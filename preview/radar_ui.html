@@ -1,0 +1,1905 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Dragon Radar UI Preview</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --screen: #032411;
+      --grid: #14dc54;
+      --grid-bright: #78ff66;
+      --grid-dim: #00562c;
+      --grid-deep: #002419;
+      --amber: #ffb824;
+      --orange: #ff6f14;
+      --red: #ff2c20;
+      --blue: #0056dc;
+      --shell: #eee7da;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, #c5d7d5 0%, #7e9d9e 56%, #4e696d 100%);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    .wrap {
+      display: grid;
+      gap: 16px;
+      justify-items: center;
+      padding: 22px;
+    }
+
+    .device {
+      position: relative;
+      width: min(92vw, 560px);
+      aspect-ratio: 1;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 34% 24%, #fffdf3 0 12%, transparent 35%),
+        radial-gradient(circle at 52% 56%, #f1eadf 0 56%, #b6afa3 76%, #827b70 100%);
+      box-shadow:
+        0 28px 70px rgba(24, 40, 42, 0.34),
+        inset -18px -22px 0 rgba(86, 80, 70, 0.28),
+        inset 13px 14px 0 rgba(255, 255, 255, 0.56);
+    }
+
+    .device::before {
+      content: "";
+      position: absolute;
+      inset: 8.5%;
+      border-radius: 50%;
+      border: 9px solid #f7f3ea;
+      box-shadow:
+        inset 0 0 0 5px #8a857a,
+        0 4px 5px rgba(50, 43, 34, 0.26);
+      pointer-events: none;
+    }
+
+    canvas {
+      width: 76.4%;
+      height: 76.4%;
+      border-radius: 50%;
+      background: var(--screen);
+      box-shadow:
+        0 0 0 8px #4f4b43,
+        0 0 0 14px #f5f0e6,
+        inset 0 0 42px rgba(0, 0, 0, 0.28);
+    }
+
+    .button {
+      position: absolute;
+      width: 50px;
+      height: 20px;
+      top: 50%;
+      border-radius: 999px;
+      background: linear-gradient(#fff6eb, #c8bfb0);
+      border: 2px solid #817a70;
+      box-shadow:
+        inset 0 2px 0 rgba(255, 255, 255, 0.72),
+        0 2px 2px rgba(57, 48, 38, 0.28);
+      pointer-events: none;
+    }
+
+    .button.left {
+      left: 2.5%;
+      transform: rotate(90deg);
+    }
+
+    .button.right {
+      right: 2.5%;
+      transform: rotate(90deg);
+    }
+
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="device" aria-label="Dragon radar UI preview">
+      <canvas id="radar" width="466" height="466"></canvas>
+      <div class="button left" aria-hidden="true"></div>
+      <div class="button right" aria-hidden="true"></div>
+    </section>
+  </main>
+
+  <script>
+    const canvas = document.getElementById("radar");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const bootBadge = new Image();
+    bootBadge.src = "../assets/avatar_badges/bulma-line-badge.png";
+    const W = canvas.width;
+    const H = canvas.height;
+    const CX = W / 2;
+    const CY = H / 2;
+    const R = Math.min(CX, CY);
+    const GRID_R = R;
+    const modePresets = {
+      radar: { demoOnBoot: true, demoTouch: false, debugHud: false, starBlips: false, simulatedBle: true }
+    };
+    const params = new URLSearchParams(location.search);
+    const initialMode = "radar";
+    const previewShot = params.get("shot");
+    const freezePreview = ["boot", "radar", "startup", "idle", "acquire", "trail", "trace", "zoom", "lock", "capture", "controls", "touch", "tilt"].includes(previewShot);
+    const requestedPhase = Number.parseFloat(params.get("phase"));
+    const frozenPhase = Number.isFinite(requestedPhase) ? Math.min(1, Math.max(0, requestedPhase)) : 1;
+    const frozenNow = 120000;
+    const bootDurationMs = 3600;
+    const mainFadeInMs = 720;
+
+    let boot = true;
+    let bootStart = performance.now();
+    let collected = 0;
+    let zoom = 0;
+    let zoomFlashUntil = 0;
+    let resetFlashUntil = 0;
+    let brightnessFlashUntil = 0;
+    let audioFlashUntil = 0;
+    let capture = null;
+    let summonStart = 0;
+    let radarStartedAt = 0;
+    let previewMode = initialMode;
+    let demoMode = modePresets[previewMode].demoOnBoot;
+    const captureFlashMs = 1100;
+    const resetFlashMs = 640;
+    const summonGatherMs = 1600;
+    const startupAcquireMs = 980;
+    const acquisitionEchoMs = 760;
+    const touchEchoMs = 520;
+    const longPressMs = 900;
+    let longPressTimer = 0;
+    let longPressHandled = false;
+    let modeFlashUntil = 0;
+    const majorGridEvery = 4;
+    const brightnessPercents = [55, 100, 125];
+    const audioPercents = [0, 70, 100, 130];
+    const gridPitch = [32, 32, 32];
+    const mapScale = [1, 1.48, 2.12];
+    const gridSnap = true;
+    const targetTrailCount = 3;
+    const targetTrailFadeMs = 1280;
+    const targetTrailMovePx = 8;
+    const summonCoreTickCount = 7;
+    const proximityEdgeTickCount = 5;
+    const idleSearchTickCount = 7;
+    const tiltInertiaTickCount = 5;
+    let touchEchoUntil = 0;
+    let touchEcho = { x: CX, y: CY };
+    let previewTiltKickUntil = 0;
+    let brightnessPreset = 1;
+    let audioPreset = 2;
+    let gridGestureScale = 1;
+    let edgeGestureActive = false;
+    let edgeGestureConsumed = false;
+    let edgeGesturePointerId = null;
+    let edgeGestureLastAngle = 0;
+
+    const balls = [
+      { star: 1, a: 32, r: 0.36, drift: 0.3 },
+      { star: 2, a: 88, r: 0.58, drift: 1.4 },
+      { star: 3, a: 143, r: 0.44, drift: 2.5 },
+      { star: 4, a: 198, r: 0.72, drift: 3.7 },
+      { star: 5, a: 246, r: 0.51, drift: 4.5 },
+      { star: 6, a: 300, r: 0.66, drift: 5.3 },
+      { star: 7, a: 344, r: 0.28, drift: 6.1 }
+    ];
+    const targetTrails = balls.map(() => ({
+      lastX: 0,
+      lastY: 0,
+      lastMs: 0,
+      points: Array.from({ length: targetTrailCount }, () => ({ x: 0, y: 0, at: 0 }))
+    }));
+
+    function config() {
+      return modePresets[previewMode];
+    }
+
+    function syncModeButtons() {
+    }
+
+    function syncPreviewState() {
+      document.documentElement.dataset.previewMode = previewMode;
+      document.documentElement.dataset.boot = boot ? "1" : "0";
+      document.documentElement.dataset.collected = String(collected);
+      document.documentElement.dataset.zoom = String(zoom);
+      document.documentElement.dataset.brightness = String(brightnessPreset);
+      document.documentElement.dataset.audio = String(audioPreset);
+      document.documentElement.dataset.summon = summonStart ? "1" : "0";
+    }
+
+    function resetTargetTrails() {
+      for (const trail of targetTrails) {
+        trail.lastX = 0;
+        trail.lastY = 0;
+        trail.lastMs = 0;
+        for (const point of trail.points) {
+          point.x = 0;
+          point.y = 0;
+          point.at = 0;
+        }
+      }
+    }
+
+    function clampGridGestureScale(scale) {
+      return Math.min(1.9, Math.max(0.55, scale));
+    }
+
+    function currentGridPitch() {
+      return Math.max(10, Math.round(gridPitch[zoom] * gridGestureScale));
+    }
+
+    function currentMapScale() {
+      return mapScale[zoom] * gridGestureScale;
+    }
+
+    function applyMode(mode, now = performance.now()) {
+      previewMode = "radar";
+      boot = true;
+      bootStart = now;
+      collected = 0;
+      capture = null;
+      summonStart = 0;
+      radarStartedAt = 0;
+      demoMode = config().demoOnBoot;
+      resetFlashUntil = 0;
+      zoomFlashUntil = 0;
+      brightnessFlashUntil = 0;
+      audioFlashUntil = 0;
+      modeFlashUntil = now + 700;
+      resetTargetTrails();
+      syncModeButtons();
+
+      const nextParams = new URLSearchParams(location.search);
+      nextParams.delete("mode");
+      const query = nextParams.toString();
+      history.replaceState(null, "", `${location.pathname}${query ? `?${query}` : ""}${location.hash}`);
+      syncPreviewState();
+    }
+
+    function resetPreviewSession(now) {
+      collected = 0;
+      capture = null;
+      summonStart = 0;
+      demoMode = config().demoOnBoot;
+      resetFlashUntil = now + resetFlashMs;
+      resetTargetTrails();
+    }
+
+    function cycleZoom(now) {
+      zoom = (zoom + 1) % 3;
+      zoomFlashUntil = now + 700;
+      resetTargetTrails();
+    }
+
+    function collectDemo(now) {
+      demoMode = true;
+      if (collected < 7) {
+        collected += 1;
+        capture = { star: collected, at: now };
+      } else {
+        resetPreviewSession(now);
+      }
+    }
+
+    function updateSimulatedBle(now) {
+      if (!config().simulatedBle || boot) return;
+      demoMode = true;
+      if (!radarStartedAt) radarStartedAt = now;
+
+    }
+
+    function pointerPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (event.clientX - rect.left) * W / rect.width,
+        y: (event.clientY - rect.top) * H / rect.height
+      };
+    }
+
+    function armTouchEcho(x, y, now) {
+      const edge = R - 14;
+      let px = Math.min(CX + edge, Math.max(CX - edge, x));
+      let py = Math.min(CY + edge, Math.max(CY - edge, y));
+      const dx = px - CX;
+      const dy = py - CY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > edge * edge) {
+        const scale = edge / Math.sqrt(d2);
+        px = CX + dx * scale;
+        py = CY + dy * scale;
+      }
+      touchEcho = { x: px, y: py };
+      touchEchoUntil = now + touchEchoMs;
+    }
+
+    function pointAngleDeg(point) {
+      return Math.atan2(point.y - CY, point.x - CX) * 180 / Math.PI;
+    }
+
+    function shortestDeltaDeg(from, to) {
+      let delta = ((to - from) % 360 + 360) % 360;
+      if (delta > 180) delta -= 360;
+      return delta;
+    }
+
+    function pointInEdgeGestureRing(point) {
+      const dx = point.x - CX;
+      const dy = point.y - CY;
+      const r = Math.sqrt(dx * dx + dy * dy);
+      return r >= 142 && r <= R + 18;
+    }
+
+    function resetEdgeGesture() {
+      edgeGestureActive = false;
+      edgeGesturePointerId = null;
+      edgeGestureLastAngle = 0;
+    }
+
+    function handleEdgeGesture(point, pointerId, now) {
+      if (!pointInEdgeGestureRing(point)) {
+        resetEdgeGesture();
+        return false;
+      }
+
+      if (boot) {
+        boot = false;
+        radarStartedAt = now;
+      }
+
+      const angle = pointAngleDeg(point);
+      edgeGestureConsumed = true;
+      if (!edgeGestureActive) {
+        edgeGestureActive = true;
+        edgeGesturePointerId = pointerId;
+        edgeGestureLastAngle = angle;
+        return true;
+      }
+
+      if (edgeGesturePointerId !== pointerId) return true;
+      const delta = shortestDeltaDeg(edgeGestureLastAngle, angle);
+      edgeGestureLastAngle = angle;
+      if (Math.abs(delta) < 0.6 || Math.abs(delta) > 55) return true;
+
+      const oldScale = gridGestureScale;
+      gridGestureScale = clampGridGestureScale(gridGestureScale * Math.exp(delta * 0.007));
+      if (Math.abs(gridGestureScale - oldScale) > 0.01) {
+        zoomFlashUntil = now + 260;
+        resetTargetTrails();
+      }
+      return true;
+    }
+
+    function handlePreviewTouch(event, now) {
+      void event;
+      void now;
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      canvas.setPointerCapture?.(event.pointerId);
+      const point = pointerPoint(event);
+      if (handleEdgeGesture(point, event.pointerId, performance.now())) {
+        clearTimeout(longPressTimer);
+        return;
+      }
+      clearTimeout(longPressTimer);
+      longPressHandled = false;
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (edgeGesturePointerId !== event.pointerId) return;
+      if (handleEdgeGesture(pointerPoint(event), event.pointerId, performance.now())) {
+        clearTimeout(longPressTimer);
+      }
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      clearTimeout(longPressTimer);
+      if (edgeGesturePointerId === event.pointerId || edgeGestureConsumed) {
+        edgeGestureConsumed = false;
+        resetEdgeGesture();
+        longPressHandled = false;
+        return;
+      }
+      longPressHandled = false;
+    });
+
+    canvas.addEventListener("pointerleave", () => {
+      clearTimeout(longPressTimer);
+    });
+
+    canvas.addEventListener("pointercancel", (event) => {
+      clearTimeout(longPressTimer);
+      if (edgeGesturePointerId === event.pointerId) {
+        edgeGestureConsumed = false;
+        resetEdgeGesture();
+      }
+    });
+
+    syncModeButtons();
+    syncPreviewState();
+
+    function handlePreviewKey(rawKey, now = performance.now()) {
+      if (freezePreview) return false;
+      const key = rawKey === "Space" ? " " : String(rawKey).toLowerCase();
+      if (key === " " || key === "c") {
+        if (boot) {
+          boot = false;
+          radarStartedAt = now;
+        } else if (config().demoTouch) {
+          collectDemo(now);
+        }
+      } else if (key === "z") {
+        cycleZoom(now);
+      } else if (key === "r") {
+        resetPreviewSession(now);
+      } else if (key === "b") {
+        brightnessPreset = (brightnessPreset + 1) % brightnessPercents.length;
+        brightnessFlashUntil = now + 700;
+      } else if (key === "a") {
+        audioPreset = (audioPreset + 1) % audioPercents.length;
+        audioFlashUntil = now + 700;
+      } else if (key === "t") {
+        previewTiltKickUntil = now + 900;
+      } else {
+        return false;
+      }
+      return true;
+    }
+
+    window.__dragonRadarPreview = {
+      press(rawKey) {
+        const handled = handlePreviewKey(rawKey, performance.now());
+        syncPreviewState();
+        return handled;
+      },
+      collectSeven() {
+        previewMode = "radar";
+        boot = false;
+        demoMode = true;
+        const now = performance.now();
+        while (collected < 7) {
+          collectDemo(now);
+        }
+        syncPreviewState();
+        return { ...document.documentElement.dataset };
+      },
+      state() {
+        syncPreviewState();
+        return { ...document.documentElement.dataset };
+      }
+    };
+
+    window.addEventListener("keydown", (event) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (handlePreviewKey(event.key, performance.now())) {
+        event.preventDefault();
+      }
+    });
+
+    function hex(hexValue, alpha = 1) {
+      if (alpha >= 1) return hexValue;
+      const value = hexValue.replace("#", "");
+      const r = parseInt(value.slice(0, 2), 16);
+      const g = parseInt(value.slice(2, 4), 16);
+      const b = parseInt(value.slice(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+
+    function smoothStep(edge0, edge1, x) {
+      const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    function text(s, x, y, size, fill, align = "center") {
+      ctx.save();
+      ctx.font = `${size}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.textAlign = align;
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = fill;
+      ctx.shadowColor = fill;
+      ctx.shadowBlur = 6;
+      ctx.fillText(s, x, y);
+      ctx.restore();
+    }
+
+    function clipCircle() {
+      ctx.beginPath();
+      ctx.arc(CX, CY, R, 0, Math.PI * 2);
+      ctx.clip();
+    }
+
+    function clearScreen() {
+      ctx.clearRect(0, 0, W, H);
+      ctx.save();
+      clipCircle();
+      ctx.fillStyle = "#032411";
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+
+    function drawCapsuleLogo(x, y, phase) {
+      const w = 190;
+      const h = 74;
+      const rr = h / 2;
+      const pulse = Math.sin(phase * Math.PI) * 12;
+      const frame = smoothStep(0, 0.26, phase);
+      const body = smoothStep(0.16, 0.54, phase);
+      const mark = smoothStep(0.42, 0.70, phase);
+      const word = smoothStep(0.58, 0.92, phase);
+
+      ctx.save();
+      ctx.shadowColor = "#4ea6ff";
+      ctx.shadowBlur = 18 + pulse;
+
+      if (frame > 0) {
+        const halfW = (117 + pulse / 2) * frame;
+        ctx.strokeStyle = "#002a4c";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x - halfW, y - 53 - pulse / 3, halfW * 2, 106 + pulse / 2);
+        ctx.strokeStyle = "#4ea6ff";
+        ctx.beginPath();
+        ctx.moveTo(x - 128 * frame, y);
+        ctx.lineTo(x + 128 * frame, y);
+        if (frame > 0.55) {
+          ctx.moveTo(x, y - 64 * frame);
+          ctx.lineTo(x, y + 64 * frame);
+          ctx.moveTo(x - 116 * frame, y - 50);
+          ctx.lineTo(x + 116 * frame, y - 50);
+          ctx.moveTo(x - 116 * frame, y + 50);
+          ctx.lineTo(x + 116 * frame, y + 50);
+        }
+        ctx.stroke();
+      }
+
+      if (body > 0) {
+        const bodyW = 72 + 118 * body;
+        const bodyH = 40 + 34 * body;
+        const bodyR = bodyH / 2;
+        ctx.fillStyle = body > 0.55 ? "#ffffff" : "#9ad6ff";
+        ctx.strokeStyle = "#0056dc";
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(x - bodyW / 2 + bodyR, y - bodyH / 2);
+        ctx.lineTo(x + bodyW / 2 - bodyR, y - bodyH / 2);
+        ctx.arc(x + bodyW / 2 - bodyR, y, bodyR, -Math.PI / 2, Math.PI / 2);
+        ctx.lineTo(x - bodyW / 2 + bodyR, y + bodyH / 2);
+        ctx.arc(x - bodyW / 2 + bodyR, y, bodyR, Math.PI / 2, Math.PI * 1.5);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        const scanX = x - bodyW / 2 + bodyW * body;
+        ctx.strokeStyle = "#78ff66";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(scanX, y - bodyH / 2 - 8);
+        ctx.lineTo(scanX, y + bodyH / 2 + 8);
+        ctx.stroke();
+      }
+
+      if (mark > 0) {
+        const r = 10 + 18 * mark;
+        ctx.fillStyle = "#0056dc";
+        ctx.beginPath();
+        ctx.arc(x - 58, y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#00207e";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        if (mark > 0.62) text("C", x - 58, y + 1, 34, "#ffffff");
+      }
+
+      if (word > 0) {
+        const lineW = 116 * word;
+        ctx.strokeStyle = word > 0.5 ? "#0056dc" : "#004068";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x - 38, y - 23);
+        ctx.lineTo(x - 38 + lineW, y - 23);
+        ctx.moveTo(x - 38, y + 23);
+        ctx.lineTo(x - 38 + lineW, y + 23);
+        ctx.stroke();
+        if (word > 0.58) text("CAPSULE", x + 20, y - 13, 18, "#0056dc");
+        if (word > 0.78) text("CORP.", x + 24, y + 12, 18, "#0056dc");
+      }
+      ctx.restore();
+    }
+
+    function noise(seed, count, fill) {
+      let state = seed || 1;
+      ctx.save();
+      clipCircle();
+      ctx.fillStyle = fill;
+      for (let i = 0; i < count; i++) {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        const x = CX - R + (state % (R * 2 + 1));
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        const y = CY - R + (state % (R * 2 + 1));
+        const dx = x - CX;
+        const dy = y - CY;
+        if (dx * dx + dy * dy <= R * R) ctx.fillRect(x, y, 1, 1);
+      }
+      ctx.restore();
+    }
+
+    function phosphorMask(strength = 1) {
+      ctx.save();
+      clipCircle();
+      ctx.globalAlpha = Math.min(1, Math.max(0, strength));
+      ctx.fillStyle = "rgba(4, 42, 18, 0.12)";
+      for (let y = CY - R + 2; y <= CY + R; y += 14) {
+        const offset = y - CY;
+        const half = Math.sqrt(Math.max(0, R * R - offset * offset));
+        ctx.fillRect(CX - half + 2, y, Math.max(0, half * 2 - 4), 1);
+      }
+
+      ctx.fillStyle = "rgba(0, 20, 10, 0.22)";
+      for (let inset = 0; inset < 24; inset += 4) {
+        const offset = R - inset;
+        const half = Math.sqrt(Math.max(0, R * R - offset * offset));
+        if (half <= 0) continue;
+        ctx.fillRect(CX - half, CY - offset, half * 2, 1);
+        ctx.fillRect(CX - half, CY + offset, half * 2, 1);
+        ctx.fillRect(CX - offset, CY - half, 1, half * 2);
+        ctx.fillRect(CX + offset, CY - half, 1, half * 2);
+      }
+      ctx.restore();
+    }
+
+    function drawGrid(alpha = 1, drift = 0, now = performance.now()) {
+      const pitch = currentGridPitch();
+      const start = -Math.floor(GRID_R / pitch) * pitch;
+
+      ctx.save();
+      clipCircle();
+      ctx.fillStyle = "#032411";
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = hex("#0c9d47", 0.88 * alpha);
+      ctx.lineWidth = 1;
+
+      for (let offset = start; offset <= -start; offset += pitch) {
+        const half = Math.sqrt(Math.max(0, GRID_R * GRID_R - offset * offset));
+        if (half <= 0) continue;
+
+        ctx.beginPath();
+        ctx.moveTo(CX - half, CY + offset);
+        ctx.lineTo(CX + half, CY + offset);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(CX + offset, CY - half);
+        ctx.lineTo(CX + offset, CY + half);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawHomeMarker(now, alpha = 1) {
+      const pulse = 0.5 + 0.5 * Math.sin(now / 180);
+      const size = 17 + pulse * 7;
+      const half = size * 0.866;
+
+      ctx.save();
+      clipCircle();
+      ctx.shadowColor = "#ff2c20";
+      ctx.shadowBlur = 7 + pulse * 9;
+      ctx.fillStyle = hex("#ff2c20", 0.92 * alpha);
+      ctx.beginPath();
+      ctx.moveTo(CX, CY - size);
+      ctx.lineTo(CX - half, CY + size * 0.5);
+      ctx.lineTo(CX + half, CY + size * 0.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = hex("#ff2c20", 0.86 * alpha);
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawRotatingScan(now, active = "#80ff70", dim = "#00562c", alpha = 1) {
+      const sweep = (now / 1945) % 1;
+      const angle = sweep * Math.PI * 2 - Math.PI / 2;
+      const x = CX + Math.cos(angle) * (R - 8);
+      const y = CY + Math.sin(angle) * (R - 8);
+
+      ctx.save();
+      clipCircle();
+      ctx.lineCap = "round";
+      const fanSteps = [
+        [0.60, "#0a4d2c", 0.08],
+        [0.52, "#0d6f36", 0.12],
+        [0.44, "#139443", 0.17],
+        [0.36, "#19b84d", 0.23],
+        [0.28, "#27d95d", 0.30],
+        [0.20, "#45ef70", 0.38],
+        [0.12, "#69ff85", 0.48],
+      ];
+      for (const [span, color, fanAlpha] of fanSteps) {
+        const outer = R - 9;
+        const inner = 18;
+        ctx.fillStyle = hex(color, fanAlpha * alpha);
+        ctx.beginPath();
+        ctx.moveTo(CX + Math.cos(angle - span) * inner, CY + Math.sin(angle - span) * inner);
+        ctx.lineTo(CX + Math.cos(angle - span) * outer, CY + Math.sin(angle - span) * outer);
+        ctx.arc(CX, CY, outer, angle - span, angle, false);
+        ctx.lineTo(CX + Math.cos(angle) * inner, CY + Math.sin(angle) * inner);
+        ctx.arc(CX, CY, inner, angle, angle - span, true);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.strokeStyle = hex(active, 0.95 * alpha);
+      ctx.lineWidth = 2;
+      ctx.shadowColor = active;
+      ctx.shadowBlur = 5 * alpha;
+      ctx.beginPath();
+      ctx.moveTo(CX, CY);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function starMark(x, y, count) {
+      ctx.save();
+      ctx.strokeStyle = "#ff2c20";
+      ctx.lineWidth = 1;
+      const start = x - ((count - 1) * 4) / 2;
+      for (let i = 0; i < count; i++) {
+        const sx = start + i * 4;
+        ctx.beginPath();
+        ctx.moveTo(sx - 1.4, y);
+        ctx.lineTo(sx + 1.4, y);
+        ctx.moveTo(sx, y - 1.4);
+        ctx.lineTo(sx, y + 1.4);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function orbPhosphorBloom(x, y, fresh, trace, pulse = 0) {
+      const span = fresh ? 20 + pulse * 3 : (trace ? 10 : 14);
+      const rows = [-2, -1, 0, 1, 2];
+      ctx.save();
+      ctx.shadowColor = trace ? "#84701c" : "#ffb824";
+      ctx.shadowBlur = fresh ? 9 : (trace ? 2 : 5);
+      for (const row of rows) {
+        const shrink = Math.abs(row) * 4;
+        const half = Math.max(2, span - shrink);
+        ctx.fillStyle = row === 0 ? (trace ? "#84701c" : "#ffb824") :
+          (Math.abs(row) === 1 ? (trace ? "#564e16" : "#ff6f14") :
+            (trace ? "#263012" : "#5c1c00"));
+        ctx.fillRect(x - half, y + row * 2, half * 2 + 1, 1);
+      }
+      ctx.restore();
+    }
+
+    function orb(x, y, star, fresh, trace = false, showStars = false, now = performance.now()) {
+      const off = (now % 1000) < 180;
+      if (off) return;
+      const r = 7;
+      ctx.save();
+      ctx.shadowColor = "#ffb824";
+      ctx.shadowBlur = 7;
+      ctx.fillStyle = "#8a2a00";
+      ctx.beginPath();
+      ctx.arc(x, y, r + 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#ff7a16";
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#ffb824";
+      ctx.beginPath();
+      ctx.arc(x - 2, y - 2, 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.arc(x - 3, y - 3, 1.2, 0, Math.PI * 2);
+      ctx.fill();
+      void star;
+      void fresh;
+      void trace;
+      void showStars;
+      ctx.restore();
+    }
+
+    function captureGlyph(x, y, ageMs) {
+      const t = Math.min(1, Math.max(0, ageMs / captureFlashMs));
+      const r = 12 + t * 22;
+      const flash = (Math.floor(ageMs / 84) & 1) === 0;
+      const c = flash ? "#78ff66" : "#ffb824";
+      ctx.save();
+      ctx.strokeStyle = c;
+      ctx.lineWidth = 1.5;
+      ctx.shadowColor = c;
+      ctx.shadowBlur = flash ? 10 : 4;
+      ctx.strokeRect(x - r, y - r, r * 2, r * 2);
+      ctx.beginPath();
+      ctx.moveTo(x - r - 6, y);
+      ctx.lineTo(x - r + 6, y);
+      ctx.moveTo(x + r - 6, y);
+      ctx.lineTo(x + r + 6, y);
+      ctx.moveTo(x, y - r - 6);
+      ctx.lineTo(x, y - r + 6);
+      ctx.moveTo(x, y + r - 6);
+      ctx.lineTo(x, y + r + 6);
+      ctx.stroke();
+      ctx.strokeStyle = "#14dc54";
+      ctx.beginPath();
+      ctx.moveTo(x - 6, y);
+      ctx.lineTo(x + 6, y);
+      ctx.moveTo(x, y - 6);
+      ctx.lineTo(x, y + 6);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function acquisitionEcho(x, y, ageMs) {
+      const t = Math.min(1, Math.max(0, ageMs / acquisitionEchoMs));
+      const dx = x - CX;
+      const dy = y - CY;
+      const edgeRoom = R - Math.hypot(dx, dy) - 12;
+      if (edgeRoom < 10) return;
+
+      const step = Math.max(8, currentGridPitch() / 2);
+      const spread = Math.min(edgeRoom, 8 + t * (step + 20));
+      const rail = Math.min(edgeRoom, spread + step);
+      const corner = Math.min(10, spread);
+      const gap = Math.max(5, spread - 2);
+      const flash = (Math.floor(ageMs / 68) & 1) === 0;
+      const primary = flash ? "#78ff66" : "#14dc54";
+      const secondary = flash ? "#14dc54" : "#00562c";
+
+      ctx.save();
+      ctx.strokeStyle = secondary;
+      ctx.lineWidth = 1;
+      ctx.shadowColor = primary;
+      ctx.shadowBlur = flash ? 8 : 3;
+      ctx.strokeRect(x - spread, y - spread, spread * 2, spread * 2);
+
+      ctx.strokeStyle = primary;
+      ctx.beginPath();
+      ctx.moveTo(x - spread, y - spread + corner);
+      ctx.lineTo(x - spread, y - spread);
+      ctx.lineTo(x - spread + corner, y - spread);
+      ctx.moveTo(x + spread - corner, y - spread);
+      ctx.lineTo(x + spread, y - spread);
+      ctx.lineTo(x + spread, y - spread + corner);
+      ctx.moveTo(x - spread, y + spread - corner);
+      ctx.lineTo(x - spread, y + spread);
+      ctx.lineTo(x - spread + corner, y + spread);
+      ctx.moveTo(x + spread - corner, y + spread);
+      ctx.lineTo(x + spread, y + spread);
+      ctx.lineTo(x + spread, y + spread - corner);
+      ctx.stroke();
+
+      if (rail > gap) {
+        ctx.shadowBlur = 0;
+        ctx.strokeStyle = secondary;
+        ctx.beginPath();
+        ctx.moveTo(x - rail, y);
+        ctx.lineTo(x - gap, y);
+        ctx.moveTo(x + gap, y);
+        ctx.lineTo(x + rail, y);
+        ctx.moveTo(x, y - rail);
+        ctx.lineTo(x, y - gap);
+        ctx.moveTo(x, y + gap);
+        ctx.lineTo(x, y + rail);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function pushTargetTrail(trail, x, y, now) {
+      for (let i = targetTrailCount - 1; i > 0; i--) {
+        trail.points[i].x = trail.points[i - 1].x;
+        trail.points[i].y = trail.points[i - 1].y;
+        trail.points[i].at = trail.points[i - 1].at;
+      }
+      trail.points[0].x = x;
+      trail.points[0].y = y;
+      trail.points[0].at = now;
+    }
+
+    function updateTargetTrail(ball, x, y, now) {
+      if (config().debugHud || config().starBlips) return;
+      const trail = targetTrails[ball.star - 1];
+      if (!trail.lastMs) {
+        trail.lastX = x;
+        trail.lastY = y;
+        trail.lastMs = now;
+        return;
+      }
+
+      const dx = x - trail.lastX;
+      const dy = y - trail.lastY;
+      if (dx * dx + dy * dy < targetTrailMovePx * targetTrailMovePx) return;
+
+      pushTargetTrail(trail, trail.lastX, trail.lastY, now);
+      trail.lastX = x;
+      trail.lastY = y;
+      trail.lastMs = now;
+    }
+
+    function drawTargetTrail(ball, now) {
+      if (config().debugHud || config().starBlips) return;
+      const trail = targetTrails[ball.star - 1];
+      ctx.save();
+      ctx.shadowColor = "#ff6f14";
+      ctx.shadowBlur = 3;
+      for (let i = 0; i < targetTrailCount; i++) {
+        const point = trail.points[i];
+        if (!point.at) continue;
+        const age = now - point.at;
+        if (age > targetTrailFadeMs) continue;
+        const half = Math.max(3, 11 - i * 3 - Math.floor(age / 280));
+        ctx.fillStyle = i === 0 ? "#845612" : (i === 1 ? "#523e12" : "#242c12");
+        ctx.fillRect(point.x - half, point.y, half * 2 + 1, 1);
+        if (half > 4) {
+          ctx.fillStyle = "#1a2e12";
+          ctx.fillRect(point.x - half + 2, point.y + 2, half * 2 - 3, 1);
+          ctx.fillRect(point.x - half + 2, point.y - 2, half * 2 - 3, 1);
+        }
+      }
+      ctx.restore();
+    }
+
+    function snapPointToGrid(x, y) {
+      if (!gridSnap) return { x, y };
+      const step = Math.max(8, currentGridPitch() / 2);
+      const sx = CX + Math.round((x - CX) / step) * step;
+      const sy = CY + Math.round((y - CY) / step) * step;
+      const dx = sx - CX;
+      const dy = sy - CY;
+      const limit = R - 14;
+      if (dx * dx + dy * dy <= limit * limit) return { x: sx, y: sy };
+      return { x, y };
+    }
+
+    function proximityNearFromRange(range) {
+      return Math.min(1, Math.max(0, (0.96 - range) / (0.96 - 0.13)));
+    }
+
+    function demoBallPoint(ball, now, forceClamp = false) {
+      const a = (ball.a - 90) * Math.PI / 180;
+      let radius = ball.r * currentMapScale() * (R - 28);
+      if (!forceClamp && zoom > 0 && radius > R - 11) return null;
+      if (forceClamp) radius = Math.min(radius, R - 34);
+      return snapPointToGrid(CX + Math.cos(a) * radius, CY + Math.sin(a) * radius);
+    }
+
+    function drawProximityEdgePulse(x, y, nearness, now) {
+      if (config().debugHud || config().starBlips || nearness < 0.18) return;
+
+      const gated = Math.min(1, Math.max(0, (nearness - 0.18) / 0.82));
+      const lit = 1 + Math.floor(gated * (proximityEdgeTickCount - 1));
+      const period = Math.max(90, 210 - gated * 96);
+      const flash = (Math.floor(now / period) & 1) === 0;
+      const active = flash ? "#78ff66" : (nearness > 0.74 ? "#ffb824" : "#14dc54");
+      const dim = flash ? "#00562c" : "#002419";
+      const dx = x - CX;
+      const dy = y - CY;
+
+      ctx.save();
+      clipCircle();
+      ctx.lineWidth = 1;
+      ctx.shadowColor = active;
+      ctx.shadowBlur = flash ? 8 : 3;
+
+      if (Math.abs(dx) >= Math.abs(dy)) {
+        const right = dx >= 0;
+        const anchorX = right ? CX + R - 18 : CX - R + 10;
+        const anchorY = Math.min(CY + R - 44, Math.max(CY - R + 44, y));
+        const railX = right ? anchorX - 4 : anchorX + 4;
+        ctx.strokeStyle = dim;
+        ctx.beginPath();
+        ctx.moveTo(railX, anchorY - 28);
+        ctx.lineTo(railX, anchorY + 28);
+        ctx.stroke();
+        ctx.strokeStyle = active;
+        ctx.beginPath();
+        ctx.moveTo(right ? anchorX - 32 : anchorX + 12, anchorY);
+        ctx.lineTo(right ? anchorX - 12 : anchorX + 32, anchorY);
+        ctx.stroke();
+        for (let i = 0; i < proximityEdgeTickCount; i++) {
+          const yy = anchorY + (i - 2) * 10;
+          const on = i < lit;
+          const w = 10 + i * 2;
+          const x0 = right ? anchorX - w : anchorX;
+          ctx.strokeStyle = on ? active : dim;
+          ctx.strokeRect(x0, yy, w, 4);
+          if (on && flash && w > 4) {
+            ctx.fillStyle = ctx.strokeStyle;
+            ctx.fillRect(x0 + 2, yy + 1, w - 3, 2);
+          }
+        }
+      } else {
+        const top = dy < 0;
+        const anchorY = top ? CY - R + 10 : CY + R - 18;
+        const anchorX = Math.min(CX + R - 44, Math.max(CX - R + 44, x));
+        const railY = top ? anchorY + 4 : anchorY - 4;
+        ctx.strokeStyle = dim;
+        ctx.beginPath();
+        ctx.moveTo(anchorX - 28, railY);
+        ctx.lineTo(anchorX + 28, railY);
+        ctx.stroke();
+        ctx.strokeStyle = active;
+        ctx.beginPath();
+        ctx.moveTo(anchorX, top ? anchorY + 12 : anchorY - 32);
+        ctx.lineTo(anchorX, top ? anchorY + 32 : anchorY - 12);
+        ctx.stroke();
+        for (let i = 0; i < proximityEdgeTickCount; i++) {
+          const xx = anchorX + (i - 2) * 10;
+          const on = i < lit;
+          const h = 10 + i * 2;
+          const y0 = top ? anchorY : anchorY - h;
+          ctx.strokeStyle = on ? active : dim;
+          ctx.strokeRect(xx, y0, 4, h);
+          if (on && flash && h > 4) {
+            ctx.fillStyle = ctx.strokeStyle;
+            ctx.fillRect(xx + 1, y0 + 2, 2, h - 3);
+          }
+        }
+      }
+      ctx.restore();
+    }
+
+    function drawIdleSearchLattice(now) {
+      if (config().debugHud || config().starBlips || demoMode || summonStart) return;
+
+      const left = CX - R + 42;
+      const right = CX + R - 42;
+      const top = CY - R + 42;
+      const bottom = CY + R - 42;
+      const phase = Math.floor(now / 118) % idleSearchTickCount;
+      const flash = (Math.floor(now / 94) & 1) === 0;
+      const active = flash ? "#78ff66" : "#14dc54";
+      const dim = flash ? "#00562c" : "#002419";
+
+      ctx.save();
+      clipCircle();
+      ctx.lineWidth = 1;
+      ctx.shadowColor = active;
+      ctx.shadowBlur = flash ? 5 : 2;
+      for (let i = 0; i < idleSearchTickCount; i++) {
+        const x = left + (right - left) * i / (idleSearchTickCount - 1);
+        const y = top + (bottom - top) * i / (idleSearchTickCount - 1);
+        const on = i === phase || ((i + 1) % idleSearchTickCount) === phase;
+        ctx.strokeStyle = on ? active : dim;
+        ctx.strokeRect(x - 4, top, 8, 4);
+        ctx.strokeRect(x - 4, bottom - 4, 8, 4);
+        ctx.strokeRect(left, y - 4, 4, 8);
+        ctx.strokeRect(right - 4, y - 4, 4, 8);
+        if (on && flash) {
+          ctx.fillStyle = active;
+          ctx.fillRect(x - 2, top + 1, 4, 2);
+          ctx.fillRect(x - 2, bottom - 3, 4, 2);
+          ctx.fillRect(left + 1, y - 2, 2, 4);
+          ctx.fillRect(right - 3, y - 2, 2, 4);
+        }
+      }
+
+      drawRotatingScan(now, active, dim, 0.62);
+
+      const box = 22 + (Math.floor(now / 180) % 3) * 4;
+      ctx.strokeStyle = dim;
+      ctx.strokeRect(CX - box, CY - box, box * 2, box * 2);
+      drawHomeMarker(now, 0.92);
+      ctx.restore();
+    }
+
+    function drawTiltInertiaGrid(now) {
+      const kicked = now < previewTiltKickUntil;
+      const activePreviewMotion = kicked || config().simulatedBle || demoMode;
+      if (config().debugHud || config().starBlips || !activePreviewMotion) return;
+
+      const energy = kicked ? 0.86 : (config().simulatedBle ? 0.58 : 0.28 + Math.sin(now / 760) * 0.08);
+      if (energy < 0.16) return;
+      const skewX = Math.sin(now / 640) * 18 * energy;
+      const skewY = Math.cos(now / 720) * 18 * energy;
+      const left = CX - 132 + skewX;
+      const right = CX + 132 + skewX;
+      const top = CY - 132 + skewY;
+      const bottom = CY + 132 + skewY;
+      const flash = (Math.floor(now / 74) & 1) === 0;
+      const active = flash ? "#78ff66" : "#14dc54";
+      const dim = flash ? "#14dc54" : "#00562c";
+      const lit = 1 + Math.floor(Math.min(1, Math.max(0, energy)) * (tiltInertiaTickCount - 1));
+
+      ctx.save();
+      clipCircle();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = dim;
+      ctx.strokeRect(left - 3, top - 3, 6, 6);
+      ctx.strokeRect(right - 3, top - 3, 6, 6);
+      ctx.strokeRect(left - 3, bottom - 3, 6, 6);
+      ctx.strokeRect(right - 3, bottom - 3, 6, 6);
+      ctx.strokeStyle = active;
+      ctx.beginPath();
+      ctx.moveTo(left, top);
+      ctx.lineTo(left + 48, top);
+      ctx.moveTo(left, top);
+      ctx.lineTo(left, top + 48);
+      ctx.moveTo(right - 48, top);
+      ctx.lineTo(right, top);
+      ctx.moveTo(right, top);
+      ctx.lineTo(right, top + 48);
+      ctx.moveTo(left, bottom);
+      ctx.lineTo(left + 48, bottom);
+      ctx.moveTo(left, bottom - 48);
+      ctx.lineTo(left, bottom);
+      ctx.moveTo(right - 48, bottom);
+      ctx.lineTo(right, bottom);
+      ctx.moveTo(right, bottom - 48);
+      ctx.lineTo(right, bottom);
+      ctx.stroke();
+
+      for (let i = 0; i < tiltInertiaTickCount; i++) {
+        const on = i < lit;
+        ctx.strokeStyle = on ? active : dim;
+        const offset = 8 + i * 9;
+        ctx.strokeRect(left + offset, top - 7, 6, 4);
+        ctx.strokeRect(right - offset - 6, bottom + 3, 6, 4);
+        ctx.strokeRect(left - 7, bottom - offset - 6, 4, 6);
+        ctx.strokeRect(right + 3, top + offset, 4, 6);
+        if (on && flash) {
+          ctx.fillStyle = active;
+          ctx.fillRect(left + offset + 1, top - 6, 4, 2);
+          ctx.fillRect(right - offset - 5, bottom + 4, 4, 2);
+          ctx.fillRect(left - 6, bottom - offset - 5, 2, 4);
+          ctx.fillRect(right + 4, top + offset + 1, 2, 4);
+        }
+      }
+      ctx.restore();
+    }
+
+    function lockGlyph(x, y, progress, now) {
+      const r = 16;
+      const frame = r + 4;
+      const side = frame * 2;
+      const corner = 8;
+      const flash = (Math.floor(now / 86) & 1) === 0;
+      const c = flash ? "#78ff66" : "#14dc54";
+      const charge = Math.min(1, Math.max(0, progress)) * side * 4;
+      ctx.save();
+      ctx.strokeStyle = c;
+      ctx.lineWidth = 1.4;
+      ctx.shadowColor = c;
+      ctx.shadowBlur = flash ? 8 : 3;
+      ctx.beginPath();
+      ctx.moveTo(x - r, y - r + corner);
+      ctx.lineTo(x - r, y - r);
+      ctx.lineTo(x - r + corner, y - r);
+      ctx.moveTo(x + r - corner, y - r);
+      ctx.lineTo(x + r, y - r);
+      ctx.lineTo(x + r, y - r + corner);
+      ctx.moveTo(x - r, y + r - corner);
+      ctx.lineTo(x - r, y + r);
+      ctx.lineTo(x - r + corner, y + r);
+      ctx.moveTo(x + r - corner, y + r);
+      ctx.lineTo(x + r, y + r);
+      ctx.lineTo(x + r, y + r - corner);
+      ctx.stroke();
+
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "#002419";
+      ctx.strokeRect(x - frame, y - frame, side, side);
+      ctx.strokeStyle = flash ? "#ffb824" : "#ff6f14";
+      ctx.beginPath();
+      const left = x - frame;
+      const top = y - frame;
+      let remaining = charge;
+      const topLen = Math.min(remaining, side);
+      if (topLen > 0) {
+        ctx.moveTo(left, top);
+        ctx.lineTo(left + topLen, top);
+      }
+      remaining -= topLen;
+      const rightLen = Math.min(Math.max(remaining, 0), side);
+      if (rightLen > 0) {
+        ctx.moveTo(left + side, top);
+        ctx.lineTo(left + side, top + rightLen);
+      }
+      remaining -= rightLen;
+      const bottomLen = Math.min(Math.max(remaining, 0), side);
+      if (bottomLen > 0) {
+        ctx.moveTo(left + side, top + side);
+        ctx.lineTo(left + side - bottomLen, top + side);
+      }
+      remaining -= bottomLen;
+      const leftLen = Math.min(Math.max(remaining, 0), side);
+      if (leftLen > 0) {
+        ctx.moveTo(left, top + side);
+        ctx.lineTo(left, top + side - leftLen);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function brightnessFlash(now) {
+      if (now > brightnessFlashUntil) return;
+      const flash = (Math.floor((brightnessFlashUntil - now) / 88) & 1) === 1;
+      const x = 36;
+      const baseY = CY + 24;
+      ctx.save();
+      ctx.lineWidth = 1;
+      for (let i = 0; i < brightnessPercents.length; i++) {
+        const h = 9 + i * 8;
+        const bx = x + i * 12;
+        const on = i <= brightnessPreset;
+        ctx.strokeStyle = on ? "#78ff66" : "#00562c";
+        ctx.strokeRect(bx, baseY - h, 7, h);
+        if (on) {
+          ctx.fillStyle = flash ? "#78ff66" : "#14dc54";
+          ctx.fillRect(bx + 2, baseY - h + 2, 3, h - 4);
+        }
+      }
+      ctx.restore();
+    }
+
+    function audioFlash(now) {
+      if (now > audioFlashUntil) return;
+      const flash = (Math.floor((audioFlashUntil - now) / 88) & 1) === 1;
+      const x = W - 44;
+      const y = CY - 18;
+      const c = flash ? "#ffb824" : "#14dc54";
+      ctx.save();
+      ctx.lineWidth = 1.5;
+      if (audioPreset === 0) {
+        ctx.strokeStyle = "#00562c";
+        ctx.strokeRect(x - 4, y + 8, 24, 24);
+        ctx.strokeStyle = c;
+        ctx.beginPath();
+        ctx.moveTo(x - 2, y + 30);
+        ctx.lineTo(x + 18, y + 10);
+        ctx.stroke();
+        ctx.restore();
+        return;
+      }
+      for (let i = 0; i < audioPercents.length - 1; i++) {
+        const len = 8 + i * 8;
+        const yy = y + i * 12;
+        const on = i < audioPreset;
+        ctx.strokeStyle = on ? c : "#00562c";
+        ctx.beginPath();
+        ctx.moveTo(x - len / 2, yy);
+        ctx.lineTo(x + len / 2, yy);
+        if (on) {
+          ctx.moveTo(x + len / 2 + 4, yy - 3);
+          ctx.lineTo(x + len / 2 + 4, yy + 3);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function resetFlash(now) {
+      if (now > resetFlashUntil) return;
+      const remaining = resetFlashUntil - now;
+      const p = 1 - Math.min(1, Math.max(0, remaining / resetFlashMs));
+      const sx = CX - R + p * R * 2;
+      const so = sx - CX;
+      if (Math.abs(so) > R) return;
+      const half = Math.sqrt(R * R - so * so);
+      const flash = (Math.floor(remaining / 72) & 1) === 0;
+      ctx.save();
+      ctx.strokeStyle = flash ? "#78ff66" : "#14dc54";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(sx, CY - half);
+      ctx.lineTo(sx, CY + half);
+      ctx.stroke();
+      ctx.strokeStyle = "#00562c";
+      ctx.lineWidth = 1;
+      for (let i = 1; i <= 2; i++) {
+        const tx = sx - i * 9;
+        const to = tx - CX;
+        if (Math.abs(to) <= R) {
+          const trailHalf = Math.sqrt(R * R - to * to);
+          ctx.beginPath();
+          ctx.moveTo(tx, CY - trailHalf + 6);
+          ctx.lineTo(tx, CY + trailHalf - 6);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    function drawTouchEcho(now) {
+      if (config().debugHud || now > touchEchoUntil) return;
+      const remaining = touchEchoUntil - now;
+      const age = touchEchoMs - remaining;
+      const side = 10 + Math.min(18, Math.floor(age / 18));
+      const x = touchEcho.x;
+      const offset = x - CX;
+      if (Math.abs(offset) > R) return;
+      const half = Math.sqrt(R * R - offset * offset);
+      if (half <= side + 6) return;
+      const y = Math.min(CY + half - side - 6, Math.max(CY - half + side + 6, touchEcho.y));
+      const flash = (Math.floor(remaining / 64) & 1) === 0;
+      const active = flash ? "#78ff66" : "#14dc54";
+      const dim = flash ? "#14dc54" : "#00562c";
+
+      ctx.save();
+      clipCircle();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = dim;
+      ctx.strokeRect(x - side, y - side, side * 2, side * 2);
+      ctx.strokeStyle = active;
+      ctx.strokeRect(x - side + 4, y - side + 4, side * 2 - 8, side * 2 - 8);
+      ctx.beginPath();
+      ctx.moveTo(x - side - 12, y);
+      ctx.lineTo(x - side - 2, y);
+      ctx.moveTo(x + side + 2, y);
+      ctx.lineTo(x + side + 12, y);
+      ctx.moveTo(x, y - side - 12);
+      ctx.lineTo(x, y - side - 2);
+      ctx.moveTo(x, y + side + 2);
+      ctx.lineTo(x, y + side + 12);
+      ctx.stroke();
+      if (flash) {
+        ctx.fillStyle = active;
+        ctx.fillRect(x - 2, y - 2, 4, 4);
+      }
+      ctx.restore();
+    }
+
+    function collectionStrip() {
+      const start = CX - 78;
+      for (let i = 0; i < 7; i++) {
+        const x = start + i * 26;
+        if (i < collected) {
+          orb(x, 82, i + 1, false, false, true);
+        } else {
+          ctx.strokeStyle = "#00562c";
+          ctx.beginPath();
+          ctx.arc(x, 82, 7, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+    }
+
+    function debugCenterHud(now) {
+      ctx.save();
+      ctx.strokeStyle = "#78ff66";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(CX, CY, 5, 0, Math.PI * 2);
+      ctx.moveTo(CX - 15, CY);
+      ctx.lineTo(CX + 15, CY);
+      ctx.moveTo(CX, CY - 15);
+      ctx.lineTo(CX, CY + 15);
+      ctx.stroke();
+      text("DRAGON RADAR", CX, 28, 14, "#78ff66");
+      text(demoMode ? "SIM" : "BLE", 54, 428, 9, "#00562c");
+      text("SCAN", 382, 428, 9, "#00562c");
+      const energy = 48 + Math.sin(now / 540) * 22;
+      ctx.strokeStyle = "#00562c";
+      ctx.strokeRect(CX - 44, 398, 88, 8);
+      ctx.fillStyle = "#14dc54";
+      ctx.fillRect(CX - 42, 400, Math.max(4, energy), 4);
+      ctx.restore();
+    }
+
+    function rssiCalibrationStrip(now) {
+      ctx.save();
+      const x = CX - 118;
+      const y = 408;
+      const w = 236;
+      const active = demoMode && collected < 7;
+      ctx.lineWidth = 1;
+      if (!active) {
+        ctx.strokeStyle = "#00562c";
+        ctx.strokeRect(CX - 70, y, 140, 8);
+        text("NO BEACON", CX, 426, 9, "#00562c");
+        ctx.restore();
+        return;
+      }
+
+      const pulse = (Math.sin(now / 620) + 1) * 0.5;
+      const filtered = 82 + pulse * 72;
+      const raw = x + 1 + filtered + Math.sin(now / 150) * 8;
+      const collect = x + 1 + 177;
+      const close = filtered > 166;
+      ctx.strokeStyle = "#00562c";
+      ctx.strokeRect(x, y, w, 8);
+      ctx.fillStyle = close ? "#ff6f14" : "#14dc54";
+      ctx.fillRect(x + 1, y + 2, filtered, 4);
+      ctx.strokeStyle = "#ffb824";
+      ctx.beginPath();
+      ctx.moveTo(collect, y - 3);
+      ctx.lineTo(collect, y + 11);
+      ctx.stroke();
+      ctx.strokeStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.moveTo(raw, y - 1);
+      ctx.lineTo(raw, y + 9);
+      ctx.stroke();
+      text(`S${collected + 1} R${close ? -47 : -58} F${close ? -48 : -57}`, CX, 426, 9, close ? "#ffb824" : "#14dc54");
+      ctx.restore();
+    }
+
+    function bearingCalibrationStrip(now) {
+      const bins = 16;
+      const startX = CX - 108;
+      const baseY = 112;
+      const step = 14;
+      const barW = 8;
+      const active = demoMode && collected < 7;
+      const best = active ? Math.floor((now / 880) % bins) : -1;
+      const heading = Math.floor((now / 510) % bins);
+
+      ctx.save();
+      ctx.lineWidth = 1;
+      for (let i = 0; i < bins; i++) {
+        const x = startX + i * step;
+        const wrapped = active ? Math.min(
+          Math.abs(i - best),
+          bins - Math.abs(i - best)
+        ) : bins;
+        const score = active ? Math.max(0, 1 - wrapped / 5) : 0;
+        const h = 2 + score * 22;
+        const isBest = active && i === best;
+        const isHeading = i === heading;
+        ctx.strokeStyle = isHeading ? "#ffffff" : "#002419";
+        ctx.strokeRect(x, baseY - 25, barW, 25);
+        if (score > 0) {
+          ctx.fillStyle = isBest ? "#ffb824" : (isHeading ? "#78ff66" : "#14dc54");
+          ctx.fillRect(x + 2, baseY - h, barW - 3, h);
+        } else if (isHeading) {
+          ctx.strokeStyle = "#00562c";
+          ctx.beginPath();
+          ctx.moveTo(x + barW / 2, baseY - 23);
+          ctx.lineTo(x + barW / 2, baseY - 2);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    function sweepLine(now) {
+      if (!config().scanLine) return;
+      drawRotatingScan(now, "#80ff70", "#00562c", 1);
+    }
+
+    function startupAcquireOverlay(now) {
+      if (!radarStartedAt) return;
+      const elapsed = now - radarStartedAt;
+      if (elapsed > startupAcquireMs) return;
+
+      const t = Math.min(1, Math.max(0, elapsed / startupAcquireMs));
+      const flash = (Math.floor(elapsed / 72) & 1) === 0;
+      const c = flash ? "#78ff66" : "#14dc54";
+      const left = CX - R + 38;
+      const right = CX + R - 38;
+      const top = CY - R + 38;
+      const bottom = CY + R - 38;
+      const corner = 34;
+      const inset = smoothStep(0, 0.55, t) * 10;
+      ctx.save();
+      clipCircle();
+      ctx.strokeStyle = c;
+      ctx.lineWidth = 1.4;
+      ctx.shadowColor = c;
+      ctx.shadowBlur = flash ? 8 : 3;
+      ctx.beginPath();
+      ctx.moveTo(left + inset, top);
+      ctx.lineTo(left + inset + corner, top);
+      ctx.moveTo(left, top + inset);
+      ctx.lineTo(left, top + inset + corner);
+      ctx.moveTo(right - corner - inset, top);
+      ctx.lineTo(right - inset, top);
+      ctx.moveTo(right, top + inset);
+      ctx.lineTo(right, top + inset + corner);
+      ctx.moveTo(left + inset, bottom);
+      ctx.lineTo(left + inset + corner, bottom);
+      ctx.moveTo(left, bottom - corner - inset);
+      ctx.lineTo(left, bottom - inset);
+      ctx.moveTo(right - corner - inset, bottom);
+      ctx.lineTo(right - inset, bottom);
+      ctx.moveTo(right, bottom - corner - inset);
+      ctx.lineTo(right, bottom - inset);
+      ctx.stroke();
+
+      drawRotatingScan(now, c, "#00562c", 0.9);
+
+      const tickY = bottom + 13;
+      const startX = CX - 54;
+      for (let i = 0; i < 7; i++) {
+        const x = startX + i * 18;
+        const on = t * 7 >= i + 0.32;
+        ctx.strokeStyle = on ? c : "#00562c";
+        ctx.strokeRect(x, tickY, 8, 4);
+        if (on && flash) {
+          ctx.fillStyle = c;
+          ctx.fillRect(x + 2, tickY + 1, 4, 2);
+        }
+      }
+      ctx.restore();
+    }
+
+    function modeFlash(now) {
+      if (now > modeFlashUntil) return;
+      const flash = Math.floor((modeFlashUntil - now) / 88) & 1;
+      const codes = previewMode === "field" ? [true, false, false] :
+        previewMode === "sim" ? [true, false, true] :
+        previewMode === "debug" ? [true, true, true] : [true, true, false];
+      const startX = CX - 30;
+      const y = 54;
+      ctx.save();
+      for (let i = 0; i < codes.length; i++) {
+        const x = startX + i * 30;
+        ctx.strokeStyle = codes[i] ? "#78ff66" : "#00562c";
+        ctx.strokeRect(x, y, 16, 5);
+        if (codes[i]) {
+          ctx.fillStyle = flash ? "#78ff66" : "#14dc54";
+          ctx.fillRect(x + 2, y + 2, 12, 1);
+        }
+      }
+      ctx.restore();
+    }
+
+    function drawBootPhase(p, now, commitState = false) {
+      ctx.clearRect(0, 0, W, H);
+      ctx.save();
+      clipCircle();
+      ctx.fillStyle = "#032411";
+      ctx.fillRect(0, 0, W, H);
+      const fadeIn = smoothStep(0.04, 0.46, p);
+      const fadeOut = 1 - smoothStep(0.72, 0.96, p);
+      ctx.globalAlpha = Math.min(1, Math.max(0, fadeIn * fadeOut));
+      ctx.beginPath();
+      ctx.arc(CX, CY, R, 0, Math.PI * 2);
+      ctx.clip();
+      if (bootBadge.complete) {
+        ctx.drawImage(bootBadge, 0, 0, W, H);
+      } else {
+        ctx.fillStyle = "#ffb824";
+        ctx.beginPath();
+        ctx.arc(CX, CY, Math.min(W, H) / 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+      if (commitState && p >= 1) {
+        boot = false;
+        radarStartedAt = now;
+      }
+    }
+
+    function drawBoot(now) {
+      drawBootPhase(Math.min((now - bootStart) / bootDurationMs, 1), now, true);
+    }
+
+    function drawRadar(now) {
+      const t = now / 1000;
+      updateSimulatedBle(now);
+      clearScreen();
+      drawGrid(1, 0, now);
+
+      ctx.save();
+      clipCircle();
+      if (demoMode) {
+        for (const ball of balls) {
+          const point = demoBallPoint(ball, now);
+          if (!point) continue;
+          const x = point.x;
+          const y = point.y;
+          if (ball.star <= collected) {
+            continue;
+          }
+          orb(x, y, ball.star, false, false, config().starBlips, now);
+        }
+      }
+      ctx.restore();
+
+      drawHomeMarker(now);
+
+      if (radarStartedAt) {
+        const fade = 1 - smoothStep(0, 1, Math.min(1, Math.max(0, (now - radarStartedAt) / mainFadeInMs)));
+        if (fade > 0) {
+          ctx.save();
+          clipCircle();
+          ctx.globalAlpha = fade;
+          ctx.fillStyle = "#000000";
+          ctx.fillRect(0, 0, W, H);
+          ctx.restore();
+        }
+      }
+    }
+
+    function drawSummonGathering(elapsed, now) {
+      const gather = smoothStep(0, 1, Math.min(1, Math.max(0, elapsed / summonGatherMs)));
+      const flash = (Math.floor(elapsed / 92) & 1) === 0;
+      const path = flash ? "#14dc54" : "#00562c";
+      const center = flash ? "#78ff66" : "#14dc54";
+      ctx.save();
+      ctx.strokeStyle = "#00562c";
+      ctx.strokeRect(CX - 24, CY - 24, 48, 48);
+      ctx.strokeStyle = center;
+      ctx.beginPath();
+      ctx.moveTo(CX - 34, CY);
+      ctx.lineTo(CX + 34, CY);
+      ctx.moveTo(CX, CY - 34);
+      ctx.lineTo(CX, CY + 34);
+      ctx.stroke();
+
+      for (const ball of balls) {
+        const start = demoBallPoint(ball, summonStart || now, true);
+        const sx = start.x;
+        const sy = start.y;
+        ctx.strokeStyle = path;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(CX, sy);
+        ctx.lineTo(CX, CY);
+        ctx.stroke();
+
+        let x = sx;
+        let y = sy;
+        const split = 0.56;
+        if (gather < split) {
+          const p = smoothStep(0, split, gather);
+          x = sx + (CX - sx) * p;
+        } else {
+          const p = smoothStep(split, 1, gather);
+          x = CX;
+          y = sy + (CY - sy) * p;
+        }
+
+        ctx.strokeStyle = "#002419";
+        ctx.strokeRect(x - 9, y - 9, 18, 18);
+        ctx.fillStyle = "#5c1c00";
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ff6f14";
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ffb824";
+        ctx.beginPath();
+        ctx.arc(x - 1, y - 1, 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawSummonCorePulse(elapsed) {
+      const flash = (Math.floor(elapsed / 74) & 1) === 0;
+      const core = flash ? "#78ff66" : "#14dc54";
+      const dim = flash ? "#00562c" : "#002419";
+      const step = Math.floor(elapsed / 56) % 4;
+
+      ctx.save();
+      ctx.lineWidth = 1;
+      ctx.shadowColor = core;
+      ctx.shadowBlur = flash ? 9 : 3;
+      for (let layer = 0; layer < 3; layer++) {
+        const r = 10 + layer * 11 + step * 2;
+        ctx.strokeStyle = layer === 0 ? core : dim;
+        ctx.strokeRect(CX - r, CY - r, r * 2, r * 2);
+      }
+
+      ctx.strokeStyle = core;
+      ctx.beginPath();
+      ctx.moveTo(CX - 42, CY);
+      ctx.lineTo(CX + 42, CY);
+      ctx.moveTo(CX, CY - 42);
+      ctx.lineTo(CX, CY + 42);
+      ctx.stroke();
+
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = dim;
+      ctx.beginPath();
+      ctx.moveTo(CX - 18, CY - 18);
+      ctx.lineTo(CX + 18, CY - 18);
+      ctx.moveTo(CX - 18, CY + 18);
+      ctx.lineTo(CX + 18, CY + 18);
+      ctx.moveTo(CX - 18, CY - 18);
+      ctx.lineTo(CX - 18, CY + 18);
+      ctx.moveTo(CX + 18, CY - 18);
+      ctx.lineTo(CX + 18, CY + 18);
+      ctx.stroke();
+
+      const startX = CX - 42;
+      const tickY = CY + 55;
+      const lit = 1 + (Math.floor(elapsed / 118) % summonCoreTickCount);
+      for (let i = 0; i < summonCoreTickCount; i++) {
+        const x = startX + i * 14;
+        const on = i < lit;
+        ctx.strokeStyle = on ? core : dim;
+        ctx.strokeRect(x, tickY, 8, 4);
+        if (on && flash) {
+          ctx.fillStyle = core;
+          ctx.fillRect(x + 2, tickY + 1, 4, 2);
+        }
+      }
+      ctx.restore();
+    }
+
+    function drawSummonOverlay(now) {
+      const elapsed = now - summonStart;
+      const t = elapsed / 1000;
+      ctx.save();
+      clipCircle();
+      const band = Math.floor((t * 1000 / 48) % 64);
+      ctx.strokeStyle = "#78ff66";
+      ctx.lineWidth = 1;
+      for (let offset = -192 + band; offset <= 192; offset += 64) {
+        if (Math.abs(offset) > R) continue;
+        const half = Math.sqrt(R * R - offset * offset);
+        ctx.beginPath();
+        ctx.moveTo(CX - half, CY + offset);
+        ctx.lineTo(CX + half, CY + offset);
+        ctx.moveTo(CX + offset, CY - half);
+        ctx.lineTo(CX + offset, CY + half);
+        ctx.stroke();
+      }
+
+      const halo = 18 + (Math.sin(t * 7) + 1) * 7;
+      ctx.strokeStyle = "#00562c";
+      ctx.strokeRect(CX - 34 - halo / 2, CY - 34 - halo / 2, 68 + halo, 68 + halo);
+      ctx.strokeStyle = "#78ff66";
+      ctx.beginPath();
+      ctx.moveTo(CX - 46, CY);
+      ctx.lineTo(CX + 46, CY);
+      ctx.moveTo(CX, CY - 46);
+      ctx.lineTo(CX, CY + 46);
+      ctx.stroke();
+      drawSummonCorePulse(elapsed);
+
+      if (elapsed < summonGatherMs) {
+        drawSummonGathering(elapsed, now);
+        drawSummonCorePulse(elapsed);
+        ctx.restore();
+        return;
+      }
+
+      const orbitT = (elapsed - summonGatherMs) / 1000;
+      for (let i = 0; i < 7; i++) {
+        const a = orbitT * 1.9 + i * (Math.PI * 2 / 7);
+        const breathe = (Math.sin(orbitT * 4.4 + i) + 1) * 0.5;
+        const radius = 34 + breathe * 10;
+        const x = CX + Math.cos(a) * radius;
+        const y = CY + Math.sin(a) * radius;
+        ctx.fillStyle = "#5c1c00";
+        ctx.beginPath();
+        ctx.arc(x, y, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ff6f14";
+        ctx.beginPath();
+        ctx.arc(x, y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ffb824";
+        ctx.beginPath();
+        ctx.arc(x - 1, y - 1, 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function tick(now) {
+      syncPreviewState();
+      if (freezePreview) {
+        if (previewShot === "boot") {
+          drawBootPhase(frozenPhase, frozenNow + frozenPhase * bootDurationMs, false);
+        } else if (previewShot === "summon") {
+          boot = false;
+          demoMode = true;
+          collected = 7;
+          radarStartedAt = 0;
+          summonStart = frozenNow - Math.round(frozenPhase * (summonGatherMs + 1600));
+          drawRadar(frozenNow);
+        } else if (previewShot === "startup") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = frozenNow - Math.round(startupAcquireMs * 0.42);
+          drawRadar(frozenNow);
+        } else if (previewShot === "idle") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = 0;
+          drawRadar(frozenNow + 236);
+        } else if (previewShot === "capture") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = 0;
+          drawRadar(frozenNow);
+          captureGlyph(CX + 56, CY - 32, Math.round(captureFlashMs * 0.34));
+        } else if (previewShot === "acquire") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = 0;
+          drawRadar(frozenNow);
+          const x = CX - 66;
+          const y = CY - 56;
+          acquisitionEcho(x, y, Math.round(acquisitionEchoMs * 0.42));
+          orb(x, y, 1, true, false, false);
+        } else if (previewShot === "trail") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = 0;
+          drawRadar(frozenNow);
+          const x = CX + 56;
+          const y = CY + 36;
+          const trail = targetTrails[0];
+          trail.points[0] = { x: x - 28, y: y, at: frozenNow - 180 };
+          trail.points[1] = { x: x - 48, y: y + 2, at: frozenNow - 520 };
+          trail.points[2] = { x: x - 66, y: y - 2, at: frozenNow - 860 };
+          drawTargetTrail(balls[0], frozenNow);
+          orb(x, y, 1, false, false, false);
+        } else if (previewShot === "trace") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = 0;
+          drawRadar(frozenNow);
+          orb(CX - 76, CY + 48, 1, false, true, false);
+        } else if (previewShot === "zoom") {
+          boot = false;
+          demoMode = true;
+          radarStartedAt = 0;
+          zoom = 2;
+          drawRadar(frozenNow);
+        } else if (previewShot === "lock") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = 0;
+          drawRadar(frozenNow);
+          const x = CX + 72;
+          const y = CY - 48;
+          orb(x, y, 1, false, false, false);
+          lockGlyph(x, y, 0.72, frozenNow);
+          drawProximityEdgePulse(x, y, 0.84, frozenNow);
+        } else if (previewShot === "controls") {
+          boot = false;
+          demoMode = false;
+          radarStartedAt = 0;
+          zoom = 2;
+          brightnessPreset = 2;
+          audioPreset = 3;
+          zoomFlashUntil = frozenNow + 540;
+          brightnessFlashUntil = frozenNow + 540;
+          audioFlashUntil = frozenNow + 540;
+          resetFlashUntil = frozenNow + Math.round(resetFlashMs * 0.5);
+          drawRadar(frozenNow);
+        } else if (previewShot === "touch") {
+          boot = false;
+          radarStartedAt = 0;
+          touchEcho = { x: CX + 42, y: CY - 18 };
+          touchEchoUntil = frozenNow + Math.round(touchEchoMs * 0.62);
+          drawRadar(frozenNow);
+        } else if (previewShot === "tilt") {
+          boot = false;
+          radarStartedAt = 0;
+          previewTiltKickUntil = frozenNow + 540;
+          drawRadar(frozenNow);
+        } else {
+          boot = false;
+          radarStartedAt = 0;
+          drawRadar(frozenNow);
+        }
+        return;
+      }
+
+      if (boot) {
+        drawBoot(now);
+      } else {
+        drawRadar(now);
+      }
+      requestAnimationFrame(tick);
+    }
+
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
