@@ -3,17 +3,14 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: tools/build_radar.sh [default|field|fielddiag|near|debug|diag|sim|beach] [build|upload]
+Usage: tools/build_radar.sh [default|field|fielddiag|debug|diag|beach] [build|upload]
 
 Examples:
   tools/build_radar.sh field
   tools/build_radar.sh fielddiag upload
-  tools/build_radar.sh near upload
   tools/build_radar.sh diag upload
-  tools/build_radar.sh sim upload
   tools/build_radar.sh beach upload
   RADAR_PORT=/dev/cu.usbmodem101 tools/build_radar.sh field upload
-  COLLECT_RSSI=-47 COLLECT_HOLD_MS=1500 tools/build_radar.sh field
 
 Environment:
   PIO_BIN          PlatformIO executable, default: pio
@@ -21,11 +18,6 @@ Environment:
   RADAR_MODE       Mode used when first arg is omitted, default: field
   RADAR_ACTION     build or upload when second arg is omitted, default: build
   RADAR_PORT       Optional serial upload port, such as /dev/cu.usbmodem101
-  COLLECT_RSSI     Override collection threshold in dBm, such as -47
-  COLLECT_HOLD_MS  Override close-hold time in milliseconds
-  BEACON_TTL_MS    Override active beacon timeout in milliseconds
-  BEACON_TRACE_MS  Override dim last-known trace lifetime in milliseconds
-  BEACON_FRESH_MS  Override bright fresh-beacon lifetime in milliseconds
   RADAR_BRIGHTNESS Override AMOLED brightness, 0-255, default: 184
   AUDIO_GAIN        Override audio level percent, 0-200, default: 100
   FRAME_MS          Override display frame interval, 20-180 ms, default: 25
@@ -33,9 +25,9 @@ Environment:
   BOOT_FRAME_DELAY_MS Override boot animation frame delay, 30-140 ms, default: 45
   GRID_SNAP         1 to latch target blips to rectangular grid, 0 for smooth motion
   SERIAL_DIAG       1 to print hidden hardware/BLE diagnostics over USB serial
-  DEMO_TOUCH        1 to allow center-tap simulated collection, 0 to disable
-  SIMULATED_BLE     1 to inject deterministic DBALL beacons in the radar firmware
   BEACH_SCENE       1 to show the beach walking scene, 0 for radar modes
+  PAIRING_HMAC_KEY  Build-time pairing HMAC key; must match server DRAGON_RADAR_PAIRING_HMAC_KEY
+  RADAR_RELEASE     1 to require a non-default production PAIRING_HMAC_KEY
 USAGE
 }
 
@@ -59,11 +51,6 @@ require_int() {
 }
 
 for override in \
-  COLLECT_RSSI \
-  COLLECT_HOLD_MS \
-  BEACON_TTL_MS \
-  BEACON_TRACE_MS \
-  BEACON_FRESH_MS \
   RADAR_BRIGHTNESS \
   AUDIO_GAIN \
   FRAME_MS \
@@ -71,8 +58,6 @@ for override in \
   BOOT_FRAME_DELAY_MS \
   GRID_SNAP \
   SERIAL_DIAG \
-  DEMO_TOUCH \
-  SIMULATED_BLE \
   BEACH_SCENE; do
   require_int "$override"
 done
@@ -95,8 +80,6 @@ require_range DISPLAY_BUS_HZ 20000000 80000000
 require_range BOOT_FRAME_DELAY_MS 30 140
 require_range GRID_SNAP 0 1
 require_range SERIAL_DIAG 0 1
-require_range DEMO_TOUCH 0 1
-require_range SIMULATED_BLE 0 1
 require_range BEACH_SCENE 0 1
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -119,11 +102,27 @@ RADAR_PLATFORM="${RADAR_PLATFORM:-https://github.com/pioarduino/platform-espress
 MODE="${1:-${RADAR_MODE:-field}}"
 ACTION="${2:-${RADAR_ACTION:-build}}"
 
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if is_truthy "${RADAR_RELEASE:-}"; then
+  DRAGON_RADAR_PAIRING_HMAC_KEY="${PAIRING_HMAC_KEY:-}" \
+  PAIRING_HMAC_KEY="${PAIRING_HMAC_KEY:-}" \
+    "$ROOT_DIR/tools/prepare_release_pairing_key.sh" check >/dev/null
+fi
+
 BASE_FLAGS=(
   "-DARDUINO_USB_CDC_ON_BOOT=1"
   "-DARDUINO_USB_MODE=1"
   "-DBOARD_HAS_PSRAM"
   "-DUSE_PRIVATE_BOOT_LOGO=1"
+  "-I\$PROJECT_PACKAGES_DIR/framework-arduinoespressif32/libraries/Network/src"
+  "-I\$PROJECT_PACKAGES_DIR/framework-arduinoespressif32/libraries/WiFi/src"
+  "-I\$PROJECT_PACKAGES_DIR/framework-arduinoespressif32/libraries/NetworkClientSecure/src"
 )
 
 BUILD_FLAGS=("${BASE_FLAGS[@]}")
@@ -133,31 +132,12 @@ case "$MODE" in
     ;;
   field)
     ENV_NAME="esp32-s3-touch-amoled-175c-field"
-    BUILD_FLAGS+=("-DDRAGON_RADAR_DEMO_ON_BOOT=0")
-    if [[ -z "${DEMO_TOUCH:-}" ]]; then
-      BUILD_FLAGS+=("-DDRAGON_RADAR_DEMO_TOUCH=0")
-    fi
     ;;
   fielddiag)
     ENV_NAME="esp32-s3-touch-amoled-175c-fielddiag"
     BUILD_FLAGS+=(
       "-DDRAGON_RADAR_SERIAL_DIAG=1"
-      "-DDRAGON_RADAR_DEMO_ON_BOOT=0"
-      "-DDRAGON_RADAR_DEMO_TOUCH=0"
     )
-    ;;
-  near)
-    ENV_NAME="esp32-s3-touch-amoled-175c-near"
-    BUILD_FLAGS+=("-DDRAGON_RADAR_DEMO_ON_BOOT=0")
-    if [[ -z "${DEMO_TOUCH:-}" ]]; then
-      BUILD_FLAGS+=("-DDRAGON_RADAR_DEMO_TOUCH=0")
-    fi
-    if [[ -z "${COLLECT_RSSI:-}" ]]; then
-      BUILD_FLAGS+=("-DDRAGON_RADAR_COLLECT_RSSI=-45")
-    fi
-    if [[ -z "${COLLECT_HOLD_MS:-}" ]]; then
-      BUILD_FLAGS+=("-DDRAGON_RADAR_COLLECT_HOLD_MS=1500")
-    fi
     ;;
   debug)
     ENV_NAME="esp32-s3-touch-amoled-175c-debug"
@@ -174,17 +154,6 @@ case "$MODE" in
       "-DDRAGON_RADAR_SCAN_LINE=1"
       "-DDRAGON_RADAR_STAR_BLIPS=1"
       "-DDRAGON_RADAR_SERIAL_DIAG=1"
-      "-DDRAGON_RADAR_DEMO_ON_BOOT=0"
-      "-DDRAGON_RADAR_DEMO_TOUCH=0"
-    )
-    ;;
-  sim)
-    ENV_NAME="esp32-s3-touch-amoled-175c-sim"
-    BUILD_FLAGS+=(
-      "-DDRAGON_RADAR_SERIAL_DIAG=1"
-      "-DDRAGON_RADAR_DEMO_ON_BOOT=0"
-      "-DDRAGON_RADAR_DEMO_TOUCH=0"
-      "-DDRAGON_RADAR_SIMULATED_BLE=1"
     )
     ;;
   beach)
@@ -192,8 +161,6 @@ case "$MODE" in
     BUILD_FLAGS+=(
       "-DDRAGON_RADAR_BEACH_SCENE=1"
       "-DDRAGON_RADAR_SERIAL_DIAG=1"
-      "-DDRAGON_RADAR_DEMO_ON_BOOT=0"
-      "-DDRAGON_RADAR_DEMO_TOUCH=0"
       "-DDRAGON_RADAR_AUDIO_GAIN=180"
     )
     ;;
@@ -222,11 +189,6 @@ append_override() {
   fi
 }
 
-append_override "${COLLECT_RSSI:-}" "DRAGON_RADAR_COLLECT_RSSI"
-append_override "${COLLECT_HOLD_MS:-}" "DRAGON_RADAR_COLLECT_HOLD_MS"
-append_override "${BEACON_TTL_MS:-}" "DRAGON_RADAR_BEACON_TTL_MS"
-append_override "${BEACON_TRACE_MS:-}" "DRAGON_RADAR_BEACON_TRACE_MS"
-append_override "${BEACON_FRESH_MS:-}" "DRAGON_RADAR_BEACON_FRESH_MS"
 append_override "${RADAR_BRIGHTNESS:-}" "DRAGON_RADAR_BRIGHTNESS"
 append_override "${AUDIO_GAIN:-}" "DRAGON_RADAR_AUDIO_GAIN"
 append_override "${FRAME_MS:-}" "DRAGON_RADAR_FRAME_MS"
@@ -234,9 +196,20 @@ append_override "${DISPLAY_BUS_HZ:-}" "DRAGON_RADAR_DISPLAY_BUS_HZ"
 append_override "${BOOT_FRAME_DELAY_MS:-}" "DRAGON_RADAR_BOOT_FRAME_DELAY_MS"
 append_override "${GRID_SNAP:-}" "DRAGON_RADAR_GRID_SNAP"
 append_override "${SERIAL_DIAG:-}" "DRAGON_RADAR_SERIAL_DIAG"
-append_override "${DEMO_TOUCH:-}" "DRAGON_RADAR_DEMO_TOUCH"
-append_override "${SIMULATED_BLE:-}" "DRAGON_RADAR_SIMULATED_BLE"
 append_override "${BEACH_SCENE:-}" "DRAGON_RADAR_BEACH_SCENE"
+
+append_string_override() {
+  local value="$1"
+  local macro="$2"
+  if [[ -n "$value" ]]; then
+    local escaped="${value//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    BUILD_FLAGS+=("-D${macro}=\\\"${escaped}\\\"")
+    CUSTOM_FLAGS=1
+  fi
+}
+
+append_string_override "${PAIRING_HMAC_KEY:-}" "DRAGON_RADAR_PAIRING_HMAC_KEY"
 
 CUSTOM_WORK_DIR=""
 cleanup() {
@@ -263,7 +236,9 @@ if [[ "$CUSTOM_FLAGS" == "1" ]]; then
     echo "monitor_speed = 115200"
     echo "upload_speed = 921600"
     echo "board_build.flash_size = 32MB"
-    echo "board_build.partitions = huge_app.csv"
+    echo "board_build.partitions = partitions_dragon_radar_32mb.csv"
+    echo "lib_deps ="
+    echo "  links2004/WebSockets @ ^2.6.1"
     echo "build_flags ="
     for flag in "${BUILD_FLAGS[@]}"; do
       echo "  $flag"
@@ -282,6 +257,14 @@ fi
 
 echo "$ACTION radar mode '$MODE' with PlatformIO env '$ENV_NAME'"
 if [[ "$CUSTOM_FLAGS" == "1" ]]; then
-  echo "Custom build flags: ${BUILD_FLAGS[*]}"
+  REDACTED_BUILD_FLAGS=()
+  for flag in "${BUILD_FLAGS[@]}"; do
+    if [[ "$flag" == -DDRAGON_RADAR_PAIRING_HMAC_KEY=* ]]; then
+      REDACTED_BUILD_FLAGS+=("-DDRAGON_RADAR_PAIRING_HMAC_KEY=<redacted>")
+    else
+      REDACTED_BUILD_FLAGS+=("$flag")
+    fi
+  done
+  echo "Custom build flags: ${REDACTED_BUILD_FLAGS[*]}"
 fi
 "$PIO_BIN" "${RUN_ARGS[@]}"

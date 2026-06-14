@@ -1,189 +1,109 @@
-# 龙珠雷达产品设计与可行性说明
+# Dragon Radar 产品设计与当前目标
 
-目标是做一个个人和朋友一起玩的龙珠雷达道具：拿在手里像动漫里的雷达，
-开机有胶囊风格动画，主界面是绿色矩形坐标网格，靠近隐藏的 7 个“龙珠”
-信标时出现目标点，收集完 7 个后进入召唤动画。
+## 当前结论
 
-硬件目标板：
+实体 `DBALL-*` 寻宝玩法已经废弃。当前项目目标改为：
 
-- Waveshare ESP32-S3-Touch-AMOLED-1.75C
-- 官方页面：<https://www.waveshare.net/shop/ESP32-S3-Touch-AMOLED-1.75C.htm>
+- 多名成员加入同一个远程房间，首版上限 7 人。
+- 每名成员使用 1 台 iPhone + 1 块 `Waveshare ESP32-S3-Touch-AMOLED-1.75C`。
+- iPhone 负责定位、指南针、账号、房间、设备绑定和 Wi-Fi/热点配置。
+- ESP 负责圆屏雷达显示、触摸控制、麦克风采集、扬声器播放和云端实时链路。
+- 云端 Relay 负责房间状态、定位转发、在线状态、抢麦控制和语音帧转发。
 
-官方规格要点：1.75 英寸 466 x 466 AMOLED，CO5300 QSPI 显示驱动，
-CST9217 电容触摸，ESP32-S3R8，8MB PSRAM，32MB Flash，BLE 5，
-QMI8658 六轴 IMU，双麦克风、音频编解码与扬声器相关硬件，Type-C，
-电池接口和 GPIO 焊盘。
+旧的实体信标、收集、召唤、field hunt、七颗球验收不再作为产品目标，也不再作为完成标准。
 
-## 结论
+## 产品形态
 
-这个项目可行，但定位应是“近距离寻物 / 派对寻宝道具”，不是户外导航设备。
+Dragon Radar 是一个多人远程定位与抢麦语音终端。
 
-原因：
+每个用户的使用链路：
 
-- 这块开发板没有板载 GPS/GNSS。
-- 室内或小场地玩法本来也不适合依赖 GPS，GPS 在室内弱、漂移大。
-- ESP32-S3 有 BLE，适合扫描 7 个低功耗广播信标。
-- 板载 IMU 可用来估计玩家旋转方向，让目标点在雷达网格上呈现相对方向。
-- AMOLED 圆屏、触摸、音频和铝合金外壳适合做成沉浸式道具。
-
-因此第一版不加 GPS。用 7 个 `DBALL-1..7` BLE 信标作为“龙珠”，雷达只做
-相对寻物和收集反馈。
-
-## 不支持 GPS 怎么办
-
-不需要为第一版补 GPS。
-
-推荐方案：
-
-1. 每个龙珠信标周期性广播 BLE 名称或制造商数据。
-2. 雷达扫描 BLE RSSI，估计哪个信标更近。
-3. 玩家缓慢转动雷达时，IMU 提供朝向变化，固件把不同朝向下的 RSSI 强度
-   累积成 16 个方向 bins。
-4. UI 把目标点吸附到矩形网格上，靠近时加快音频 ping，并出现收集锁定。
-5. 收集满 7 个后，7 个目标沿横竖网格线汇聚到中心，进入召唤动画。
-
-这套玩法的体验重点是“像雷达一样找东西”，不是地图定位。
-
-## 是否能改装 GPS
-
-可以改，但不建议作为第一版。
-
-可行改装路径：
-
-- 外接小型 GNSS 模块，通过 UART 或可用 GPIO 焊盘连接。
-- 需要给 GNSS 天线留出朝天方向和无遮挡位置。
-- 需要额外供电预算，电池续航会下降。
-- 需要在固件里加入 NMEA 解析、坐标存储、地图比例和目标坐标管理。
-- 室外才有明显价值，室内体验通常不如 BLE 信标稳定。
-
-更推荐的升级路线：
-
-- V1：BLE 信标 + IMU，相对寻物。
-- V1.5：手机蓝牙桥接，手机提供 GPS/指南针，雷达仍只负责道具 UI。
-- V2：UWB 信标，提高近距离方向和距离精度。
-- V3：外接 GNSS，只用于户外大范围玩法。
+```text
+iPhone 获取定位/管理房间
+        |
+        | BLE 配对、配网、写入 server_config/local_location
+        v
+ESP 圆屏显示房间成员位置，并通过 Wi-Fi/WSS 连接 Relay
+        |
+        | WSS: device_status / voice_frame / heartbeat
+        v
+Relay Server
+        ^
+        | WSS: app_location / room_state / room_switch
+        |
+其他成员的 iPhone + ESP
+```
 
 ## MVP 功能
 
 必须完成：
 
-- 开机动画：绿色网格唤醒、扫描带、胶囊风格 Logo、7 个进度 tick。
-- 主 UI：圆形 AMOLED 内显示矩形坐标网格，不使用同心圆环。
-- 正式模式无调试文字，只有目标点、锁定、收集和召唤反馈。
-- `field` 模式：真实游玩，空网格开始，只响应实体 BLE 信标。
-- `fielddiag` 模式：干净 UI + 隐藏串口记录，用于真实游玩验收。
-- `sim` 模式：一块板模拟 7 个龙珠，用于上板测试。
-- `diag` 模式：硬件 bring-up 和调试 HUD。
-- 7 个 `DBALL-*` BLE 信标固件。
-- 视觉 QA、固件 UI 契约审计、发布包自检和硬件验收脚本。
+- App 创建/加入房间，首版房间上限 7 人。
+- App 通过 CoreLocation 获取本机定位，并上传 Relay。
+- App 通过 CoreBluetooth 扫描 `CapsuleRadar-*`，完成设备绑定、Wi-Fi 配网和 server_config 写入。
+- ESP 通过 BLE 暴露配置服务，接收 Wi-Fi、房间、Relay URL、设备 token 和本机定位摘要。
+- ESP 通过 Wi-Fi 连接 Relay，维持 `/v1/radar/device/ws` 长连接。
+- Relay 维护 room_state，把同一成员的 App 和 ESP 合并成一个成员状态。
+- ESP 圆屏显示同房间其他成员的距离、方位、在线状态、定位新鲜度和说话状态。
+- ESP 触摸或按键触发抢麦/释放麦。
+- Relay 维护抢麦状态：同一时间只允许一个成员获得发言权，其他成员收到 `voice_busy`。
+- ESP 上行麦克风语音帧，其他在线 ESP 下行播放远端语音帧。
+- 断线后 App、ESP、Relay 都能恢复房间状态。
 
-当前仓库已经实现这些软件交付物，硬件闭环仍需要真板和实体信标报告证明。
+## 不做的功能
 
-## 创新点
+- 不做实体 `DBALL-*` 信标。
+- 不做信标制作、隐藏、收集、召唤动画作为完成标准。
+- 不做离线地图包。
+- 不让 iPhone 转发 ESP 音频；语音由 ESP 直接走云端 Relay。
+- 首版不做多人同时混音。当前语音目标是抢麦：一个成员说话，其他成员听。
 
-- GPS-free 龙珠雷达：不依赖地图和坐标，靠 BLE + IMU 做相对雷达感。
-- 动漫式 UI 约束自动化：固件审计会防止主界面误改成圆环雷达或调试 HUD。
-- 干净 UI 与隐藏诊断分离：朋友看到的是道具界面，电脑能记录完整 DIAG 证据。
-- 一块板模拟验收：没有 7 个信标时，也能先验证屏幕、触摸、IMU、BLE、音频和召唤流程。
-- 发布包自检：交给别人前可以无硬件验证包完整性和 mock 链路。
-- 现场工具化：信标标签、field kit、中文 quickstart、可复现的报告和 checksum。
-- 私有 Logo 钩子：本地可以编译胶囊风格开机图形，发布包不泄露私有源文件。
+## 模块职责
 
-## 硬件组成
+### ESP 固件
 
-主雷达：
+- BLE 配置服务：`pairing_challenge`、`pairing_response`、`wifi_config`、`local_location`、`device_status`、`server_config`。
+- Wi-Fi STA：连接路由器或 iPhone Personal Hotspot。
+- CloudClient：连接 Relay，发送 hello、heartbeat、device_status、voice_frame。
+- RoomStateStore：解析 room_state，保存远端成员定位、在线状态和语音状态。
+- RadarUI：圆屏矩形网格、远端成员 marker、距离/方位、网络状态、说话状态。
+- VoiceController：抢麦、静音、VAD、音频帧上行、远端语音播放。
 
-- ESP32-S3-Touch-AMOLED-1.75C 主板。
-- Type-C 数据线。
-- 可选锂电池版本或外接 3.7V 电池。
-- 可选挂绳、外壳保护、屏幕保护膜。
+### iOS App
 
-7 个龙珠信标：
+- 房间：创建、加入、切房、显示成员列表。
+- 定位：上传本机 GPS/course/accuracy，并过滤模拟默认定位。
+- BLE：扫描、绑定、写 Wi-Fi、写 server_config、写 local_location。
+- 设备：展示 ESP 的 BLE、Wi-Fi、Relay、定位、语音状态。
+- 诊断：展示 Relay room_state、device_status、voice_status 和最近错误。
 
-- 任意能跑 ESP32 Arduino BLE 广播的小 ESP32 开发板。
-- 每个信标刷入一个编号：`DBALL-1` 到 `DBALL-7`。
-- 每个信标独立供电，推荐小电池盒或带开关锂电模块。
-- 打印 `docs/beacon-labels.html`，贴编号和隐藏位置记录。
+### Relay Server
 
-## 软件模式
+- 接入 `/v1/radar/app/ws` 和 `/v1/radar/device/ws`。
+- 按 room + group 合并 App/ESP 成员。
+- 广播 room_state。
+- 转发 app_location 给同房间设备。
+- 管理抢麦状态和 `voice_busy`。
+- 转发 `voice_frame`，并记录抢麦、上行、下行语音帧日志。
 
-| 模式 | 用途 | 是否干净 UI | 是否有串口 DIAG |
-| --- | --- | --- | --- |
-| `field` | 真实游玩 | 是 | 否 |
-| `fielddiag` | 真实游玩记录 | 是 | 是 |
-| `sim` | 一块板上板模拟 | 是 | 是 |
-| `diag` | 硬件 bring-up | 否，带 HUD | 是 |
-| `debug` | UI/方向调试 | 否，带 HUD | 可选 |
+## 验收标准
 
-## 验收路径
+当前目标完成需要满足：
 
-无硬件：
-
-```sh
-tools/selftest_release.py
-```
-
-这只证明发布包和 mock 链路，报告中必须是 `hardwareProof=false`。
-
-一块主板：
-
-```sh
-tools/run_board_sim_test.py port-check
-RADAR_PORT=/dev/cu.usbmodem101 tools/run_board_sim_test.py auto
-```
-
-通过后证明真板上的屏幕、触摸、IMU、BLE 初始化、音频和 7 个模拟收集流程。
-
-完整硬件：
-
-```sh
-RADAR_PORT=/dev/cu.usbmodem101 tools/run_release_acceptance.sh all
-```
-
-完成条件：
-
-- 硬件 bring-up passed。
-- 一块板 sim bench passed。
-- 7 个实体信标都被看到。
-- field hunt 记录 7 次收集事件。
-- 最终 `summon=true`。
-- `output/project-status.md` 显示 `Hardware completion: PASS`。
-
-## 风险与规避
-
-BLE RSSI 波动：
-
-- 目标点做滤波和网格吸附。
-- 玩法设计成“越近越强”和“转动找方向”，不承诺精确米级定位。
-- 通过 `recommend_field_tuning.py` 按场地调 `COLLECT_RSSI`。
-
-室内遮挡和人体吸收：
-
-- 信标不要贴在金属盒里。
-- 让朋友隐藏在布袋、纸盒、塑料球里更稳定。
-- 先用 `verify_beacon_set.sh` 确认 7 个信标都能被看到。
-
-电池和续航：
-
-- 信标广播间隔不要太短。
-- 每轮游戏前用 field kit 勾选电量和开关状态。
-
-Logo 和版权边界：
-
-- 私有胶囊风格开机图形只在本地编译进固件。
-- 发布包只包含 `private_boot_logo.h.example`，不复制私有 Logo 源文件。
-
-硬件串口不可见：
-
-- 换数据线，优先排除纯充电线。
-- 运行 `tools/run_board_sim_test.py port-check`。
-- 只看到蓝牙、耳机或 debug-console 时，不要继续刷机。
+- 1 个房间内至少 2 组 `iPhone + ESP` 能同时在线。
+- 任一 iPhone 定位变化后，同房间其他 ESP 能在圆屏显示距离/方位变化。
+- 房间第 8 名成员加入会被 Relay 拒绝，并返回明确错误。
+- ESP 断网后，其他成员在 room_state 中看到该设备离线。
+- 一个 ESP 抢麦时，其他 ESP 不能同时抢到麦，并收到 busy 状态。
+- 抢麦成员的语音帧能被 Relay 转发到其他 ESP，并触发播放状态。
+- iOS App 能显示房间成员、定位、设备在线、Wi-Fi、Relay、语音状态。
+- 固件和 App 均能重新连接 Relay 并恢复当前房间。
 
 ## 当前状态
 
-截至当前仓库状态：
+截至当前工作区：
 
-- 软件包、预览、视觉 QA、固件 UI 契约、自检和发布包校验均已通过。
-- 发布包位置：`output/release-current.tar.gz`。
-- 真板串口尚未识别到，硬件验收报告缺失。
-- 因此项目状态应继续保持 `Hardware completion: NOT PROVEN`，不能标记 goal 完成。
+- Relay smoke 已能证明 App/Device 同房间、定位转发、voice_state 回填。
+- iOS App 已有 4 Tab 信息架构、BLE 配置、定位上传、Relay room_state 解析。
+- ESP 固件已具备 BLE 配置服务、Wi-Fi/WSS、room_state 解析、远端定位 marker、PTT/VAD/语音帧雏形。
+- 还缺真实 2 组以上硬件联调、生产鉴权、持久化房间、TLS 部署和完整抢麦语音实测。

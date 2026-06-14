@@ -1,4 +1,4 @@
-# 多雷达远程定位与 7 人同时语音架构
+# 多雷达远程定位与 7 人房间抢麦语音架构
 
 ## 目标
 
@@ -8,7 +8,7 @@
 - 用户 2：`ESP32-S3-Touch-AMOLED-1.75C-2` + `iPhone-2`
 - 用户 N：`ESP32-S3-Touch-AMOLED-1.75C-N` + `iPhone-N`
 
-每块 ESP 连接自己的 iPhone 后，能在 ESP 圆屏上看到同一房间内其他成员的定位状态、距离、方位、在线状态，并通过 ESP 的麦克风/扬声器进行最多 7 人同时语音。
+每块 ESP 连接自己的 iPhone 后，能在 ESP 圆屏上看到同一房间内其他成员的定位状态、距离、方位、在线状态，并通过 ESP 的麦克风/扬声器进行房间抢麦语音。
 
 ## 关键结论
 
@@ -108,10 +108,10 @@ iPhone App 不负责首版语音转发。语音由 ESP 直接经云端中继。
 - iPhone WebSocket 接入
 - 定位状态转发
 - 最多 7 人语音房间管理
-- 服务端混音和每设备 mix-minus 下发
+- 抢麦仲裁、当前发言权状态和单路语音转发
 - 在线/断线/心跳管理
 
-服务端负责鉴权、房间状态、语音解码、混音、重新编码和每设备 mix-minus 下发。
+服务端负责鉴权、房间状态、抢麦仲裁、语音帧转发和发言权释放。
 
 ## 网络模式
 
@@ -161,6 +161,17 @@ Characteristics：
 | `local_location` | App -> ESP write | 本机 GPS 摘要 |
 | `device_status` | ESP -> App notify | 电量、Wi-Fi、云连接、音频状态 |
 | `server_config` | App -> ESP write | Relay URL、room token、device token |
+
+首版 iOS/ESP 固件使用以下特征 UUID 合同：
+
+| 名称 | UUID |
+| --- | --- |
+| `pairing_challenge` | `7d540101-f82d-4b2f-91c6-4f0f88aa5a11` |
+| `pairing_response` | `7d540102-f82d-4b2f-91c6-4f0f88aa5a11` |
+| `wifi_config` | `7d540103-f82d-4b2f-91c6-4f0f88aa5a11` |
+| `local_location` | `7d540104-f82d-4b2f-91c6-4f0f88aa5a11` |
+| `device_status` | `7d540105-f82d-4b2f-91c6-4f0f88aa5a11` |
+| `server_config` | `7d540106-f82d-4b2f-91c6-4f0f88aa5a11` |
 
 ### 本机定位包
 
@@ -215,37 +226,41 @@ wss://api.example.com/v1/radar/device/ws?device_id=<id>
 | `room_state` | 房间成员、在线状态 |
 | `member_location` | 某个房间成员的 iPhone 定位 |
 | `member_display_state` | 某个房间成员相对本机的显示状态 |
-| `voice_state` | 房间语音成员、静音、活跃说话者 |
-| `audio_mix_frame` | 服务端给本设备的混音帧 |
+| `voice_state` | 房间语音成员、静音、当前抢麦者 |
+| `voice_frame` | 当前抢麦者发给其他设备的语音帧 |
+| `voice_busy` | 本机抢麦失败，房间已有发言者 |
 | `config_update` | 服务器配置 |
 
-## 7 人同时语音
+## 7 人房间抢麦语音
 
-首版使用服务端混音，不让 ESP 本地解码和混合 6 路远端音频。
+首版不做多人同时混音。房间最多 7 名成员，但同一时刻只有 1 名成员持有发言权。
 
 每台 ESP：
 
-- 上行：只上传 1 路本机麦克风音频。
-- 下行：只接收 1 路服务端混好的 `mix-minus` 音频。
+- 按住抢麦键后发送 `voice_claim`。
+- Relay 若当前无人发言，则返回 `voice_granted`，该 ESP 才开始上传麦克风帧。
+- Relay 若已有其他成员发言，则返回 `voice_busy`，该 ESP 不上传语音。
+- 下行只接收当前抢麦者的一路 `voice_frame`。
 
-`mix-minus` 含义：服务端给某台 ESP 下发的混音中包含房间其他成员声音，不包含这台 ESP 自己上传的声音，避免本机回声被立即返送回来。
+松开抢麦键、静音、断线、或超时无帧时，Relay 释放发言权并广播新的 `voice_state`。
 
 房间容量：
 
 - `max_members = 7`
 - 每名成员最多绑定 1 台活跃 ESP
-- 每台 ESP 最多 1 路上行音频、1 路下行混音
+- 每个房间同一时刻最多 1 路上行发言音频
+- 每台非发言 ESP 最多 1 路下行语音
 
-首版编码使用 `G.711 μ-law`，不使用 Opus。原因是 ESP 端实现确定、延迟低、CPU 占用可控；服务端负责解码、混音、重新编码。
+首版编码以当前固件实现为准，使用 `PCM16 16kHz mono` 20 ms 帧。后续若网络带宽需要压缩，再引入 G.711 或 Opus；压缩不是当前 MVP 完成条件。
 
 固定参数：
 
-- 采样率：`8000 Hz`
+- 采样率：`16000 Hz`
 - 声道：`mono`
-- 编码：`G.711 μ-law`
+- 编码：`PCM16_LE`
 - 帧长：`20 ms`
-- 每帧 PCM 样本：`160`
-- 每帧编码后大小：`160 bytes`
+- 每帧 PCM 样本：`320`
+- 每帧大小：`640 bytes`
 
 ESP 上行语音帧：
 
@@ -253,32 +268,31 @@ ESP 上行语音帧：
 struct AudioFrameHeader {
   uint16_t magic;       // 0xDA7A
   uint8_t  version;     // 1
-  uint8_t  codec;       // 1 = G711_ULAW
+  uint8_t  codec;       // 1 = PCM16_LE
   uint32_t session_id;
   uint16_t seq;
   uint32_t timestamp_ms;
   uint8_t  flags;       // bit0 muted, bit1 vad_active
 };
-// followed by 160 bytes G.711 payload
+// followed by 640 bytes PCM16 payload
 ```
 
-服务端混音规则：
+服务端抢麦规则：
 
-- 服务端维护房间内最多 7 路成员音频输入。
-- 服务端每 20 ms 对齐一次房间音频帧。
-- 每路输入先从 μ-law 解码为 16-bit PCM。
-- 对每个接收设备生成一份独立 mix-minus PCM：混入其他成员，不混入自己。
-- 混音时用 `int32` 累加，再限幅到 `int16`，最后重新编码成 μ-law。
-- 若某成员静音、掉线、或 300 ms 内没有音频帧，该成员输入视为静音。
-- 服务端下发 `voice_state`，包含正在发出有效语音的成员列表。
-- ESP 端不做多路混音，只播放服务端下发的 `audio_mix_frame`。
+- Relay 维护每个房间的 `floor_holder`。
+- `floor_holder` 为空时，第一个合法 `voice_claim` 获得发言权。
+- `floor_holder` 非空时，其他成员的 `voice_claim` 返回 `voice_busy`。
+- 只有 `floor_holder` 的 `audio_frame` 会被 Relay 转发给其他成员。
+- 若 `floor_holder` 静音、释放、断线、或 300 ms 内没有音频帧，Relay 释放发言权。
+- Relay 下发 `voice_state`，包含当前抢麦者、静音状态、帧计数和延迟。
+- ESP 端只播放 Relay 下发的 `voice_frame`，不做多路混音。
 
 ESP 端回声处理：
 
 - 首版必须提供触摸静音。
-- 扬声器播放时，麦克风仍可采集，但固件要做噪声门限：低于阈值不上传。
-- 服务端做 mix-minus，但不能消除扬声器声音被本机麦克风再次采到的声学回声。
-- 如果实测回声明显，下一步增加回声抑制：ESP 上传播放参考能量，服务端对该成员输入做门限/衰减；产品形态上也可以降低扬声器音量或增加物理隔音。
+- 播放下行语音时，本机默认不持有发言权，避免本机扬声器被麦克风再次采集。
+- 抢麦时如果本机正在播放远端语音，固件应先停止播放或显著压低播放音量。
+- 如果实测回声明显，下一步再增加回声抑制；它不是当前抢麦 MVP 的前置条件。
 
 ## 定位显示
 
@@ -413,7 +427,8 @@ voice_member_states
   - Relay 延迟
   - GPS 精度
   - 语音帧计数
-  - 混音下行帧计数
+  - 语音下行帧计数
+  - 当前抢麦状态
 
 ## ESP 固件模块
 
@@ -469,7 +484,7 @@ voice_member_states
 - 所有公网连接使用 TLS：`https://` 和 `wss://`
 - 设备 token 由 App 绑定时下发
 - BLE 配网写入必须加密，不能明文广播 Wi-Fi 密码
-- 语音帧只在房间成员之间混音和转发
+- 语音帧只在房间成员之间转发
 - 服务端验证 `room_id + device_id + token`
 - 邀请码一次性或短期有效
 - 设备解绑后立即吊销 device token
@@ -480,9 +495,9 @@ voice_member_states
 2. iOS：登录、BLE 扫描绑定、创建最多 7 人房间、上传定位。
 3. ESP：Wi-Fi 连接、WSS hello/heartbeat、显示服务端下发文本。
 4. 定位链路：任一 iPhone 上传定位，同房间其他 ESP 屏幕显示该成员位置。
-5. 单人语音上行：1 台 ESP 上传麦克风帧，服务端收到并统计。
-6. 单人混音下行：服务端给其他 ESP 下发该成员声音。
-7. 多人同时语音：最多 7 台 ESP 同时上传，服务端给每台 ESP 下发各自的 mix-minus 混音。
+5. 抢麦控制：1 台 ESP 成功获得发言权，其他 ESP 收到当前抢麦状态。
+6. 单人语音上行：持有发言权的 ESP 上传麦克风帧，服务端收到并统计。
+7. 单人语音下行：Relay 将当前抢麦者声音转发给其他在线 ESP；并发抢麦返回 `voice_busy`。
 8. 断线重连：ESP、App、服务端分别做重连和状态恢复。
 9. 现场测试：最多 7 名成员、不同网络、iPhone 热点、家用 Wi-Fi、弱网。
 
@@ -493,11 +508,11 @@ voice_member_states
 - 任一 iPhone 的定位变化能在同房间其他 ESP 屏幕上显示。
 - 房间第 8 名成员尝试加入时，服务端拒绝并返回明确错误码。
 - 1 人说话时，其余在线 ESP 都能播放该成员声音。
-- 2-7 人同时说话时，每台 ESP 都能听到除自己之外的混音。
+- 2-7 人同时抢麦时，只允许 1 人获得发言权，其余设备收到明确 busy 状态。
 - 任一 ESP 本地静音后，服务端不再把该 ESP 的麦克风输入混入其他成员下行。
 - 任一 ESP 断网后，其他成员 ESP 在 5 秒内显示该设备离线。
 - 任一 iPhone 定位失效后，其他成员 ESP 显示该成员定位无效。
-- 云端日志能追踪每次房间、设备、定位、语音 session、上行帧、下行混音帧。
+- 云端日志能追踪每次房间、设备、定位、抢麦 session、上行帧、下行语音帧。
 
 ## 官方依据
 

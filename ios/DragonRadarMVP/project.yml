@@ -1,0 +1,72 @@
+name: DragonRadarMVP
+options:
+  bundleIdPrefix: com.sn5
+  deploymentTarget:
+    iOS: "18.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: Y77G89XGJ7
+    CODE_SIGN_STYLE: Automatic
+targets:
+  DragonRadarMVP:
+    type: application
+    platform: iOS
+    sources:
+      - DragonRadarMVP/Sources
+      - DragonRadarMVP/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sn5.DragonRadarMVP
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+      configs:
+        Debug:
+          INFOPLIST_FILE: DragonRadarMVP/Info-Debug.plist
+          CODE_SIGN_ENTITLEMENTS: ""
+          APS_ENVIRONMENT: development
+          DRAGON_RADAR_ENVIRONMENT: Debug
+          DRAGON_RADAR_HTTP_API_BASE_URL: http://139.224.41.192:8788
+          DRAGON_RADAR_RELAY_BASE_URL: ws://139.224.41.192:8787
+        Release:
+          INFOPLIST_FILE: DragonRadarMVP/Info.plist
+          CODE_SIGN_ENTITLEMENTS: DragonRadarMVP/DragonRadarMVP.entitlements
+          APS_ENVIRONMENT: production
+          DRAGON_RADAR_ENVIRONMENT: Production
+          DRAGON_RADAR_HTTP_API_BASE_URL: https://relay.dragon-radar.example
+          DRAGON_RADAR_RELAY_BASE_URL: wss://relay.dragon-radar.example
+  DragonRadarMVPTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - DragonRadarMVPTests
+    dependencies:
+      - target: DragonRadarMVP
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sn5.DragonRadarMVPTests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/DragonRadarMVP.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DragonRadarMVP"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+  DragonRadarMVPUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - DragonRadarMVPUITests
+    dependencies:
+      - target: DragonRadarMVP
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sn5.DragonRadarMVPUITests
+        TEST_TARGET_NAME: DragonRadarMVP
+schemes:
+  DragonRadarMVP:
+    build:
+      targets:
+        DragonRadarMVP: all
+        DragonRadarMVPTests: [test]
+        DragonRadarMVPUITests: [test]
+    test:
+      targets:
+        - DragonRadarMVPTests
+        - DragonRadarMVPUITests

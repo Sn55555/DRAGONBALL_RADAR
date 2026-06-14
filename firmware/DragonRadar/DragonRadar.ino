@@ -2,12 +2,18 @@
 #include <Arduino_GFX_Library.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEDevice.h>
-#include <BLEScan.h>
+#include <BLEServer.h>
+#include <Network.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebSocketsClient.h>
 #include <ESP_I2S.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <base64.h>
 #include <esp_system.h>
 #include <math.h>
+#include <mbedtls/md.h>
 #include <string.h>
 
 #include "SensorQMI8658.hpp"
@@ -41,40 +47,28 @@
 #define DRAGON_RADAR_SERIAL_DIAG 0
 #endif
 
-#ifndef DRAGON_RADAR_DEMO_ON_BOOT
-#define DRAGON_RADAR_DEMO_ON_BOOT 1
+#ifndef DRAGON_RADAR_REMOTE_BLE
+#define DRAGON_RADAR_REMOTE_BLE 1
 #endif
 
-#ifndef DRAGON_RADAR_DEMO_TOUCH
-#define DRAGON_RADAR_DEMO_TOUCH 1
+#ifndef DRAGON_RADAR_PAIRING_HMAC_KEY
+#define DRAGON_RADAR_PAIRING_HMAC_KEY "dragon-radar-dev-pairing-key"
 #endif
 
-#ifndef DRAGON_RADAR_SIMULATED_BLE
-#define DRAGON_RADAR_SIMULATED_BLE 0
+#ifndef DRAGON_RADAR_ALLOW_LEGACY_PAIRING
+#define DRAGON_RADAR_ALLOW_LEGACY_PAIRING 0
+#endif
+
+#ifndef DRAGON_RADAR_PROTOCOL_VERSION
+#define DRAGON_RADAR_PROTOCOL_VERSION 2
+#endif
+
+#ifndef DRAGON_RADAR_MIN_RELAY_PROTOCOL_VERSION
+#define DRAGON_RADAR_MIN_RELAY_PROTOCOL_VERSION 2
 #endif
 
 #ifndef DRAGON_RADAR_BEACH_SCENE
 #define DRAGON_RADAR_BEACH_SCENE 0
-#endif
-
-#ifndef DRAGON_RADAR_BEACON_TTL_MS
-#define DRAGON_RADAR_BEACON_TTL_MS 18000
-#endif
-
-#ifndef DRAGON_RADAR_BEACON_TRACE_MS
-#define DRAGON_RADAR_BEACON_TRACE_MS 45000
-#endif
-
-#ifndef DRAGON_RADAR_BEACON_FRESH_MS
-#define DRAGON_RADAR_BEACON_FRESH_MS 3000
-#endif
-
-#ifndef DRAGON_RADAR_COLLECT_HOLD_MS
-#define DRAGON_RADAR_COLLECT_HOLD_MS 1200
-#endif
-
-#ifndef DRAGON_RADAR_COLLECT_RSSI
-#define DRAGON_RADAR_COLLECT_RSSI -50
 #endif
 
 #ifndef DRAGON_RADAR_BRIGHTNESS
@@ -86,7 +80,7 @@
 #endif
 
 #ifndef DRAGON_RADAR_SOUND_EFFECTS
-#define DRAGON_RADAR_SOUND_EFFECTS 0
+#define DRAGON_RADAR_SOUND_EFFECTS 1
 #endif
 
 #ifndef DRAGON_RADAR_FRAME_MS
@@ -106,6 +100,7 @@
 #include "private_boot_logo.h"
 #endif
 #endif
+#include "boot_audio_pcm.h"
 
 static_assert(DRAGON_RADAR_BRIGHTNESS >= 0 && DRAGON_RADAR_BRIGHTNESS <= 255,
               "DRAGON_RADAR_BRIGHTNESS must be in 0..255");
@@ -117,10 +112,14 @@ static_assert(DRAGON_RADAR_GRID_SNAP == 0 || DRAGON_RADAR_GRID_SNAP == 1,
               "DRAGON_RADAR_GRID_SNAP must be 0 or 1");
 static_assert(DRAGON_RADAR_SERIAL_DIAG == 0 || DRAGON_RADAR_SERIAL_DIAG == 1,
               "DRAGON_RADAR_SERIAL_DIAG must be 0 or 1");
-static_assert(DRAGON_RADAR_DEMO_TOUCH == 0 || DRAGON_RADAR_DEMO_TOUCH == 1,
-              "DRAGON_RADAR_DEMO_TOUCH must be 0 or 1");
-static_assert(DRAGON_RADAR_SIMULATED_BLE == 0 || DRAGON_RADAR_SIMULATED_BLE == 1,
-              "DRAGON_RADAR_SIMULATED_BLE must be 0 or 1");
+static_assert(DRAGON_RADAR_REMOTE_BLE == 0 || DRAGON_RADAR_REMOTE_BLE == 1,
+              "DRAGON_RADAR_REMOTE_BLE must be 0 or 1");
+static_assert(DRAGON_RADAR_ALLOW_LEGACY_PAIRING == 0 || DRAGON_RADAR_ALLOW_LEGACY_PAIRING == 1,
+              "DRAGON_RADAR_ALLOW_LEGACY_PAIRING must be 0 or 1");
+static_assert(DRAGON_RADAR_PROTOCOL_VERSION >= 1,
+              "DRAGON_RADAR_PROTOCOL_VERSION must be >= 1");
+static_assert(DRAGON_RADAR_MIN_RELAY_PROTOCOL_VERSION >= 1,
+              "DRAGON_RADAR_MIN_RELAY_PROTOCOL_VERSION must be >= 1");
 static_assert(DRAGON_RADAR_BEACH_SCENE == 0 || DRAGON_RADAR_BEACH_SCENE == 1,
               "DRAGON_RADAR_BEACH_SCENE must be 0 or 1");
 static_assert(DRAGON_RADAR_FRAME_MS >= 20 && DRAGON_RADAR_FRAME_MS <= 180,
@@ -139,7 +138,13 @@ constexpr int kCy = LCD_HEIGHT / 2;
 constexpr int kRadarRadius = 214;
 constexpr int kRadarGridRadius = min(kCx, kCy);
 constexpr int kTargetMaxRadius = kRadarRadius - 28;
+constexpr uint8_t kRadarGridCellsAcross = 8;
+constexpr int kFixedRadarGridPitch = (kRadarGridRadius * 2) / kRadarGridCellsAcross;
+constexpr int kRadarGridXOffsetHalfPx = -1;
+constexpr int kRadarGridYOffsetHalfPx = -1;
 constexpr float kPi = 3.14159265358979323846f;
+constexpr float kPttRippleOriginDeg = 42.0f;
+constexpr float kAltButtonOriginDeg = kPttRippleOriginDeg + 180.0f;
 constexpr uint32_t kFrameMs = DRAGON_RADAR_FRAME_MS;
 constexpr int32_t kDisplayBusHz = DRAGON_RADAR_DISPLAY_BUS_HZ;
 constexpr uint32_t kBootFrameDelayMs = DRAGON_RADAR_BOOT_FRAME_DELAY_MS;
@@ -150,28 +155,44 @@ constexpr uint32_t kBootFadeOutMs = kMainFadeInMs;
 constexpr uint32_t kSettingsFadeOutMs = kMainFadeInMs;
 constexpr uint32_t kSettingsFadeInMs = kMainFadeInMs;
 constexpr uint32_t kEasterDisplayMs = 1600;
-constexpr uint32_t kBeaconTtlMs = DRAGON_RADAR_BEACON_TTL_MS;
-constexpr uint32_t kBeaconTraceMs = DRAGON_RADAR_BEACON_TRACE_MS;
-constexpr uint32_t kBeaconFreshMs = DRAGON_RADAR_BEACON_FRESH_MS;
 constexpr uint32_t kScanKickMs = 30000;
-constexpr uint32_t kCollectHoldMs = DRAGON_RADAR_COLLECT_HOLD_MS;
+constexpr uint32_t kRetiredTargetHoldMs = 1200;
+constexpr int kRetiredTargetCloseRssi = -50;
 constexpr uint32_t kCaptureFlashMs = 1100;
 constexpr uint32_t kResetFlashMs = 640;
 constexpr uint32_t kSummonGatherMs = 1600;
 constexpr uint32_t kStartupAcquireMs = 980;
 constexpr uint32_t kAcquisitionEchoMs = 760;
 constexpr uint32_t kTouchEchoMs = 520;
+constexpr uint32_t kPttRippleArchRiseMs = 180;
+constexpr uint32_t kPttRippleReleaseMs = 860;
+constexpr uint32_t kButtonTapPressMs = 220;
+constexpr uint32_t kButtonTapReleaseMs = 360;
 constexpr uint32_t kButtonDebounceMs = 45;
 constexpr uint32_t kButtonLongPressMs = 900;
 constexpr uint16_t kFarChirpIntervalMs = 820;
 constexpr uint16_t kNearChirpIntervalMs = 260;
 constexpr uint8_t kAxp2101Address = 0x34;
+constexpr uint8_t kAxpStatus1Reg = 0x00;
+constexpr uint8_t kAxpStatus2Reg = 0x01;
+constexpr uint8_t kAxpChargerFuelGaugeReg = 0x18;
 constexpr uint8_t kAxpIrqEnable1Reg = 0x41;
 constexpr uint8_t kAxpIrqStatus1Reg = 0x49;
+constexpr uint8_t kAxpBatteryVoltageHighReg = 0x34;
+constexpr uint8_t kAxpBatteryVoltageLowReg = 0x35;
+constexpr uint8_t kAxpBatteryPercentReg = 0xA4;
+constexpr uint8_t kAxpGaugeEnableBit = 0x08;
+constexpr uint8_t kAxpBatteryPresentBit = 0x08;
 constexpr uint8_t kAxpPowerKeyLongPressBit = 0x04;
 constexpr uint8_t kAxpPowerKeyShortPressBit = 0x08;
-constexpr int kCollectRssi = DRAGON_RADAR_COLLECT_RSSI;
 constexpr int kAudioSampleRate = 16000;
+constexpr int kBootAudioSampleRate = 44100;
+constexpr uint8_t kBootAudioChannels = 2;
+constexpr uint8_t kBootAudioVolumePercent = 38;
+constexpr uint8_t kBootCodecOutputVolumePercent = 76;
+constexpr int16_t kBootAudioPeakLimit = 19000;
+constexpr uint16_t kBootAudioFadeInMs = 18;
+constexpr uint16_t kBootAudioFadeOutMs = 220;
 constexpr uint8_t kDisplayBrightness = DRAGON_RADAR_BRIGHTNESS;
 constexpr int kAudioGainPercent = DRAGON_RADAR_AUDIO_GAIN;
 constexpr bool kSoundEffectsEnabled = DRAGON_RADAR_SOUND_EFFECTS;
@@ -180,11 +201,17 @@ constexpr bool kShowScanLine = DRAGON_RADAR_SCAN_LINE;
 constexpr bool kShowStarBlips = DRAGON_RADAR_STAR_BLIPS;
 constexpr bool kSnapTargetsToGrid = DRAGON_RADAR_GRID_SNAP;
 constexpr bool kSerialDiagnostics = DRAGON_RADAR_SERIAL_DIAG;
-constexpr bool kDemoOnBoot = DRAGON_RADAR_DEMO_ON_BOOT;
-constexpr bool kDemoTouchEnabled = DRAGON_RADAR_DEMO_TOUCH;
-constexpr bool kSimulatedBle = DRAGON_RADAR_SIMULATED_BLE;
+constexpr bool kRemoteBleEnabled = DRAGON_RADAR_REMOTE_BLE;
+constexpr bool kAllowLegacyPairing = DRAGON_RADAR_ALLOW_LEGACY_PAIRING;
+constexpr const char *kPairingHmacKey = DRAGON_RADAR_PAIRING_HMAC_KEY;
 constexpr bool kBeachSceneMode = DRAGON_RADAR_BEACH_SCENE;
 constexpr uint8_t kZoomLevelCount = 3;
+constexpr float kZoomBaseScales[kZoomLevelCount] = {1.0f, 1.48f, 2.12f};
+constexpr uint8_t kFocusNone = 255;
+constexpr uint8_t kFocusRemoteApp = 7;
+constexpr uint8_t kRemoteAppSlotCount = 6;
+constexpr uint32_t kFocusFlashMs = 900;
+constexpr int kFocusEdgeMarginPx = 18;
 constexpr uint8_t kTargetTrailCount = 3;
 constexpr uint32_t kTargetTrailFadeMs = 1280;
 constexpr uint8_t kTargetTrailMovePx = 8;
@@ -201,6 +228,9 @@ constexpr uint16_t kGrid = RGB565(20, 220, 84);
 constexpr uint16_t kGridBright = RGB565(120, 255, 102);
 constexpr uint16_t kGridDim = RGB565(0, 86, 44);
 constexpr uint16_t kGridDeep = RGB565(0, 36, 25);
+constexpr uint16_t kRippleHead = RGB565(56, 190, 74);
+constexpr uint16_t kRippleMid = RGB565(18, 125, 56);
+constexpr uint16_t kRippleDim = RGB565(0, 64, 34);
 constexpr uint16_t kPhosphorLine = RGB565(4, 42, 18);
 constexpr uint16_t kPhosphorEdge = RGB565(0, 20, 10);
 constexpr uint16_t kScan = RGB565(128, 255, 112);
@@ -217,17 +247,110 @@ constexpr uint16_t kWhite = RGB565_WHITE;
 constexpr uint8_t kMajorGridEvery = 4;
 constexpr uint8_t kBearingBinCount = 16;
 constexpr uint8_t kBrightnessPresetCount = 5;
-constexpr uint8_t kAudioPresetCount = 5;
+constexpr uint8_t kAudioPresetCount = 6;
 constexpr uint8_t kFramePresetCount = 6;
 constexpr uint8_t kTouchInitAttempts = 3;
 constexpr uint8_t kFramePrefsSchema = 3;
+constexpr uint8_t kAudioPrefsSchema = 2;
 constexpr size_t kRadarChordCacheSize = kRadarRadius * 2 + 1;
 constexpr uint8_t kBrightnessPercents[kBrightnessPresetCount] = {35, 55, 80, 105, 125};
-constexpr uint8_t kAudioRuntimePercents[kAudioPresetCount] = {0, 45, 70, 100, 130};
+constexpr uint8_t kAudioRuntimePercents[kAudioPresetCount] = {0, 12, 32, 52, 72, 92};
+constexpr uint8_t kCodecRuntimePercents[kAudioPresetCount] = {0, 65, 65, 65, 65, 65};
 constexpr uint32_t kFrameRuntimeMs[kFramePresetCount] = {kFrameMs, 33, 50, 65, 80, 120};
 constexpr uint32_t kLegacyFrameRuntimeMs[] = {80, 65, 50, 120};
+constexpr const char *kRadarBleServiceUuid = "7d540100-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kPairingChallengeUuid = "7d540101-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kPairingResponseUuid = "7d540102-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kWifiConfigUuid = "7d540103-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kLocalLocationUuid = "7d540104-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kDeviceStatusUuid = "7d540105-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kServerConfigUuid = "7d540106-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr uint32_t kDeviceStatusNotifyMs = 2000;
+constexpr uint32_t kRelayReconnectMs = 5000;
+constexpr uint32_t kRelayHeartbeatMs = 15000;
+constexpr uint32_t kRelayStatusMs = 5000;
+constexpr uint32_t kBatteryPollMs = 10000;
+constexpr int8_t kLowBatteryPercent = 20;
+constexpr uint32_t kRemoteAppMarkerTtlMs = 30000;
+constexpr uint32_t kLocationReceiveBlinkMs = 180;
+constexpr uint32_t kLocationReceiveBlinkIntervalMs = 2000;
+constexpr uint32_t kRemoteSpeakingHoldMs = 1300;
+constexpr uint8_t kDistanceLabelTextSize = 2;
+constexpr uint32_t kVoiceSampleTickMs = 20;
+constexpr uint32_t kVoiceFrameTickMs = 20;
+constexpr uint16_t kVoiceFrameDurationMs = 20;
+constexpr uint16_t kVoiceVadRmsThreshold = 650;
+constexpr uint16_t kVoiceVadPeakThreshold = 1600;
+constexpr uint16_t kVoiceFrameSamples = (kAudioSampleRate * kVoiceFrameDurationMs) / 1000;
+constexpr size_t kVoicePcmBytes = kVoiceFrameSamples * sizeof(int16_t);
+constexpr uint8_t kEs7210Address = 0x40;
+constexpr float kEarthRadiusM = 6371000.0f;
+constexpr float kRemoteRadarFullScaleM = 5000.0f;
+constexpr uint32_t kSelfLocationPersistMinIntervalMs = 20000;
 
-struct DragonTarget {
+enum class RadarGattWriteRole : uint8_t {
+  PairingResponse,
+  WifiConfig,
+  LocalLocation,
+  ServerConfig,
+};
+
+struct RemoteLocationFrame {
+  bool valid = false;
+  int32_t latE7 = 0;
+  int32_t lonE7 = 0;
+  uint16_t horizontalAccuracyCm = 0;
+  uint16_t speedCms = 0;
+  uint16_t courseDeg100 = 0;
+  uint32_t unixTime = 0;
+  uint32_t receivedMs = 0;
+};
+
+struct RemoteMarkerDrawState {
+  bool visible = false;
+  bool distanceKnown = false;
+  bool fresh = false;
+  bool speaking = false;
+  uint8_t slot = 0;
+  uint8_t pulse = 0;
+  int x = 0;
+  int y = 0;
+  float distanceM = 0.0f;
+  bool motionKnown = false;
+  float courseDeg = 0.0f;
+  float speedMps = 0.0f;
+};
+
+struct FocusCandidate {
+  uint8_t slot = kFocusNone;
+  float angle = 0.0f;
+  float range = 0.0f;
+};
+
+struct RemoteProvisioningState {
+  bool serviceOnline = false;
+  bool appConnected = false;
+  bool paired = false;
+  bool wifiConnectRequested = false;
+  bool wifiConnectInFlight = false;
+  bool serverConfigured = false;
+  bool relaySocketConfigured = false;
+  bool relayConnected = false;
+  bool locationReceived = false;
+  char deviceName[28] = {0};
+  char challenge[24] = {0};
+  String pairingResponse;
+  String wifiSsid;
+  String wifiPassword;
+  String relayUrl;
+  String roomToken;
+  String deviceToken;
+  String lastWrite = "none";
+  String relayState = "idle";
+  uint32_t lastStatusNotifyMs = 0;
+};
+
+struct RetiredTarget {
   uint8_t star = 0;
   bool seen = false;
   bool demo = true;
@@ -258,6 +381,32 @@ struct AudioTone {
   int remainingSamples = 0;
   int totalSamples = 0;
   int16_t level = 3200;
+};
+
+struct VoiceCaptureState {
+  bool captureOnline = false;
+  bool muted = false;
+  bool pttActive = false;
+  bool vadActive = false;
+  bool playbackActive = false;
+  uint16_t rms = 0;
+  uint16_t peak = 0;
+  uint32_t sequence = 0;
+  uint32_t receivedSequence = 0;
+  uint32_t lastSampleMs = 0;
+  uint32_t lastFrameMs = 0;
+  uint32_t lastPlaybackMs = 0;
+};
+
+struct BatteryStatus {
+  bool online = false;
+  bool present = false;
+  bool charging = false;
+  bool discharging = false;
+  bool low = false;
+  int8_t percent = -1;
+  uint16_t voltageMv = 0;
+  uint32_t lastReadMs = 0;
 };
 
 struct BeachWalker {
@@ -300,24 +449,52 @@ IMUdata acc;
 IMUdata gyr;
 I2SClass i2s;
 
-DragonTarget targets[7];
-BLEScan *bleScan = nullptr;
+RetiredTarget targets[7];
+BLEServer *provisioningServer = nullptr;
+BLECharacteristic *pairingChallengeCharacteristic = nullptr;
+BLECharacteristic *deviceStatusCharacteristic = nullptr;
+WebSocketsClient relaySocket;
 AudioTone tone;
+VoiceCaptureState voiceCapture;
+BatteryStatus batteryStatus;
+RemoteProvisioningState provisioning;
+RemoteLocationFrame selfLocationFrame;
+RemoteLocationFrame remoteAppLocationFrame;
+String remoteAppPeerName;
+RemoteLocationFrame remoteAppLocationFrames[kRemoteAppSlotCount];
+String remoteAppPeerIds[kRemoteAppSlotCount];
+String remoteAppPeerNames[kRemoteAppSlotCount];
+uint32_t remoteAppBlinkStartedSlotsMs[kRemoteAppSlotCount] = {0};
+uint32_t remoteAppSpeakingUntilMs[kRemoteAppSlotCount] = {0};
+bool lastRelayAppLocationWasSelf = false;
+bool remoteRoomSpeakerActive = false;
+uint32_t remoteRoomSpeakerUntilMs = 0;
+uint32_t remoteAppBlinkStartedMs = 0;
+size_t bootAudioPcmOffset = 0;
+bool bootAudioPlaying = false;
+bool audioTxConfigured = false;
+bool audioRxConfigured = false;
+bool audioTxFailureLogged = false;
+bool audioRxFailureLogged = false;
+bool speakerMutedForCapture = false;
+uint32_t audioTxSampleRate = 0;
 
 volatile bool touchIrq = false;
 bool touchOnline = false;
 bool imuOnline = false;
 bool bleOnline = false;
 bool audioOnline = false;
+bool voiceInputOnline = false;
 bool powerButtonOnline = false;
-bool demoMode = kDemoOnBoot;
+bool demoMode = false;
 bool scanning = true;
-bool summonMode = false;
+bool retiredTargetOverlayMode = false;
 bool settingsMode = false;
 bool easterMode = false;
 uint8_t zoomLevel = 0;
+uint8_t focusedTargetSlot = kFocusNone;
 uint8_t brightnessPreset = 2;
-uint8_t audioPreset = 3;
+uint8_t audioPreset = 4;
 uint8_t framePreset = 0;
 
 uint32_t bootStartedMs = 0;
@@ -337,18 +514,32 @@ uint32_t lastTouchMs = 0;
 uint32_t touchPressedAtMs = 0;
 uint32_t lastButtonMs = 0;
 uint32_t lastBleKickMs = 0;
+uint32_t lastWifiAttemptMs = 0;
+uint32_t lastWifiStatusLogMs = 0;
+uint32_t lastRelayAttemptMs = 0;
+uint32_t lastRelayHeartbeatMs = 0;
+uint32_t lastRelayStatusMs = 0;
+uint32_t lastSelfLocationPersistMs = 0;
 uint32_t lastImuMicros = 0;
 uint32_t lastScanChirpMs = 0;
-uint32_t summonStartedMs = 0;
+uint32_t lastSignalLostBeepPhase = UINT32_MAX;
+uint32_t retiredTargetOverlayStartedMs = 0;
 uint32_t radarStartedMs = 0;
 uint32_t zoomFlashUntilMs = 0;
+uint32_t focusFlashUntilMs = 0;
 uint32_t resetFlashUntilMs = 0;
 uint32_t brightnessFlashUntilMs = 0;
 uint32_t audioFlashUntilMs = 0;
 uint32_t frameFlashUntilMs = 0;
 uint32_t touchEchoUntilMs = 0;
 uint32_t bootButtonPressedAtMs = 0;
+uint32_t pttRippleStartedMs = 0;
+uint32_t pttRippleEndedMs = 0;
+uint32_t bootTapPressedMs = 0;
+uint32_t bootTapReleasedMs = 0;
 uint32_t altButtonPressedAtMs = 0;
+uint32_t altTapPressedMs = 0;
+uint32_t altTapReleasedMs = 0;
 uint32_t settingsFlashUntilMs = 0;
 uint32_t displaySelfTestUntilMs = 0;
 uint32_t lastDiagMs = 0;
@@ -363,7 +554,8 @@ float tiltVectorX = 0.0f;
 float tiltVectorY = 0.0f;
 uint8_t lastActiveCount = 0;
 uint8_t lastCollectedCount = 0;
-uint16_t huntSessionId = 1;
+uint16_t radarSessionId = 1;
+String serialCommandLine;
 bool bootButtonWasPressed = false;
 bool bootButtonLongHandled = false;
 bool altButtonWasPressed = false;
@@ -385,13 +577,25 @@ bool beachSceneReady = false;
 uint32_t lastBeachUpdateMs = 0;
 uint32_t beachControlUntilMs = 0;
 int8_t beachControlDir = 1;
+wl_status_t lastLoggedWifiStatus = WL_IDLE_STATUS;
 
 void startTone(float frequency, uint16_t durationMs, int16_t level, bool force);
-void startBleScan();
+void setupProvisioningBle();
+void provisioningTick();
+void cloudRelayTick();
+void voiceCaptureTick();
+void beginPushToTalk();
+void endPushToTalk();
+void cancelPushToTalkDueToBusy(const char *reason);
+void loadProvisioningState();
+void persistSelfLocationFrame(bool force);
+void notifyDeviceStatus(bool force);
+String localRelayPeerId();
+String localAppRelayPeerId();
 void snapPointToGrid(int &x, int &y);
 void printHardwareSummary();
 void printSerialCommandHelp();
-void printHuntEvent(const char *event, uint32_t now);
+void printRadarEvent(const char *event, uint32_t now);
 void serialDiagnosticsTick();
 int circleChordHalf(int offset, int radius = kRadarRadius);
 void resetEdgeGesture();
@@ -409,6 +613,10 @@ void drawBeachScene();
 
 float degToRad(float deg) {
   return deg * kPi / 180.0f;
+}
+
+float radToDeg(float rad) {
+  return rad * 180.0f / kPi;
 }
 
 float wrap360(float v) {
@@ -443,6 +651,45 @@ float clampf(float v, float lo, float hi) {
   return v;
 }
 
+float latE7ToDeg(int32_t value) {
+  return static_cast<float>(value) / 10000000.0f;
+}
+
+float geoDistanceMeters(const RemoteLocationFrame &from, const RemoteLocationFrame &to) {
+  const float fromLatDeg = latE7ToDeg(from.latE7);
+  const float fromLonDeg = latE7ToDeg(from.lonE7);
+  const float toLatDeg = latE7ToDeg(to.latE7);
+  const float toLonDeg = latE7ToDeg(to.lonE7);
+  const float lat1 = degToRad(fromLatDeg);
+  const float lat2 = degToRad(toLatDeg);
+  const float dLat = lat2 - lat1;
+  const float dLon = degToRad(toLonDeg - fromLonDeg);
+  const float sinLat = sinf(dLat * 0.5f);
+  const float sinLon = sinf(dLon * 0.5f);
+  const float a = sinLat * sinLat + cosf(lat1) * cosf(lat2) * sinLon * sinLon;
+  const float c = 2.0f * atan2f(sqrtf(a), sqrtf(fmaxf(0.0f, 1.0f - a)));
+  return kEarthRadiusM * c;
+}
+
+float geoBearingDeg(const RemoteLocationFrame &from, const RemoteLocationFrame &to) {
+  const float fromLonDeg = latE7ToDeg(from.lonE7);
+  const float toLonDeg = latE7ToDeg(to.lonE7);
+  const float lat1 = degToRad(latE7ToDeg(from.latE7));
+  const float lat2 = degToRad(latE7ToDeg(to.latE7));
+  const float dLon = degToRad(toLonDeg - fromLonDeg);
+  const float y = sinf(dLon) * cosf(lat2);
+  const float x = cosf(lat1) * sinf(lat2) - sinf(lat1) * cosf(lat2) * cosf(dLon);
+  return wrap360(radToDeg(atan2f(y, x)));
+}
+
+float remoteDistanceToRange(float meters) {
+  if (meters <= 0.0f) {
+    return 0.12f;
+  }
+  const float normalized = log1pf(meters / 25.0f) / log1pf(kRemoteRadarFullScaleM / 25.0f);
+  return clampf(0.14f + normalized * 0.78f, 0.14f, 0.92f);
+}
+
 float smoothStep(float edge0, float edge1, float x) {
   const float t = clampf((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
   return t * t * (3.0f - 2.0f * t);
@@ -463,9 +710,7 @@ void polarToPoint(float angleDeg, float radius, int &x, int &y) {
 }
 
 int currentGridPitch() {
-  static const int pitches[kZoomLevelCount] = {32, 32, 32};
-  const uint8_t idx = zoomLevel < kZoomLevelCount ? zoomLevel : kZoomLevelCount - 1;
-  return max(10, static_cast<int>(roundf(pitches[idx] * gridGestureScale)));
+  return max(10, kFixedRadarGridPitch);
 }
 
 void initRadarChordHalfCache() {
@@ -494,45 +739,20 @@ void armTouchEcho(int16_t x, int16_t y, uint32_t now) {
 }
 
 float currentMapScale() {
-  static const float scales[kZoomLevelCount] = {1.0f, 1.48f, 2.12f};
   const uint8_t idx = zoomLevel < kZoomLevelCount ? zoomLevel : kZoomLevelCount - 1;
-  return scales[idx] * gridGestureScale;
+  return kZoomBaseScales[idx] * gridGestureScale;
 }
 
 uint8_t activeTargetCount() {
-  const uint32_t now = millis();
-  uint8_t active = 0;
-  for (const auto &target : targets) {
-    if (!target.collected && target.seen && now - target.lastSeenMs < kBeaconTtlMs) {
-      ++active;
-    }
-  }
-  return active;
+  return 0;
 }
 
 uint8_t collectedTargetCount() {
-  uint8_t collected = 0;
-  for (const auto &target : targets) {
-    if (target.collected) {
-      ++collected;
-    }
-  }
-  return collected;
+  return 0;
 }
 
 int strongestActiveTargetIndex() {
-  const uint32_t now = millis();
-  int best = -1;
-  int bestRssi = -128;
-  for (int i = 0; i < 7; ++i) {
-    const DragonTarget &target = targets[i];
-    if (!target.collected && target.seen && now - target.lastSeenMs < kBeaconTtlMs &&
-        target.filteredRssi > bestRssi) {
-      best = i;
-      bestRssi = target.filteredRssi;
-    }
-  }
-  return best;
+  return -1;
 }
 
 int rssiToBarWidth(int rssi, int width) {
@@ -560,12 +780,12 @@ uint8_t rssiToBearingScore(int rssi) {
   return static_cast<uint8_t>(constrain((clamped + 95) * 4, 1, 240));
 }
 
-void resetBearingScores(DragonTarget &target) {
+void resetBearingScores(RetiredTarget &target) {
   memset(target.bearingScores, 0, sizeof(target.bearingScores));
   target.bestBearingBin = headingToBearingBin(target.worldAngleDeg);
 }
 
-void addBearingScore(DragonTarget &target, uint8_t bin, uint8_t sample) {
+void addBearingScore(RetiredTarget &target, uint8_t bin, uint8_t sample) {
   const uint16_t previous = target.bearingScores[bin];
   const uint16_t blended = (previous * 3 + sample) / 4;
   uint16_t next = blended > previous ? blended : previous;
@@ -575,7 +795,7 @@ void addBearingScore(DragonTarget &target, uint8_t bin, uint8_t sample) {
   target.bearingScores[bin] = static_cast<uint8_t>(next);
 }
 
-void updateBearingEstimate(DragonTarget &target, int rssi, bool reset) {
+void updateBearingEstimate(RetiredTarget &target, int rssi, bool reset) {
   if (reset) {
     resetBearingScores(target);
   }
@@ -611,11 +831,11 @@ void updateBearingEstimate(DragonTarget &target, int rssi, bool reset) {
   }
 }
 
-float targetNearness(const DragonTarget &target) {
+float targetNearness(const RetiredTarget &target) {
   return clampf((0.96f - target.rangeNorm) / (0.96f - 0.13f), 0.0f, 1.0f);
 }
 
-uint16_t targetChirpIntervalMs(const DragonTarget &target) {
+uint16_t targetChirpIntervalMs(const RetiredTarget &target) {
   if (target.closeSinceMs > 0) {
     return 180;
   }
@@ -623,7 +843,7 @@ uint16_t targetChirpIntervalMs(const DragonTarget &target) {
   return static_cast<uint16_t>(lerpf(kFarChirpIntervalMs, kNearChirpIntervalMs, near));
 }
 
-float targetChirpFrequency(const DragonTarget &target, uint8_t activeCount) {
+float targetChirpFrequency(const RetiredTarget &target, uint8_t activeCount) {
   const float near = targetNearness(target);
   float freq = lerpf(900.0f, 1540.0f, near) + activeCount * 24.0f;
   if (target.closeSinceMs > 0) {
@@ -632,11 +852,11 @@ float targetChirpFrequency(const DragonTarget &target, uint8_t activeCount) {
   return freq;
 }
 
-uint16_t targetChirpDurationMs(const DragonTarget &target) {
+uint16_t targetChirpDurationMs(const RetiredTarget &target) {
   return static_cast<uint16_t>(lerpf(26.0f, 48.0f, targetNearness(target)));
 }
 
-int16_t targetChirpLevel(const DragonTarget &target) {
+int16_t targetChirpLevel(const RetiredTarget &target) {
   return static_cast<int16_t>(lerpf(2200.0f, 3900.0f, targetNearness(target)));
 }
 
@@ -645,6 +865,26 @@ int16_t scaledAudioLevel(int16_t level) {
                           kAudioRuntimePercents[audioPreset]) /
                          10000;
   return static_cast<int16_t>(constrain(scaled, 0L, 12000L));
+}
+
+int16_t scaledAlertAudioLevel(int16_t level) {
+  (void)level;
+  constexpr int32_t kAlertMaxLevel = 26000;
+  constexpr int32_t kAlertMaxRuntimePercent = kAudioRuntimePercents[kAudioPresetCount - 1];
+  if (audioPreset == 0) {
+    return 0;
+  }
+  const int32_t scaled =
+      (kAlertMaxLevel * kAudioRuntimePercents[audioPreset]) / kAlertMaxRuntimePercent;
+  return static_cast<int16_t>(constrain(scaled, 9000L, kAlertMaxLevel));
+}
+
+int16_t scaledBootAudioLevel(int16_t level) {
+  const int32_t scaled =
+      (static_cast<int32_t>(level) * kAudioGainPercent *
+       kAudioRuntimePercents[kAudioPresetCount - 1]) /
+      10000;
+  return static_cast<int16_t>(constrain(scaled, 0L, 32000L));
 }
 
 uint8_t currentBrightness() {
@@ -712,7 +952,9 @@ void loadRuntimeSettings() {
   }
   const bool hasFrame = prefs.isKey("frame");
   const bool hasFrameMs = prefs.isKey("frameMs");
+  const bool hasAudio = prefs.isKey("audio");
   const uint8_t frameSchema = prefs.getUChar("frameSchema", 0);
+  const uint8_t audioSchema = prefs.getUChar("audioSchema", 0);
   brightnessPreset = prefs.getUChar("bright", brightnessPreset);
   audioPreset = prefs.getUChar("audio", audioPreset);
   if (hasFrameMs) {
@@ -733,7 +975,9 @@ void loadRuntimeSettings() {
     brightnessPreset = 2;
   }
   if (audioPreset >= kAudioPresetCount) {
-    audioPreset = 3;
+    audioPreset = 4;
+  } else if (hasAudio && audioSchema < kAudioPrefsSchema && audioPreset < kAudioPresetCount - 1) {
+    ++audioPreset;
   }
   if (framePreset >= kFramePresetCount) {
     framePreset = 0;
@@ -747,6 +991,7 @@ void saveRuntimeSettings() {
   }
   prefs.putUChar("bright", brightnessPreset);
   prefs.putUChar("audio", audioPreset);
+  prefs.putUChar("audioSchema", kAudioPrefsSchema);
   prefs.putUChar("frame", framePreset);
   prefs.putUInt("frameMs", currentFrameMs());
   prefs.putUChar("frameSchema", kFramePrefsSchema);
@@ -760,7 +1005,7 @@ void setFrameTurbo() {
   startTone(720.0f, 48, 2600, true);
 }
 
-void resetTargetTrail(DragonTarget &target) {
+void resetTargetTrail(RetiredTarget &target) {
   target.lastScreenX = 0;
   target.lastScreenY = 0;
   target.lastTrailMs = 0;
@@ -775,7 +1020,7 @@ void resetAllTargetTrails() {
   }
 }
 
-void clearHuntState() {
+void clearRetiredTargetState() {
   for (auto &target : targets) {
     target.seen = false;
     target.demo = true;
@@ -790,62 +1035,29 @@ void clearHuntState() {
     resetBearingScores(target);
     resetTargetTrail(target);
   }
-  summonMode = false;
   lastActiveCount = 0;
   lastCollectedCount = 0;
 }
 
-void resetHuntSession() {
-  clearHuntState();
-  ++huntSessionId;
+void resetRadarDisplayState() {
+  clearRetiredTargetState();
+  ++radarSessionId;
   resetFlashUntilMs = millis() + kResetFlashMs;
-  startBleScan();
   startTone(620.0f, 70, 3000, true);
-  printHuntEvent("reset", millis());
+  printRadarEvent("reset", millis());
 }
 
-void printHuntEvent(const char *event, uint32_t now) {
+void printRadarEvent(const char *event, uint32_t now) {
   if (!kSerialDiagnostics) {
     return;
   }
 
-  Serial.print("DIAG hunt session=");
-  Serial.print(huntSessionId);
+  Serial.print("DIAG radar session=");
+  Serial.print(radarSessionId);
   Serial.print(" event=");
   Serial.print(event);
   Serial.print(" ms=");
   Serial.println(now);
-}
-
-void printCollectionEvent(const DragonTarget &target, uint32_t now) {
-  if (!kSerialDiagnostics) {
-    return;
-  }
-
-  Serial.print("DIAG collect DBALL-");
-  Serial.print(target.star);
-  Serial.print(" session=");
-  Serial.print(huntSessionId);
-  Serial.print(" ms=");
-  Serial.print(now);
-  Serial.print(" raw=");
-  Serial.print(target.rssi);
-  Serial.print(" filtered=");
-  Serial.print(target.filteredRssi);
-  Serial.print(" range=");
-  Serial.print(target.rangeNorm, 2);
-  Serial.print(" bearingBin=");
-  Serial.print(target.bestBearingBin);
-  Serial.print(" bearing=");
-  Serial.println(target.worldAngleDeg, 1);
-}
-
-void markTargetCollected(DragonTarget &target, uint32_t now) {
-  if (!target.collected) {
-    target.collected = true;
-    target.collectedAtMs = now;
-    printCollectionEvent(target, now);
-  }
 }
 
 void cycleMapScale() {
@@ -853,6 +1065,148 @@ void cycleMapScale() {
   resetAllTargetTrails();
   zoomFlashUntilMs = millis() + 700;
   startTone(820.0f + zoomLevel * 220.0f, 64, 2800, true);
+}
+
+bool targetDisplayCandidate(uint8_t slot, uint32_t now, float &angle, float &range) {
+  (void)slot;
+  (void)now;
+  (void)angle;
+  (void)range;
+  return false;
+}
+
+uint8_t remoteSlotFromFocusSlot(uint8_t slot) {
+  if (slot < kFocusRemoteApp || slot >= kFocusRemoteApp + kRemoteAppSlotCount) {
+    return kRemoteAppSlotCount;
+  }
+  return static_cast<uint8_t>(slot - kFocusRemoteApp);
+}
+
+bool remoteAppDisplayCandidate(uint8_t remoteSlot, uint32_t now, float &angle, float &range,
+                               float &distanceM, bool &distanceKnown) {
+  if (remoteSlot >= kRemoteAppSlotCount) {
+    return false;
+  }
+  const RemoteLocationFrame &frame = remoteAppLocationFrames[remoteSlot];
+  if (!frame.valid ||
+      frame.receivedMs == 0 ||
+      now - frame.receivedMs > kRemoteAppMarkerTtlMs) {
+    return false;
+  }
+
+  distanceM = 0.0f;
+  distanceKnown = false;
+  if (selfLocationFrame.valid && selfLocationFrame.receivedMs > 0) {
+    distanceM = geoDistanceMeters(selfLocationFrame, frame);
+    distanceKnown = true;
+    angle = geoBearingDeg(selfLocationFrame, frame);
+    range = remoteDistanceToRange(distanceM);
+  } else {
+    const float t = now / 1000.0f;
+    angle = wrap360(42.0f + remoteSlot * 38.0f + sinf(t * 0.52f + remoteSlot) * 10.0f);
+    range = 0.35f + remoteSlot * 0.13f + 0.04f * sinf(t * 0.8f + remoteSlot);
+    range = clampf(range, 0.22f, 0.88f);
+  }
+  return true;
+}
+
+bool focusSlotAvailable(uint8_t slot, uint32_t now, float &angle, float &range) {
+  if (slot >= kFocusRemoteApp && slot < kFocusRemoteApp + kRemoteAppSlotCount) {
+    float distanceM = 0.0f;
+    bool distanceKnown = false;
+    return remoteAppDisplayCandidate(remoteSlotFromFocusSlot(slot), now, angle, range, distanceM, distanceKnown);
+  }
+  return targetDisplayCandidate(slot, now, angle, range);
+}
+
+void applyFocusMapScale(float range, uint32_t now) {
+  const float safeRange = max(0.05f, range);
+  const float allowedScale =
+      static_cast<float>(kTargetMaxRadius - kFocusEdgeMarginPx) /
+      (safeRange * static_cast<float>(kTargetMaxRadius));
+
+  uint8_t bestZoom = 0;
+  float bestGesture = 1.0f;
+  float bestTotalScale = 0.0f;
+  for (uint8_t i = 0; i < kZoomLevelCount; ++i) {
+    const float base = kZoomBaseScales[i];
+    const float minTotal = base * 0.55f;
+    const float maxTotal = base * 1.9f;
+    const float total = min(allowedScale, maxTotal);
+    if (total >= minTotal && total >= bestTotalScale) {
+      bestZoom = i;
+      bestGesture = clampGridGestureScale(total / base);
+      bestTotalScale = base * bestGesture;
+    }
+  }
+
+  if (bestTotalScale <= 0.0f) {
+    bestZoom = 0;
+    bestGesture = clampGridGestureScale(allowedScale / kZoomBaseScales[0]);
+  }
+
+  zoomLevel = bestZoom;
+  gridGestureScale = bestGesture;
+  resetAllTargetTrails();
+  zoomFlashUntilMs = now + 700;
+  focusFlashUntilMs = now + kFocusFlashMs;
+  startTone(900.0f + bestZoom * 180.0f, 58, 2800, true);
+}
+
+bool focusCandidateLess(const FocusCandidate &a, const FocusCandidate &b) {
+  const float delta = a.range - b.range;
+  if (fabsf(delta) > 0.001f) {
+    return delta < 0.0f;
+  }
+  return a.slot < b.slot;
+}
+
+uint8_t collectFocusCandidates(uint32_t now, FocusCandidate *candidates, uint8_t maxCandidates) {
+  uint8_t count = 0;
+  constexpr uint8_t kFocusOrderCount = kRemoteAppSlotCount + 7;
+  for (uint8_t index = 0; index < kFocusOrderCount && count < maxCandidates; ++index) {
+    const uint8_t slot =
+        index < kRemoteAppSlotCount ? static_cast<uint8_t>(kFocusRemoteApp + index)
+                                    : static_cast<uint8_t>(index - kRemoteAppSlotCount);
+    FocusCandidate candidate;
+    candidate.slot = slot;
+    if (!focusSlotAvailable(slot, now, candidate.angle, candidate.range)) {
+      continue;
+    }
+
+    uint8_t insertAt = count;
+    while (insertAt > 0 && focusCandidateLess(candidate, candidates[insertAt - 1])) {
+      candidates[insertAt] = candidates[insertAt - 1];
+      --insertAt;
+    }
+    candidates[insertAt] = candidate;
+    ++count;
+  }
+  return count;
+}
+
+bool focusNextMember() {
+  const uint32_t now = millis();
+  constexpr int kFocusOrderCount = kRemoteAppSlotCount + 7;
+  FocusCandidate candidates[kFocusOrderCount];
+  const uint8_t count = collectFocusCandidates(now, candidates, kFocusOrderCount);
+  if (count == 0) {
+    focusedTargetSlot = kFocusNone;
+    return false;
+  }
+
+  uint8_t currentIndex = count;
+  for (uint8_t i = 0; i < count; ++i) {
+    if (candidates[i].slot == focusedTargetSlot) {
+      currentIndex = i;
+      break;
+    }
+  }
+
+  const uint8_t nextIndex = currentIndex < count ? static_cast<uint8_t>((currentIndex + 1) % count) : 0;
+  focusedTargetSlot = candidates[nextIndex].slot;
+  applyFocusMapScale(candidates[nextIndex].range, now);
+  return true;
 }
 
 void cycleBrightness() {
@@ -868,6 +1222,7 @@ void cycleBrightness() {
 void cycleAudioGain() {
   audioPreset = (audioPreset + 1) % kAudioPresetCount;
   saveRuntimeSettings();
+  applyCodecOutputVolume();
   audioFlashUntilMs = millis() + 700;
   startTone(540.0f + audioPreset * 180.0f, 56, 3000, true);
 }
@@ -939,7 +1294,7 @@ void setEasterMode(bool nextEasterMode) {
   panel->setBrightness(0);
   settingsMode = false;
   easterMode = nextEasterMode;
-  summonMode = false;
+  retiredTargetOverlayMode = false;
   displaySelfTestUntilMs = 0;
   resetEdgeGesture();
   touchWasPressed = false;
@@ -975,6 +1330,10 @@ void showEasterEgg() {
 void handleBootShortPress() {
   if (settingsMode) {
     toggleSettingsMode();
+    return;
+  }
+  if (!focusNextMember()) {
+    cycleMapScale();
   }
 }
 
@@ -995,24 +1354,6 @@ void cycleFrameRate() {
   lastFrameMs = now;
   frameFlashUntilMs = now + 700;
   startTone(720.0f + framePreset * 180.0f, 48, 2600, true);
-}
-
-void collectNextDemoTarget() {
-  for (auto &target : targets) {
-    if (!target.collected) {
-      target.seen = true;
-      target.demo = true;
-      target.rssi = -42;
-      target.filteredRssi = -42;
-      target.bestRssi = -42;
-      target.lastSeenMs = millis();
-      target.revealedAtMs = target.lastSeenMs;
-      target.closeSinceMs = target.lastSeenMs;
-      markTargetCollected(target, target.lastSeenMs);
-      return;
-    }
-  }
-  resetHuntSession();
 }
 
 void drawThickLine(int x0, int y0, int x1, int y1, uint16_t color, int thick) {
@@ -1578,6 +1919,35 @@ bool codecRead(uint8_t reg, uint8_t &value) {
   return true;
 }
 
+bool es7210Write(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(kEs7210Address);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool es7210Read(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(kEs7210Address);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  if (Wire.requestFrom(kEs7210Address, static_cast<uint8_t>(1)) != 1) {
+    return false;
+  }
+  value = Wire.read();
+  return true;
+}
+
+bool es7210Update(uint8_t reg, uint8_t mask, uint8_t value) {
+  uint8_t current = 0;
+  if (!es7210Read(reg, current)) {
+    return false;
+  }
+  current = (current & ~mask) | (value & mask);
+  return es7210Write(reg, current);
+}
+
 bool axpRead(uint8_t reg, uint8_t &value) {
   Wire.beginTransmission(kAxp2101Address);
   Wire.write(reg);
@@ -1596,6 +1966,56 @@ bool axpWrite(uint8_t reg, uint8_t value) {
   Wire.write(reg);
   Wire.write(value);
   return Wire.endTransmission() == 0;
+}
+
+bool axpReadAdc14(uint8_t highReg, uint8_t lowReg, uint16_t &value) {
+  uint8_t high = 0;
+  uint8_t low = 0;
+  if (!axpRead(highReg, high) || !axpRead(lowReg, low)) {
+    return false;
+  }
+  value = (static_cast<uint16_t>(high & 0x3f) << 8) | low;
+  return true;
+}
+
+bool batteryLevelLow() {
+  return batteryStatus.present && batteryStatus.percent >= 0 &&
+         batteryStatus.percent <= kLowBatteryPercent;
+}
+
+void updateBatteryStatus(bool force) {
+  const uint32_t now = millis();
+  if (!force && now - batteryStatus.lastReadMs < kBatteryPollMs) {
+    return;
+  }
+  batteryStatus.lastReadMs = now;
+
+  uint8_t status1 = 0;
+  uint8_t status2 = 0;
+  uint8_t percent = 0;
+  uint16_t voltageMv = 0;
+  const bool status1Ok = axpRead(kAxpStatus1Reg, status1);
+  const bool status2Ok = axpRead(kAxpStatus2Reg, status2);
+  const bool percentOk = axpRead(kAxpBatteryPercentReg, percent);
+  const bool voltageOk = axpReadAdc14(kAxpBatteryVoltageHighReg, kAxpBatteryVoltageLowReg, voltageMv);
+
+  batteryStatus.online = status1Ok || status2Ok || percentOk || voltageOk;
+  batteryStatus.present = status1Ok && ((status1 & kAxpBatteryPresentBit) != 0);
+  const uint8_t currentDirection = status2Ok ? ((status2 >> 5) & 0x03) : 0;
+  batteryStatus.charging = currentDirection == 0x01;
+  batteryStatus.discharging = currentDirection == 0x02;
+  batteryStatus.percent = (percentOk && percent <= 100) ? static_cast<int8_t>(percent) : -1;
+  batteryStatus.voltageMv = voltageOk ? voltageMv : 0;
+  batteryStatus.low = batteryLevelLow();
+}
+
+void setupBatteryGauge() {
+  uint8_t control = 0;
+  if (axpRead(kAxpChargerFuelGaugeReg, control) &&
+      (control & kAxpGaugeEnableBit) == 0) {
+    axpWrite(kAxpChargerFuelGaugeReg, control | kAxpGaugeEnableBit);
+  }
+  updateBatteryStatus(true);
 }
 
 void setupPowerButton() {
@@ -1640,7 +2060,79 @@ void pollPowerButton() {
   }
 }
 
-bool setupCodec16k() {
+uint8_t codecVolumeRegister(uint8_t percent) {
+  if (percent == 0) {
+    return 0;
+  }
+  const int reg = (static_cast<int>(min<uint8_t>(percent, 100)) * 256 / 100) - 1;
+  return static_cast<uint8_t>(constrain(reg, 0, 255));
+}
+
+uint8_t currentCodecOutputVolumePercent() {
+  if (audioPreset >= kAudioPresetCount) {
+    return kCodecRuntimePercents[4];
+  }
+  return kCodecRuntimePercents[audioPreset];
+}
+
+bool applyCodecOutputVolume() {
+  if (!audioOnline) {
+    return false;
+  }
+  return codecWrite(0x32, codecVolumeRegister(currentCodecOutputVolumePercent()));
+}
+
+bool applyCodecOutputVolumePercent(uint8_t percent) {
+  if (!audioOnline) {
+    return false;
+  }
+  return codecWrite(0x32, codecVolumeRegister(percent));
+}
+
+bool setCodecOutputMuted(bool muted) {
+  uint8_t reg = 0;
+  if (!codecRead(0x31, reg)) {
+    return false;
+  }
+  if (muted) {
+    reg |= 0x60;
+  } else {
+    reg &= ~0x60;
+  }
+  return codecWrite(0x31, reg);
+}
+
+void setSpeakerMutedForCapture(bool muted) {
+  speakerMutedForCapture = muted;
+  if (muted) {
+    tone.active = false;
+    tone.remainingSamples = 0;
+    bootAudioPlaying = false;
+  }
+  if (audioOnline) {
+    setCodecOutputMuted(muted);
+  }
+  digitalWrite(PA, muted ? LOW : HIGH);
+}
+
+bool beginI2sBus(uint32_t sampleRate) {
+  i2s.end();
+  audioTxConfigured = false;
+  audioRxConfigured = false;
+  audioTxSampleRate = 0;
+  audioTxFailureLogged = false;
+  audioRxFailureLogged = false;
+
+  i2s.setPins(PIN_ES7210_BCLK, PIN_ES7210_LRCK, PIN_ES8311_DOUT, PIN_ES7210_DIN, PIN_ES7210_MCLK);
+  if (!i2s.begin(I2S_MODE_STD, sampleRate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+    return false;
+  }
+  i2s.setTimeout(1);
+  return true;
+}
+
+bool setupCodecForSampleRate(uint32_t sampleRate) {
+  (void)sampleRate;
   uint8_t reg = 0;
   bool ok = true;
 
@@ -1673,7 +2165,7 @@ bool setupCodec16k() {
   ok &= codecWrite(0x17, 0xC8);
   ok &= codecWrite(0x14, 0x1A);
   ok &= codecWrite(0x16, 0x03);
-  ok &= codecWrite(0x32, 0x9A);
+  ok &= codecWrite(0x32, codecVolumeRegister(currentCodecOutputVolumePercent()));
   ok &= codecRead(0x31, reg);
   reg &= ~(0x60);
   ok &= codecWrite(0x31, reg);
@@ -1681,8 +2173,122 @@ bool setupCodec16k() {
   return ok;
 }
 
+bool setupEs7210Adc16k() {
+  bool ok = true;
+
+  ok &= es7210Write(0x00, 0xff);
+  ok &= es7210Write(0x00, 0x41);
+  ok &= es7210Write(0x01, 0x1f);
+  ok &= es7210Write(0x09, 0x30);
+  ok &= es7210Write(0x0a, 0x30);
+  ok &= es7210Write(0x40, 0xc3);
+  ok &= es7210Write(0x41, 0x70);
+  ok &= es7210Write(0x42, 0x70);
+
+  ok &= es7210Write(0x02, 0xc1);
+  ok &= es7210Write(0x07, 0x20);
+  ok &= es7210Write(0x04, 0x01);
+  ok &= es7210Write(0x05, 0x00);
+
+  for (uint8_t reg = 0x43; reg <= 0x46; ++reg) {
+    ok &= es7210Update(reg, 0x10, 0x00);
+  }
+  ok &= es7210Write(0x4b, 0xff);
+  ok &= es7210Write(0x4c, 0xff);
+
+  ok &= es7210Update(0x01, 0x0b, 0x00);
+  ok &= es7210Write(0x4b, 0x00);
+  ok &= es7210Update(0x43, 0x10, 0x10);
+  ok &= es7210Update(0x01, 0x0b, 0x00);
+  ok &= es7210Write(0x4b, 0x00);
+  ok &= es7210Update(0x44, 0x10, 0x10);
+  ok &= es7210Update(0x01, 0x15, 0x00);
+  ok &= es7210Write(0x4c, 0x00);
+  ok &= es7210Update(0x45, 0x10, 0x10);
+  ok &= es7210Update(0x01, 0x15, 0x00);
+  ok &= es7210Write(0x4c, 0x00);
+  ok &= es7210Update(0x46, 0x10, 0x10);
+
+  ok &= es7210Update(0x11, 0xe0, 0x60);
+  ok &= es7210Update(0x11, 0x03, 0x00);
+  ok &= es7210Write(0x12, 0x00);
+
+  ok &= es7210Update(0x43, 0x0f, 0x00);
+  ok &= es7210Update(0x44, 0x0f, 0x00);
+  ok &= es7210Update(0x45, 0x0f, 0x0e);
+  ok &= es7210Update(0x46, 0x0f, 0x0e);
+
+  ok &= es7210Write(0x01, 0x00);
+  ok &= es7210Write(0x06, 0x00);
+  ok &= es7210Write(0x47, 0x00);
+  ok &= es7210Write(0x48, 0x00);
+  ok &= es7210Write(0x49, 0x00);
+  ok &= es7210Write(0x4a, 0x00);
+  ok &= es7210Write(0x4b, 0x00);
+  ok &= es7210Write(0x4c, 0x00);
+
+  if (kSerialDiagnostics) {
+    uint8_t chipState = 0;
+    if (es7210Read(0x01, chipState)) {
+      Serial.print("DIAG es7210 clock=");
+      Serial.println(chipState, HEX);
+    }
+  }
+  return ok;
+}
+
+bool configureAudioTx(uint32_t sampleRate) {
+  if (!audioOnline) {
+    return false;
+  }
+  if (sampleRate == kAudioSampleRate || sampleRate == kBootAudioSampleRate) {
+    if (i2s.txSampleRate() != sampleRate &&
+        !i2s.configureTX(sampleRate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+      if (!audioTxFailureLogged) {
+        Serial.println("I2S TX configure failed.");
+        audioTxFailureLogged = true;
+      }
+      return false;
+    }
+    audioTxConfigured = true;
+    audioRxConfigured = false;
+    audioTxSampleRate = sampleRate;
+    audioTxFailureLogged = false;
+    return true;
+  }
+
+  if (!audioTxFailureLogged) {
+    Serial.println("I2S TX sample-rate switch disabled.");
+    audioTxFailureLogged = true;
+  }
+  return false;
+}
+
+bool configureAudioRx() {
+  if (!voiceInputOnline) {
+    return false;
+  }
+  audioRxConfigured = true;
+  audioRxFailureLogged = false;
+  return true;
+}
+
 void startTone(float frequency, uint16_t durationMs, int16_t level, bool force = false) {
+  (void)frequency;
+  (void)durationMs;
+  (void)level;
+  (void)force;
+  tone.active = false;
+  tone.remainingSamples = 0;
+}
+
+void startAlertTone(float frequency, uint16_t durationMs, int16_t level, bool force = false) {
   if (!kSoundEffectsEnabled) {
+    tone.active = false;
+    tone.remainingSamples = 0;
+    return;
+  }
+  if (voiceCapture.pttActive || voiceCapture.playbackActive || speakerMutedForCapture) {
     tone.active = false;
     tone.remainingSamples = 0;
     return;
@@ -1690,27 +2296,133 @@ void startTone(float frequency, uint16_t durationMs, int16_t level, bool force =
   if (!audioOnline) {
     return;
   }
+  if (audioPreset == 0) {
+    tone.active = false;
+    tone.remainingSamples = 0;
+    return;
+  }
   if (tone.active && !force) {
     return;
   }
+  applyCodecOutputVolume();
+  setCodecOutputMuted(false);
+  digitalWrite(PA, HIGH);
   tone.active = true;
   tone.frequency = frequency;
   tone.phase = 0.0f;
   tone.totalSamples = (kAudioSampleRate * durationMs) / 1000;
   tone.remainingSamples = tone.totalSamples;
-  tone.level = scaledAudioLevel(level);
+  tone.level = scaledAlertAudioLevel(level);
+}
+
+void startBootTone(float frequency, uint16_t durationMs, int16_t level) {
+  (void)frequency;
+  (void)durationMs;
+  (void)level;
 }
 
 void playBootAudioCues(float phase, uint8_t &nextCue) {
   while (nextCue < kBootAudioCueCount && phase >= kBootAudioCues[nextCue].phase) {
     const BootAudioCue &cue = kBootAudioCues[nextCue];
-    startTone(cue.frequency, cue.durationMs, cue.level, true);
+    startBootTone(cue.frequency, cue.durationMs, cue.level);
     ++nextCue;
+  }
+}
+
+void startBootBackgroundAudio() {
+  bootAudioPcmOffset = 0;
+  bootAudioPlaying = kSoundEffectsEnabled && audioOnline &&
+                     kBootAudioPcm_len >= kBootAudioChannels * sizeof(int16_t) &&
+                     configureAudioTx(kBootAudioSampleRate);
+  if (bootAudioPlaying) {
+    applyCodecOutputVolumePercent(kBootCodecOutputVolumePercent);
+    setCodecOutputMuted(false);
+    digitalWrite(PA, HIGH);
+    tone.active = false;
+    tone.remainingSamples = 0;
+  }
+}
+
+void stopBootBackgroundAudio() {
+  if (bootAudioPlaying && audioOnline) {
+    if (configureAudioTx(kBootAudioSampleRate)) {
+      int16_t silence[96 * kBootAudioChannels] = {0};
+      i2s.write(reinterpret_cast<uint8_t *>(silence), sizeof(silence));
+    }
+    setCodecOutputMuted(true);
+    digitalWrite(PA, LOW);
+  }
+  bootAudioPlaying = false;
+}
+
+void bootBackgroundAudioTick() {
+  if (!bootAudioPlaying || !audioOnline) {
+    return;
+  }
+  if (voiceCapture.pttActive || speakerMutedForCapture) {
+    stopBootBackgroundAudio();
+    return;
+  }
+  if (!configureAudioTx(kBootAudioSampleRate)) {
+    bootAudioPlaying = false;
+    return;
+  }
+
+  constexpr size_t kBootAudioFramesPerTick = 768;
+  int16_t stereo[kBootAudioFramesPerTick * kBootAudioChannels];
+  const size_t frameBytes = kBootAudioChannels * sizeof(int16_t);
+  const size_t totalFrames = kBootAudioPcm_len / frameBytes;
+  const size_t remainingFrames = (kBootAudioPcm_len - bootAudioPcmOffset) / frameBytes;
+  const size_t count = min(kBootAudioFramesPerTick, remainingFrames);
+  constexpr uint8_t volumePercent = kBootAudioVolumePercent;
+  const size_t fadeInFrames = (static_cast<size_t>(kBootAudioSampleRate) * kBootAudioFadeInMs) / 1000;
+  const size_t fadeOutFrames = (static_cast<size_t>(kBootAudioSampleRate) * kBootAudioFadeOutMs) / 1000;
+  const size_t startFrame = bootAudioPcmOffset / frameBytes;
+
+  for (size_t i = 0; i < count; ++i) {
+    const size_t frameIndex = startFrame + i;
+    float envelope = 1.0f;
+    if (fadeInFrames > 0 && frameIndex < fadeInFrames) {
+      envelope = min(envelope, static_cast<float>(frameIndex) / static_cast<float>(fadeInFrames));
+    }
+    if (fadeOutFrames > 0 && frameIndex + fadeOutFrames > totalFrames) {
+      const size_t framesLeft = totalFrames > frameIndex ? totalFrames - frameIndex : 0;
+      envelope = min(envelope, static_cast<float>(framesLeft) / static_cast<float>(fadeOutFrames));
+    }
+    envelope = smoothStep(0.0f, 1.0f, clampf(envelope, 0.0f, 1.0f));
+    for (uint8_t ch = 0; ch < kBootAudioChannels; ++ch) {
+      const size_t byteOffset = bootAudioPcmOffset + i * frameBytes + ch * sizeof(int16_t);
+      const uint16_t raw = static_cast<uint16_t>(kBootAudioPcm[byteOffset]) |
+                           (static_cast<uint16_t>(kBootAudioPcm[byteOffset + 1]) << 8);
+      const int16_t source = static_cast<int16_t>(raw);
+      const int32_t scaled = static_cast<int32_t>(
+          (static_cast<float>(source) * static_cast<float>(volumePercent) * envelope) / 100.0f);
+      stereo[i * kBootAudioChannels + ch] =
+          static_cast<int16_t>(constrain(scaled,
+                                         -static_cast<long>(kBootAudioPeakLimit),
+                                         static_cast<long>(kBootAudioPeakLimit)));
+    }
+  }
+
+  if (count > 0) {
+    i2s.write(reinterpret_cast<uint8_t *>(stereo), count * frameBytes);
+    bootAudioPcmOffset += count * frameBytes;
+  }
+  if (bootAudioPcmOffset >= kBootAudioPcm_len || count == 0) {
+    stopBootBackgroundAudio();
   }
 }
 
 void audioTick() {
   if (!audioOnline || !tone.active) {
+    return;
+  }
+  if (voiceCapture.pttActive || voiceCapture.playbackActive || speakerMutedForCapture) {
+    tone.active = false;
+    tone.remainingSamples = 0;
+    return;
+  }
+  if (!configureAudioTx(kAudioSampleRate)) {
     return;
   }
 
@@ -1761,28 +2473,62 @@ void resetPanelAndTouch() {
   delay(120);
 }
 
+void setupBootAudio() {
+  pinMode(PA, OUTPUT);
+  digitalWrite(PA, LOW);
+  speakerMutedForCapture = false;
+
+  voiceInputOnline = false;
+  voiceCapture.captureOnline = false;
+  if (!beginI2sBus(kBootAudioSampleRate)) {
+    audioOnline = false;
+    Serial.println("I2S boot audio offline.");
+    return;
+  }
+
+  audioOnline = setupCodecForSampleRate(kBootAudioSampleRate);
+  configureAudioTx(kBootAudioSampleRate);
+  if (audioOnline) {
+    applyCodecOutputVolumePercent(kBootCodecOutputVolumePercent);
+    setCodecOutputMuted(false);
+    digitalWrite(PA, HIGH);
+  }
+  Serial.println(audioOnline ? "ES8311 boot audio online." : "ES8311 boot codec offline.");
+}
+
 void setupAudio() {
   pinMode(PA, OUTPUT);
-  digitalWrite(PA, HIGH);
+  digitalWrite(PA, LOW);
+  speakerMutedForCapture = false;
 
-  i2s.setPins(PIN_ES7210_BCLK, PIN_ES7210_LRCK, PIN_ES8311_DOUT, PIN_ES7210_DIN, PIN_ES7210_MCLK);
-  if (!i2s.begin(I2S_MODE_STD, kAudioSampleRate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+  if (!beginI2sBus(kAudioSampleRate)) {
+    audioOnline = false;
+    voiceInputOnline = false;
+    voiceCapture.captureOnline = false;
     Serial.println("I2S audio offline.");
     return;
   }
 
-  audioOnline = setupCodec16k();
+  audioOnline = setupCodecForSampleRate(kAudioSampleRate);
+  voiceInputOnline = setupEs7210Adc16k();
+  voiceCapture.captureOnline = voiceInputOnline;
+  configureAudioTx(kAudioSampleRate);
+  if (audioOnline) {
+    applyCodecOutputVolume();
+    setCodecOutputMuted(false);
+    digitalWrite(PA, HIGH);
+  }
   Serial.println(audioOnline ? "ES8311 audio online." : "ES8311 codec offline.");
-  startTone(740.0f, 90, 3600, true);
+  Serial.println(voiceInputOnline ? "ES7210 mic online." : "ES7210 mic offline.");
 }
 
 void runBootAnimation() {
   bootStartedMs = millis();
-  uint8_t nextBootCue = 0;
   const uint8_t targetBrightness = currentBrightness();
   panel->setBrightness(0);
   drawBootFrame(1.0f);
   gfx->flush();
+  startBootBackgroundAudio();
 
   while (millis() - bootStartedMs < kBootDurationMs) {
     const uint32_t elapsedMs = millis() - bootStartedMs;
@@ -1793,10 +2539,10 @@ void runBootAnimation() {
                                             static_cast<float>(elapsedMs));
     const float brightness = clampf(fadeIn * fadeOut, 0.0f, 1.0f);
     panel->setBrightness(static_cast<uint8_t>(targetBrightness * brightness));
-    playBootAudioCues(phase, nextBootCue);
-    audioTick();
+    bootBackgroundAudioTick();
     delay(18);
   }
+  stopBootBackgroundAudio();
   panel->setBrightness(0);
   gfx->fillScreen(kBlack);
   gfx->flush();
@@ -1840,34 +2586,6 @@ void initTargets() {
   }
 }
 
-int extractDragonBallIndex(BLEAdvertisedDevice &device) {
-  if (device.haveName()) {
-    String name = device.getName();
-    name.toUpperCase();
-    const int p = name.indexOf("DBALL-");
-    if (p >= 0) {
-      const int star = name.substring(p + 6).toInt();
-      if (star >= 1 && star <= 7) {
-        return star - 1;
-      }
-    }
-  }
-
-  if (device.haveManufacturerData()) {
-    const String payload = device.getManufacturerData();
-    if (payload.length() == 3) {
-      const uint8_t marker0 = static_cast<uint8_t>(payload[0]);
-      const uint8_t marker1 = static_cast<uint8_t>(payload[1]);
-      const uint8_t star = static_cast<uint8_t>(payload[2]);
-      if (marker0 == 0x44 && marker1 == 0x42 && star >= 1 && star <= 7) {
-        return star - 1;
-      }
-    }
-  }
-
-  return -1;
-}
-
 float rssiToRangeNorm(int rssi) {
   const float raw = (abs(rssi) - 35.0f) / 55.0f;
   return clampf(raw, 0.13f, 0.96f);
@@ -1881,137 +2599,17 @@ int smoothRssi(int previous, int sample, bool reset) {
   return weighted / 4;
 }
 
-void updateTargetFromBle(int index, int rssi) {
-  if (index < 0 || index >= 7) {
-    return;
-  }
-
-  DragonTarget &target = targets[index];
-  const uint32_t now = millis();
-  if (target.collected) {
-    demoMode = false;
-    return;
-  }
-
-  const bool firstSeen = !target.seen || target.lastSeenMs == 0;
-  const bool stale = firstSeen || now - target.lastSeenMs > kBeaconTtlMs;
-  const bool stronger = rssi > target.bestRssi + 3;
-
-  demoMode = false;
-  target.seen = true;
-  target.demo = false;
-  target.rssi = rssi;
-  target.filteredRssi = smoothRssi(target.filteredRssi, rssi, stale);
-  target.lastSeenMs = now;
-  if (firstSeen || stale) {
-    target.revealedAtMs = now;
-  }
-  const float measuredRange = rssiToRangeNorm(target.filteredRssi);
-  target.rangeNorm = stale ? measuredRange : lerpf(target.rangeNorm, measuredRange, 0.35f);
-  updateBearingEstimate(target, target.filteredRssi, stale);
-
-  if (stale) {
-    target.closeSinceMs = 0;
-  }
-  if (!kSimulatedBle && rssi >= kCollectRssi) {
-    if (target.closeSinceMs == 0) {
-      target.closeSinceMs = now;
-    } else if (now - target.closeSinceMs >= kCollectHoldMs) {
-      markTargetCollected(target, now);
-    }
-  } else {
-    target.closeSinceMs = 0;
-  }
-
-  if (stronger || stale) {
-    target.bestRssi = rssi;
-  }
-
-  if (kSerialDiagnostics && now - lastBleDiagMs[index] > 500) {
-    lastBleDiagMs[index] = now;
-    Serial.print("DIAG BLE DBALL-");
-    Serial.print(index + 1);
-    Serial.print(" raw=");
-    Serial.print(target.rssi);
-    Serial.print(" filtered=");
-    Serial.print(target.filteredRssi);
-    Serial.print(" range=");
-    Serial.print(target.rangeNorm, 2);
-    Serial.print(" bearingBin=");
-    Serial.print(target.bestBearingBin);
-    Serial.print(" bearing=");
-    Serial.print(target.worldAngleDeg, 1);
-    Serial.print(" close=");
-    Serial.println(target.closeSinceMs > 0 ? "yes" : "no");
-  }
-}
-
-void simulatedBleTick() {
-  if (!kSimulatedBle || summonMode) {
-    return;
-  }
-
-  const uint32_t now = millis();
-  if (radarStartedMs == 0 || now - radarStartedMs < 800 || now - lastSimulatedBleMs < 220) {
-    return;
-  }
-  lastSimulatedBleMs = now;
-
-  for (int i = 0; i < 7; ++i) {
-    if (targets[i].collected) {
-      continue;
-    }
-    targets[i].seen = true;
-    targets[i].demo = true;
-    targets[i].rssi = -62;
-    targets[i].filteredRssi = -62;
-    targets[i].bestRssi = -62;
-    targets[i].lastSeenMs = now;
-    if (targets[i].revealedAtMs == 0) {
-      targets[i].revealedAtMs = now;
-    }
-    targets[i].worldAngleDeg = wrap360(28.0f + i * 51.3f);
-    targets[i].rangeNorm = 0.38f + (i % 4) * 0.13f;
-    targets[i].closeSinceMs = 0;
-  }
-}
-
-class DragonBeaconCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    const int index = extractDragonBallIndex(advertisedDevice);
-    if (index >= 0) {
-      updateTargetFromBle(index, advertisedDevice.getRSSI());
-    }
-  }
-};
-
-void startBleScan() {
-  if (!bleScan) {
-    return;
-  }
-  bleScan->stop();
-  bleScan->clearResults();
-  bleScan->start(0, nullptr, false);
-  lastBleKickMs = millis();
-  if (kSerialDiagnostics) {
-    Serial.println("DIAG BLE scan restarted");
-  }
-}
-
 void setupBle() {
-  BLEDevice::init("CapsuleRadar");
-  bleScan = BLEDevice::getScan();
-  if (!bleScan) {
-    return;
+  if (kRemoteBleEnabled && provisioning.deviceName[0] == '\0') {
+    buildProvisioningIdentity();
   }
-
-  bleScan->setAdvertisedDeviceCallbacks(new DragonBeaconCallbacks(), true);
-  bleScan->setActiveScan(true);
-  bleScan->setInterval(160);
-  bleScan->setWindow(96);
-  bleOnline = true;
-  Serial.println("BLE scan online.");
-  startBleScan();
+  const char *bleName = kRemoteBleEnabled && provisioning.deviceName[0] != '\0'
+                            ? provisioning.deviceName
+                            : "CapsuleRadar";
+  BLEDevice::init(bleName);
+  setupProvisioningBle();
+  bleOnline = provisioning.serviceOnline;
+  Serial.println("BLE provisioning online.");
 }
 
 void onTouchInterrupt() {
@@ -2067,19 +2665,13 @@ void setupImu() {
 
 void readImu() {
   if (!imuOnline || !qmi.getDataReady()) {
-    if (!imuOnline) {
-      headingDeg = wrap360(headingDeg + 0.08f);
-    }
     return;
   }
 
   const uint32_t now = micros();
-  const float dt = (now - lastImuMicros) / 1000000.0f;
   lastImuMicros = now;
 
-  if (qmi.getGyroscope(gyr.x, gyr.y, gyr.z)) {
-    headingDeg = wrap360(headingDeg + gyr.z * dt);
-  }
+  (void)qmi.getGyroscope(gyr.x, gyr.y, gyr.z);
   if (qmi.getAccelerometer(acc.x, acc.y, acc.z)) {
     tiltVectorX = lerpf(tiltVectorX, acc.x, 0.12f);
     tiltVectorY = lerpf(tiltVectorY, acc.y, 0.12f);
@@ -2175,19 +2767,25 @@ void pollButtons() {
   if (pressed && !bootButtonWasPressed) {
     bootButtonPressedAtMs = now;
     bootButtonLongHandled = false;
+    bootTapPressedMs = now;
+    bootTapReleasedMs = 0;
   }
 
   if (pressed && !bootButtonLongHandled && bootButtonPressedAtMs > 0 &&
       now - bootButtonPressedAtMs >= kButtonLongPressMs) {
     bootButtonLongHandled = true;
     lastButtonMs = now;
-    showEasterEgg();
+    beginPushToTalk();
   }
 
   if (!pressed && bootButtonWasPressed) {
     const uint32_t heldMs = bootButtonPressedAtMs > 0 ? now - bootButtonPressedAtMs : 0;
-    if (!bootButtonLongHandled && heldMs >= kButtonDebounceMs && now - lastButtonMs > 160) {
+    if (bootButtonLongHandled && voiceCapture.pttActive) {
+      endPushToTalk();
       lastButtonMs = now;
+    } else if (!bootButtonLongHandled && heldMs >= kButtonDebounceMs && now - lastButtonMs > 160) {
+      lastButtonMs = now;
+      bootTapReleasedMs = now;
       handleBootShortPress();
     }
     bootButtonPressedAtMs = 0;
@@ -2203,6 +2801,8 @@ void pollButtons() {
   if (altPressed && !altButtonWasPressed) {
     altButtonPressedAtMs = now;
     altButtonLongHandled = false;
+    altTapPressedMs = now;
+    altTapReleasedMs = 0;
   }
 
   if (altPressed && !altButtonLongHandled && altButtonPressedAtMs > 0 &&
@@ -2215,6 +2815,7 @@ void pollButtons() {
     const uint32_t heldMs = altButtonPressedAtMs > 0 ? now - altButtonPressedAtMs : 0;
     if (!altButtonLongHandled && heldMs >= kButtonDebounceMs && now - lastButtonMs > 160) {
       lastButtonMs = now;
+      altTapReleasedMs = now;
       toggleSettingsMode();
     }
     altButtonPressedAtMs = 0;
@@ -2304,12 +2905,1680 @@ void pollTouch() {
   }
 }
 
-void updateBleScan() {
-  if (!bleOnline || !bleScan) {
+String jsonEscape(const String &value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+    }
+    if (c == '\n' || c == '\r') {
+      out += ' ';
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+bool extractJsonStringValue(const String &json, const char *key, String &out) {
+  const String needle = String("\"") + key + "\"";
+  int pos = json.indexOf(needle);
+  if (pos < 0) {
+    return false;
+  }
+  pos = json.indexOf(':', pos + needle.length());
+  if (pos < 0) {
+    return false;
+  }
+  pos = json.indexOf('"', pos + 1);
+  if (pos < 0) {
+    return false;
+  }
+
+  out = "";
+  bool escaped = false;
+  for (int i = pos + 1; i < json.length(); ++i) {
+    const char c = json[i];
+    if (escaped) {
+      out += c;
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') {
+      return true;
+    }
+    out += c;
+  }
+  return false;
+}
+
+bool extractJsonIntValue(const String &json, const char *key, int32_t &out) {
+  const String needle = String("\"") + key + "\"";
+  int pos = json.indexOf(needle);
+  if (pos < 0) {
+    return false;
+  }
+  pos = json.indexOf(':', pos + needle.length());
+  if (pos < 0) {
+    return false;
+  }
+  ++pos;
+  while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t')) {
+    ++pos;
+  }
+
+  bool negative = false;
+  if (pos < json.length() && json[pos] == '-') {
+    negative = true;
+    ++pos;
+  }
+
+  int64_t value = 0;
+  bool foundDigit = false;
+  while (pos < json.length() && json[pos] >= '0' && json[pos] <= '9') {
+    foundDigit = true;
+    value = value * 10 + (json[pos] - '0');
+    ++pos;
+  }
+  if (!foundDigit) {
+    return false;
+  }
+
+  if (negative) {
+    value = -value;
+  }
+  out = static_cast<int32_t>(value);
+  return true;
+}
+
+bool extractJsonBoolValue(const String &json, const char *key, bool &out) {
+  const String needle = String("\"") + key + "\"";
+  int pos = json.indexOf(needle);
+  if (pos < 0) {
+    return false;
+  }
+  pos = json.indexOf(':', pos + needle.length());
+  if (pos < 0) {
+    return false;
+  }
+  ++pos;
+  while (pos < json.length() &&
+         (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) {
+    ++pos;
+  }
+  if (json.startsWith("true", pos) || json.startsWith("1", pos)) {
+    out = true;
+    return true;
+  }
+  if (json.startsWith("false", pos) || json.startsWith("0", pos)) {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
+String characteristicValueAsString(BLECharacteristic *characteristic) {
+  const uint8_t *data = characteristic->getData();
+  const size_t len = characteristic->getLength();
+  String text;
+  text.reserve(len);
+  for (size_t i = 0; i < len; ++i) {
+    text += static_cast<char>(data[i]);
+  }
+  return text;
+}
+
+int32_t readLeInt32(const uint8_t *data) {
+  const uint32_t raw = static_cast<uint32_t>(data[0]) |
+                       (static_cast<uint32_t>(data[1]) << 8) |
+                       (static_cast<uint32_t>(data[2]) << 16) |
+                       (static_cast<uint32_t>(data[3]) << 24);
+  return static_cast<int32_t>(raw);
+}
+
+uint16_t readLeUInt16(const uint8_t *data) {
+  return static_cast<uint16_t>(data[0]) |
+         (static_cast<uint16_t>(data[1]) << 8);
+}
+
+uint32_t readLeUInt32(const uint8_t *data) {
+  return static_cast<uint32_t>(data[0]) |
+         (static_cast<uint32_t>(data[1]) << 8) |
+         (static_cast<uint32_t>(data[2]) << 16) |
+         (static_cast<uint32_t>(data[3]) << 24);
+}
+
+bool parseLocationFrame(const uint8_t *data, size_t len) {
+  if (len < 28 || data[0] != 1) {
+    return false;
+  }
+
+  selfLocationFrame.valid = (data[1] & 0x01) != 0;
+  selfLocationFrame.latE7 = readLeInt32(data + 2);
+  selfLocationFrame.lonE7 = readLeInt32(data + 6);
+  selfLocationFrame.horizontalAccuracyCm = readLeUInt16(data + 14);
+  selfLocationFrame.speedCms = readLeUInt16(data + 18);
+  selfLocationFrame.courseDeg100 = readLeUInt16(data + 20);
+  selfLocationFrame.unixTime = readLeUInt32(data + 24);
+  selfLocationFrame.receivedMs = millis();
+  provisioning.locationReceived = true;
+  persistSelfLocationFrame(true);
+  return true;
+}
+
+void copyLocationFrame(RemoteLocationFrame &dst, const RemoteLocationFrame &src) {
+  dst.valid = src.valid;
+  dst.latE7 = src.latE7;
+  dst.lonE7 = src.lonE7;
+  dst.horizontalAccuracyCm = src.horizontalAccuracyCm;
+  dst.speedCms = src.speedCms;
+  dst.courseDeg100 = src.courseDeg100;
+  dst.unixTime = src.unixTime;
+  dst.receivedMs = src.receivedMs;
+}
+
+bool parseRelayLocationObject(const String &json, RemoteLocationFrame &frame) {
+  int32_t latE7 = 0;
+  int32_t lonE7 = 0;
+  int32_t hAccCm = 0;
+  int32_t speedCms = 0;
+  int32_t courseDeg100 = 0;
+  int32_t unixTime = 0;
+  if (!extractJsonIntValue(json, "lat_e7", latE7) ||
+      !extractJsonIntValue(json, "lon_e7", lonE7)) {
+    return false;
+  }
+
+  extractJsonIntValue(json, "h_acc_cm", hAccCm);
+  extractJsonIntValue(json, "speed_cms", speedCms);
+  extractJsonIntValue(json, "course_deg100", courseDeg100);
+  extractJsonIntValue(json, "unix_time", unixTime);
+
+  frame.valid = true;
+  frame.latE7 = latE7;
+  frame.lonE7 = lonE7;
+  frame.horizontalAccuracyCm = static_cast<uint16_t>(constrain(hAccCm, 0, 65535));
+  frame.speedCms = static_cast<uint16_t>(constrain(speedCms, 0, 65535));
+  frame.courseDeg100 = static_cast<uint16_t>(constrain(courseDeg100, 0, 65535));
+  frame.unixTime = unixTime > 0 ? static_cast<uint32_t>(unixTime) : 0;
+  frame.receivedMs = millis();
+  return true;
+}
+
+bool isLocalAppRelayPeer(const String &peerId) {
+  return peerId.length() > 0 &&
+         (peerId == localAppRelayPeerId() || peerId == localRelayPeerId());
+}
+
+bool relayMemberBelongsToLocalGroup(const String &member) {
+  String groupId;
+  String peerId;
+  String appPeerId;
+  String devicePeerId;
+  extractJsonStringValue(member, "group_id", groupId);
+  extractJsonStringValue(member, "peer_id", peerId);
+  extractJsonStringValue(member, "app_peer_id", appPeerId);
+  extractJsonStringValue(member, "device_peer_id", devicePeerId);
+  const String localDevice = localRelayPeerId();
+  const String localApp = localAppRelayPeerId();
+  return groupId == localDevice ||
+         peerId == localDevice ||
+         peerId == localApp ||
+         appPeerId == localApp ||
+         appPeerId == localDevice ||
+         devicePeerId == localDevice;
+}
+
+uint8_t remoteAppSlotForPeer(const String &peerId) {
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < kRemoteAppSlotCount; ++i) {
+    if (remoteAppPeerIds[i] == peerId && remoteAppLocationFrames[i].valid) {
+      return i;
+    }
+  }
+  for (uint8_t i = 0; i < kRemoteAppSlotCount; ++i) {
+    if (remoteAppPeerIds[i].length() == 0 || !remoteAppLocationFrames[i].valid ||
+        now - remoteAppLocationFrames[i].receivedMs > kRemoteAppMarkerTtlMs) {
+      return i;
+    }
+  }
+
+  uint8_t oldest = 0;
+  uint32_t oldestMs = remoteAppLocationFrames[0].receivedMs;
+  for (uint8_t i = 1; i < kRemoteAppSlotCount; ++i) {
+    if (remoteAppLocationFrames[i].receivedMs < oldestMs) {
+      oldest = i;
+      oldestMs = remoteAppLocationFrames[i].receivedMs;
+    }
+  }
+  return oldest;
+}
+
+void storeRemoteAppLocation(const String &peerId, const String &name, const RemoteLocationFrame &frame) {
+  const uint8_t slot = remoteAppSlotForPeer(peerId);
+  copyLocationFrame(remoteAppLocationFrames[slot], frame);
+  remoteAppPeerIds[slot] = peerId;
+  remoteAppPeerNames[slot] = name.length() > 0 ? name : peerId;
+
+  copyLocationFrame(remoteAppLocationFrame, frame);
+  remoteAppPeerName = remoteAppPeerNames[slot];
+  const uint32_t now = millis();
+  if (remoteAppBlinkStartedSlotsMs[slot] == 0 ||
+      now - remoteAppBlinkStartedSlotsMs[slot] >= kLocationReceiveBlinkIntervalMs) {
+    remoteAppBlinkStartedSlotsMs[slot] = now;
+  }
+  if (remoteAppBlinkStartedMs == 0 ||
+      now - remoteAppBlinkStartedMs >= kLocationReceiveBlinkIntervalMs) {
+    remoteAppBlinkStartedMs = now;
+  }
+}
+
+void storeRemoteAppSpeaking(const String &peerId, bool speaking) {
+  const uint8_t slot = remoteAppSlotForPeer(peerId);
+  if (slot >= kRemoteAppSlotCount) {
     return;
   }
-  if (millis() - lastBleKickMs > kScanKickMs) {
-    startBleScan();
+  if (speaking) {
+    remoteAppSpeakingUntilMs[slot] = millis() + kRemoteSpeakingHoldMs;
+  } else if (remoteAppSpeakingUntilMs[slot] < millis() + 180) {
+    remoteAppSpeakingUntilMs[slot] = 0;
+  }
+}
+
+bool relayMemberSpeaking(const String &member) {
+  if (member.indexOf("\"voice_status\"") < 0) {
+    return false;
+  }
+  bool vad = false;
+  bool ptt = false;
+  extractJsonBoolValue(member, "vad", vad);
+  extractJsonBoolValue(member, "ptt", ptt);
+  return vad || ptt;
+}
+
+bool remoteRoomVoiceBusy() {
+  if (!remoteRoomSpeakerActive) {
+    return false;
+  }
+  if (remoteRoomSpeakerUntilMs != 0 && millis() > remoteRoomSpeakerUntilMs) {
+    remoteRoomSpeakerActive = false;
+    remoteRoomSpeakerUntilMs = 0;
+    return false;
+  }
+  return true;
+}
+
+uint8_t activeRemoteAppLocationCount(uint32_t now) {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < kRemoteAppSlotCount; ++i) {
+    if (remoteAppLocationFrames[i].valid &&
+        remoteAppLocationFrames[i].receivedMs > 0 &&
+        now - remoteAppLocationFrames[i].receivedMs <= kRemoteAppMarkerTtlMs) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+bool parseRelayAppLocation(const String &json) {
+  RemoteLocationFrame frame;
+  if (!parseRelayLocationObject(json, frame)) {
+    return false;
+  }
+
+  String from;
+  extractJsonStringValue(json, "from", from);
+  String name;
+  extractJsonStringValue(json, "name", name);
+  lastRelayAppLocationWasSelf = isLocalAppRelayPeer(from);
+  if (lastRelayAppLocationWasSelf) {
+    copyLocationFrame(selfLocationFrame, frame);
+    persistSelfLocationFrame(false);
+    provisioning.lastWrite = "relay_self_location";
+  } else {
+    storeRemoteAppLocation(from, name, frame);
+    provisioning.lastWrite = "relay_app_location";
+  }
+  provisioning.locationReceived = true;
+  return true;
+}
+
+bool parseRelayRoomState(const String &json) {
+  if (json.indexOf("\"type\":\"room_state\"") < 0) {
+    return false;
+  }
+
+  const int membersKey = json.indexOf("\"members\"");
+  if (membersKey < 0) {
+    return false;
+  }
+  const int arrayStart = json.indexOf('[', membersKey);
+  if (arrayStart < 0) {
+    return false;
+  }
+
+  bool inString = false;
+  bool escaped = false;
+  int depth = 0;
+  int objectStart = -1;
+  bool updatedSelf = false;
+  bool updatedRemote = false;
+  bool remoteSpeakerSeen = false;
+
+  for (int i = arrayStart + 1; i < json.length(); ++i) {
+    const char c = json[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = inString;
+      continue;
+    }
+    if (c == '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (c == '{') {
+      if (depth == 0) {
+        objectStart = i;
+      }
+      ++depth;
+      continue;
+    }
+    if (c == '}') {
+      if (depth > 0) {
+        --depth;
+      }
+      if (depth == 0 && objectStart >= 0) {
+        const String member = json.substring(objectStart, i + 1);
+        objectStart = -1;
+
+        String role;
+        String peerId;
+        String name;
+        extractJsonStringValue(member, "role", role);
+        extractJsonStringValue(member, "peer_id", peerId);
+        extractJsonStringValue(member, "name", name);
+        const bool localMember = relayMemberBelongsToLocalGroup(member);
+        const bool memberSpeaking = relayMemberSpeaking(member);
+        if (!localMember && memberSpeaking) {
+          remoteSpeakerSeen = true;
+        }
+        if (role != "app") {
+          continue;
+        }
+
+        RemoteLocationFrame frame;
+        if (!parseRelayLocationObject(member, frame)) {
+          continue;
+        }
+
+        if (localMember || isLocalAppRelayPeer(peerId)) {
+          copyLocationFrame(selfLocationFrame, frame);
+          persistSelfLocationFrame(false);
+          updatedSelf = true;
+        } else {
+          storeRemoteAppLocation(peerId, name, frame);
+          storeRemoteAppSpeaking(peerId, memberSpeaking);
+          updatedRemote = true;
+        }
+      }
+      continue;
+    }
+    if (c == ']' && depth == 0) {
+      break;
+    }
+  }
+
+  remoteRoomSpeakerActive = remoteSpeakerSeen;
+  remoteRoomSpeakerUntilMs = remoteSpeakerSeen ? millis() + kRemoteSpeakingHoldMs : 0;
+  if (remoteRoomVoiceBusy() && voiceCapture.pttActive) {
+    cancelPushToTalkDueToBusy("room_state_busy");
+  }
+
+  if (updatedSelf || updatedRemote) {
+    provisioning.locationReceived =
+        selfLocationFrame.valid || activeRemoteAppLocationCount(millis()) > 0;
+    provisioning.lastWrite = updatedSelf ? "room_state_self_location" : "room_state_remote_location";
+  }
+  return updatedSelf || updatedRemote;
+}
+
+void saveProvisioningState() {
+  Preferences prefs;
+  if (!prefs.begin("radarNet", false)) {
+    return;
+  }
+  prefs.putBool("paired", provisioning.paired);
+  prefs.putString("ssid", provisioning.wifiSsid);
+  prefs.putString("pass", provisioning.wifiPassword);
+  prefs.putString("relay", provisioning.relayUrl);
+  prefs.putString("room", provisioning.roomToken);
+  prefs.putString("device", provisioning.deviceToken);
+  prefs.end();
+}
+
+bool loadPersistedSelfLocationFrame(Preferences &prefs) {
+  if (!prefs.getBool("slocValid", false)) {
+    return false;
+  }
+
+  const int32_t latE7 = prefs.getInt("slocLat", 0);
+  const int32_t lonE7 = prefs.getInt("slocLon", 0);
+  if (latE7 == 0 && lonE7 == 0) {
+    return false;
+  }
+
+  selfLocationFrame.valid = true;
+  selfLocationFrame.latE7 = latE7;
+  selfLocationFrame.lonE7 = lonE7;
+  selfLocationFrame.horizontalAccuracyCm =
+      static_cast<uint16_t>(prefs.getUInt("slocAcc", 0) & 0xffff);
+  selfLocationFrame.speedCms =
+      static_cast<uint16_t>(prefs.getUInt("slocSpeed", 0) & 0xffff);
+  selfLocationFrame.courseDeg100 =
+      static_cast<uint16_t>(prefs.getUInt("slocCourse", 0) & 0xffff);
+  selfLocationFrame.unixTime = prefs.getUInt("slocTime", 0);
+  selfLocationFrame.receivedMs = millis();
+  provisioning.locationReceived = true;
+  provisioning.lastWrite = "stored_self_location";
+  return true;
+}
+
+void persistSelfLocationFrame(bool force) {
+  if (!selfLocationFrame.valid || (selfLocationFrame.latE7 == 0 && selfLocationFrame.lonE7 == 0)) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (!force && lastSelfLocationPersistMs > 0 &&
+      now - lastSelfLocationPersistMs < kSelfLocationPersistMinIntervalMs) {
+    return;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin("radarNet", false)) {
+    return;
+  }
+  prefs.putBool("slocValid", true);
+  prefs.putInt("slocLat", selfLocationFrame.latE7);
+  prefs.putInt("slocLon", selfLocationFrame.lonE7);
+  prefs.putUInt("slocAcc", selfLocationFrame.horizontalAccuracyCm);
+  prefs.putUInt("slocSpeed", selfLocationFrame.speedCms);
+  prefs.putUInt("slocCourse", selfLocationFrame.courseDeg100);
+  prefs.putUInt("slocTime", selfLocationFrame.unixTime);
+  prefs.end();
+  lastSelfLocationPersistMs = now;
+}
+
+void loadProvisioningState() {
+  Preferences prefs;
+  if (!prefs.begin("radarNet", false)) {
+    return;
+  }
+  provisioning.paired = prefs.getBool("paired", false);
+  provisioning.wifiSsid = prefs.isKey("ssid") ? prefs.getString("ssid", "") : "";
+  provisioning.wifiPassword = prefs.isKey("pass") ? prefs.getString("pass", "") : "";
+  provisioning.relayUrl = prefs.isKey("relay") ? prefs.getString("relay", "") : "";
+  provisioning.roomToken = prefs.isKey("room") ? prefs.getString("room", "") : "";
+  provisioning.deviceToken = prefs.isKey("device") ? prefs.getString("device", "") : "";
+  loadPersistedSelfLocationFrame(prefs);
+  prefs.end();
+
+  provisioning.serverConfigured =
+      provisioning.relayUrl.length() > 0 && provisioning.deviceToken.length() > 0;
+  provisioning.wifiConnectRequested = provisioning.wifiSsid.length() > 0;
+  provisioning.relayState = provisioning.serverConfigured ? "configured" : "unconfigured";
+}
+
+void buildProvisioningIdentity() {
+  const uint64_t mac = ESP.getEfuseMac();
+  const uint16_t suffix = static_cast<uint16_t>(mac & 0xffff);
+  snprintf(provisioning.deviceName, sizeof(provisioning.deviceName), "CapsuleRadar-%04X", suffix);
+  snprintf(provisioning.challenge, sizeof(provisioning.challenge), "CR-%04X-%08lX", suffix,
+           static_cast<unsigned long>(esp_random()));
+}
+
+const char *wifiStatusText() {
+  if (provisioning.wifiConnectInFlight && WiFi.status() != WL_CONNECTED) {
+    return "connecting";
+  }
+  switch (WiFi.status()) {
+    case WL_CONNECTED:
+      return "connected";
+    case WL_NO_SSID_AVAIL:
+      return "missing";
+    case WL_CONNECT_FAILED:
+      return "failed";
+    case WL_CONNECTION_LOST:
+      return "lost";
+    case WL_DISCONNECTED:
+      return "disconnected";
+    default:
+      return "connecting";
+  }
+}
+
+const char *relayStatusText() {
+  if (!provisioning.serverConfigured) {
+    return "unconfigured";
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    return "waiting_wifi";
+  }
+  if (provisioning.relayConnected) {
+    return "connected";
+  }
+  return provisioning.relayState.c_str();
+}
+
+String buildDeviceStatusJson() {
+  updateBatteryStatus(false);
+  String status = "{";
+  status += "\"v\":1";
+  status += ",\"protocol_version\":";
+  status += String(DRAGON_RADAR_PROTOCOL_VERSION);
+  status += ",\"min_relay_protocol_version\":";
+  status += String(DRAGON_RADAR_MIN_RELAY_PROTOCOL_VERSION);
+  status += ",\"name\":\"";
+  status += jsonEscape(provisioning.deviceName);
+  status += "\"";
+  status += ",\"ble\":";
+  status += provisioning.appConnected ? "1" : "0";
+  status += ",\"paired\":";
+  status += provisioning.paired ? "1" : "0";
+  status += ",\"wifi\":\"";
+  status += wifiStatusText();
+  status += "\"";
+  status += ",\"rssi\":";
+  status += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String(0);
+  status += ",\"ip\":\"";
+  status += WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
+  status += "\"";
+  status += ",\"server\":";
+  status += provisioning.serverConfigured ? "1" : "0";
+  status += ",\"relay\":\"";
+  status += jsonEscape(String(relayStatusText()));
+  status += "\"";
+  status += ",\"loc\":";
+  status += provisioning.locationReceived ? "1" : "0";
+  status += ",\"battery_percent\":";
+  status += String(batteryStatus.percent);
+  status += ",\"battery_voltage_mv\":";
+  status += String(batteryStatus.voltageMv);
+  status += ",\"battery\":{";
+  status += "\"present\":";
+  status += batteryStatus.present ? "true" : "false";
+  status += ",\"percent\":";
+  status += String(batteryStatus.percent);
+  status += ",\"voltage_mv\":";
+  status += String(batteryStatus.voltageMv);
+  status += ",\"charging\":";
+  status += batteryStatus.charging ? "true" : "false";
+  status += ",\"discharging\":";
+  status += batteryStatus.discharging ? "true" : "false";
+  status += ",\"low\":";
+  status += batteryStatus.low ? "true" : "false";
+  status += "}";
+  status += ",\"voice\":{";
+  status += "\"capture\":";
+  status += voiceCapture.captureOnline ? "1" : "0";
+  status += ",\"muted\":";
+  status += voiceCapture.muted ? "1" : "0";
+  status += ",\"ptt\":";
+  status += voiceCapture.pttActive ? "1" : "0";
+  status += ",\"vad\":";
+  status += voiceCapture.vadActive ? "1" : "0";
+  status += ",\"playback\":";
+  status += voiceCapture.playbackActive ? "1" : "0";
+  status += ",\"rms\":";
+  status += String(voiceCapture.rms);
+  status += ",\"peak\":";
+  status += String(voiceCapture.peak);
+  status += ",\"seq\":";
+  status += String(voiceCapture.sequence);
+  status += ",\"rx_seq\":";
+  status += String(voiceCapture.receivedSequence);
+  status += "}";
+  status += ",\"last\":\"";
+  status += jsonEscape(provisioning.lastWrite);
+  status += "\"";
+  status += "}";
+  return status;
+}
+
+void notifyDeviceStatus(bool force) {
+  if (!deviceStatusCharacteristic) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (!force && now - provisioning.lastStatusNotifyMs < kDeviceStatusNotifyMs) {
+    return;
+  }
+  provisioning.lastStatusNotifyMs = now;
+  const String status = buildDeviceStatusJson();
+  deviceStatusCharacteristic->setValue(status);
+  if (provisioning.appConnected) {
+    deviceStatusCharacteristic->notify();
+  }
+}
+
+bool hmacSha256Hex(const String &message, String &outHex) {
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!info || !kPairingHmacKey || strlen(kPairingHmacKey) == 0) {
+    return false;
+  }
+
+  uint8_t digest[32] = {0};
+  const int rc = mbedtls_md_hmac(
+      info,
+      reinterpret_cast<const unsigned char *>(kPairingHmacKey),
+      strlen(kPairingHmacKey),
+      reinterpret_cast<const unsigned char *>(message.c_str()),
+      message.length(),
+      digest);
+  if (rc != 0) {
+    return false;
+  }
+
+  outHex = "";
+  outHex.reserve(64);
+  static constexpr char kHex[] = "0123456789abcdef";
+  for (uint8_t byte : digest) {
+    outHex += kHex[(byte >> 4) & 0x0f];
+    outHex += kHex[byte & 0x0f];
+  }
+  return true;
+}
+
+bool isHexSha256(const String &value) {
+  if (value.length() != 64) {
+    return false;
+  }
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value.charAt(i);
+    const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!hex) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool verifyPairingResponse(const String &response) {
+  static const String prefix = "dra-pair:v2:";
+  if (!response.startsWith(prefix)) {
+    return kAllowLegacyPairing && response.length() > 0;
+  }
+
+  const int deviceStart = prefix.length();
+  const int nonceStart = response.indexOf(':', deviceStart);
+  if (nonceStart < 0) {
+    return false;
+  }
+  const int signatureStart = response.indexOf(':', nonceStart + 1);
+  if (signatureStart < 0) {
+    return false;
+  }
+
+  const String deviceId = response.substring(deviceStart, nonceStart);
+  const String nonce = response.substring(nonceStart + 1, signatureStart);
+  const String signature = response.substring(signatureStart + 1);
+  if (deviceId.length() == 0 || nonce.length() == 0 || !isHexSha256(signature)) {
+    return false;
+  }
+
+  String expected;
+  const String message = String("v2|") + provisioning.challenge + "|" + deviceId + "|" + nonce;
+  if (!hmacSha256Hex(message, expected)) {
+    return false;
+  }
+  return signature.equalsIgnoreCase(expected);
+}
+
+void handlePairingResponseWrite(BLECharacteristic *characteristic) {
+  const String response = characteristicValueAsString(characteristic);
+  if (!verifyPairingResponse(response)) {
+    provisioning.lastWrite = "pairing_response invalid";
+    notifyDeviceStatus(true);
+    Serial.println("BLE provisioning pairing_response invalid");
+    return;
+  }
+  provisioning.pairingResponse = response;
+  provisioning.paired = true;
+  provisioning.lastWrite = "pairing_response_verified";
+  saveProvisioningState();
+  notifyDeviceStatus(true);
+  Serial.println("BLE provisioning pairing_response verified");
+}
+
+void handleWifiConfigWrite(BLECharacteristic *characteristic) {
+  const String json = characteristicValueAsString(characteristic);
+  String ssid;
+  String password;
+  if (!extractJsonStringValue(json, "ssid", ssid)) {
+    provisioning.lastWrite = "wifi_config invalid:ssid";
+    notifyDeviceStatus(true);
+    Serial.println("BLE provisioning wifi_config missing ssid");
+    return;
+  }
+  extractJsonStringValue(json, "password", password);
+  provisioning.wifiSsid = ssid;
+  provisioning.wifiPassword = password;
+  provisioning.wifiConnectRequested = true;
+  provisioning.wifiConnectInFlight = false;
+  lastWifiAttemptMs = 0;
+  provisioning.lastWrite = "wifi_config";
+  saveProvisioningState();
+  notifyDeviceStatus(true);
+  Serial.print("BLE provisioning wifi_config ssid=");
+  Serial.println(provisioning.wifiSsid);
+}
+
+bool applyServerConfigJson(const String &json, const char *source) {
+  String relayUrl;
+  String roomToken;
+  String deviceToken;
+  extractJsonStringValue(json, "relay_url", relayUrl);
+  extractJsonStringValue(json, "room_token", roomToken);
+  extractJsonStringValue(json, "device_token", deviceToken);
+  if (relayUrl.length() == 0 || roomToken.length() == 0 || deviceToken.length() == 0) {
+    provisioning.lastWrite = String(source) + " invalid:server_config";
+    notifyDeviceStatus(true);
+    Serial.print(source);
+    Serial.println(" server_config invalid");
+    return false;
+  }
+  provisioning.relayUrl = relayUrl;
+  provisioning.roomToken = roomToken;
+  provisioning.deviceToken = deviceToken;
+  provisioning.serverConfigured = relayUrl.length() > 0 && deviceToken.length() > 0;
+  provisioning.relayConnected = false;
+  provisioning.relaySocketConfigured = false;
+  provisioning.relayState = provisioning.serverConfigured ? "configured" : "unconfigured";
+  lastRelayAttemptMs = 0;
+  lastRelayHeartbeatMs = 0;
+  provisioning.lastWrite = String(source) + "_server_config";
+  saveProvisioningState();
+  notifyDeviceStatus(true);
+  relaySocket.disconnect();
+  Serial.print(source);
+  Serial.print(" server_config relay=");
+  Serial.println(provisioning.relayUrl);
+  return true;
+}
+
+void handleServerConfigWrite(BLECharacteristic *characteristic) {
+  const String json = characteristicValueAsString(characteristic);
+  applyServerConfigJson(json, "ble");
+}
+
+void handleLocalLocationWrite(BLECharacteristic *characteristic) {
+  const uint8_t *data = characteristic->getData();
+  const size_t len = characteristic->getLength();
+  if (!parseLocationFrame(data, len)) {
+    provisioning.lastWrite = "local_location invalid";
+    notifyDeviceStatus(true);
+    Serial.print("BLE provisioning local_location invalid len=");
+    Serial.println(len);
+    return;
+  }
+
+  provisioning.lastWrite = "local_location";
+  notifyDeviceStatus(true);
+  Serial.print("BLE provisioning self_location latE7=");
+  Serial.print(selfLocationFrame.latE7);
+  Serial.print(" lonE7=");
+  Serial.print(selfLocationFrame.lonE7);
+  Serial.print(" hAccCm=");
+  Serial.println(selfLocationFrame.horizontalAccuracyCm);
+}
+
+void handleGattWrite(RadarGattWriteRole role, BLECharacteristic *characteristic) {
+  switch (role) {
+    case RadarGattWriteRole::PairingResponse:
+      handlePairingResponseWrite(characteristic);
+      break;
+    case RadarGattWriteRole::WifiConfig:
+      handleWifiConfigWrite(characteristic);
+      break;
+    case RadarGattWriteRole::LocalLocation:
+      handleLocalLocationWrite(characteristic);
+      break;
+    case RadarGattWriteRole::ServerConfig:
+      handleServerConfigWrite(characteristic);
+      break;
+  }
+}
+
+class ProvisioningServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *server) override {
+    (void)server;
+    provisioning.appConnected = true;
+    notifyDeviceStatus(true);
+    Serial.println("BLE provisioning app connected");
+  }
+
+  void onDisconnect(BLEServer *server) override {
+    (void)server;
+    provisioning.appConnected = false;
+    notifyDeviceStatus(true);
+    BLEDevice::startAdvertising();
+    Serial.println("BLE provisioning app disconnected");
+  }
+};
+
+class RadarGattWriteCallbacks : public BLECharacteristicCallbacks {
+ public:
+  explicit RadarGattWriteCallbacks(RadarGattWriteRole role) : role_(role) {}
+
+  void onWrite(BLECharacteristic *characteristic) override {
+    handleGattWrite(role_, characteristic);
+  }
+
+ private:
+  RadarGattWriteRole role_;
+};
+
+BLECharacteristic *createProvisioningCharacteristic(
+    BLEService *service,
+    const char *uuid,
+    uint32_t properties,
+    BLECharacteristicCallbacks *callbacks = nullptr) {
+  BLECharacteristic *characteristic = service->createCharacteristic(uuid, properties);
+  if (callbacks) {
+    characteristic->setCallbacks(callbacks);
+  }
+  return characteristic;
+}
+
+void setupProvisioningBle() {
+  if (!kRemoteBleEnabled) {
+    return;
+  }
+
+  buildProvisioningIdentity();
+  provisioningServer = BLEDevice::createServer();
+  provisioningServer->setCallbacks(new ProvisioningServerCallbacks());
+
+  BLEService *service = provisioningServer->createService(kRadarBleServiceUuid);
+  pairingChallengeCharacteristic = createProvisioningCharacteristic(
+      service,
+      kPairingChallengeUuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  pairingChallengeCharacteristic->setValue(provisioning.challenge);
+
+  createProvisioningCharacteristic(
+      service,
+      kPairingResponseUuid,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::PairingResponse));
+  createProvisioningCharacteristic(
+      service,
+      kWifiConfigUuid,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::WifiConfig));
+  createProvisioningCharacteristic(
+      service,
+      kLocalLocationUuid,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::LocalLocation));
+  deviceStatusCharacteristic = createProvisioningCharacteristic(
+      service,
+      kDeviceStatusUuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  createProvisioningCharacteristic(
+      service,
+      kServerConfigUuid,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::ServerConfig));
+
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(kRadarBleServiceUuid);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMaxPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  provisioning.serviceOnline = true;
+  notifyDeviceStatus(true);
+  Serial.print("BLE provisioning service online name=");
+  Serial.print(provisioning.deviceName);
+  Serial.print(" service=");
+  Serial.println(kRadarBleServiceUuid);
+}
+
+void provisioningTick() {
+  if (!kRemoteBleEnabled) {
+    return;
+  }
+
+  if (provisioning.serviceOnline && pairingChallengeCharacteristic && provisioning.appConnected) {
+    pairingChallengeCharacteristic->setValue(provisioning.challenge);
+    pairingChallengeCharacteristic->notify();
+  }
+
+  const uint32_t now = millis();
+  const wl_status_t wifiStatus = WiFi.status();
+  if (wifiStatus == WL_CONNECTED && provisioning.wifiConnectInFlight) {
+    provisioning.wifiConnectInFlight = false;
+    Serial.print("Wi-Fi connected ip=");
+    Serial.print(WiFi.localIP());
+    Serial.print(" rssi=");
+    Serial.println(WiFi.RSSI());
+    notifyDeviceStatus(true);
+  }
+
+  if (wifiStatus != lastLoggedWifiStatus || now - lastWifiStatusLogMs > 10000) {
+    lastLoggedWifiStatus = wifiStatus;
+    lastWifiStatusLogMs = now;
+    Serial.print("Wi-Fi status=");
+    Serial.print(wifiStatusText());
+    Serial.print(" raw=");
+    Serial.println(static_cast<int>(wifiStatus));
+  }
+
+  if (provisioning.wifiConnectRequested && provisioning.wifiSsid.length() > 0 &&
+      wifiStatus != WL_CONNECTED &&
+      (!provisioning.wifiConnectInFlight || now - lastWifiAttemptMs > 45000)) {
+    lastWifiAttemptMs = now;
+    if (provisioning.wifiConnectInFlight) {
+      WiFi.disconnect(false, false);
+      delay(80);
+    }
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(provisioning.wifiSsid.c_str(), provisioning.wifiPassword.c_str());
+    provisioning.wifiConnectInFlight = true;
+    Serial.print("Wi-Fi connect requested ssid=");
+    Serial.println(provisioning.wifiSsid);
+  }
+
+  notifyDeviceStatus(false);
+}
+
+String urlEncode(const String &value) {
+  const char *hex = "0123456789ABCDEF";
+  String encoded;
+  encoded.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(value[i]);
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += static_cast<char>(c);
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0f];
+      encoded += hex[c & 0x0f];
+    }
+  }
+  return encoded;
+}
+
+bool parseRelayBaseUrl(const String &url, String &host, uint16_t &port, String &path, bool &secure) {
+  String trimmed = url;
+  trimmed.trim();
+  secure = false;
+  port = 0;
+  path = "";
+
+  int offset = 0;
+  if (trimmed.startsWith("ws://")) {
+    offset = 5;
+    port = 80;
+  } else if (trimmed.startsWith("wss://")) {
+    offset = 6;
+    port = 443;
+    secure = true;
+  } else {
+    return false;
+  }
+
+  int pathStart = trimmed.indexOf('/', offset);
+  String authority = pathStart >= 0 ? trimmed.substring(offset, pathStart) : trimmed.substring(offset);
+  path = pathStart >= 0 ? trimmed.substring(pathStart) : "";
+  if (path.endsWith("/")) {
+    path.remove(path.length() - 1);
+  }
+
+  const int portSep = authority.lastIndexOf(':');
+  if (portSep > 0) {
+    host = authority.substring(0, portSep);
+    const int parsedPort = authority.substring(portSep + 1).toInt();
+    if (parsedPort <= 0 || parsedPort > 65535) {
+      return false;
+    }
+    port = static_cast<uint16_t>(parsedPort);
+  } else {
+    host = authority;
+  }
+
+  host.trim();
+  return host.length() > 0;
+}
+
+String relaySocketPath() {
+  String path = "/v1/radar/device/ws?room=";
+  path += urlEncode(provisioning.roomToken.length() > 0 ? provisioning.roomToken : "DRGN-LOCAL");
+  path += "&device_id=";
+  path += urlEncode(provisioning.deviceToken.length() > 0 ? provisioning.deviceToken : provisioning.deviceName);
+  return path;
+}
+
+String localRelayPeerId() {
+  return provisioning.deviceToken.length() > 0 ? provisioning.deviceToken : String(provisioning.deviceName);
+}
+
+String localAppRelayPeerId() {
+  String peer = "app-";
+  peer += localRelayPeerId();
+  return peer;
+}
+
+int base64Value(char c) {
+  if (c >= 'A' && c <= 'Z') {
+    return c - 'A';
+  }
+  if (c >= 'a' && c <= 'z') {
+    return c - 'a' + 26;
+  }
+  if (c >= '0' && c <= '9') {
+    return c - '0' + 52;
+  }
+  if (c == '+') {
+    return 62;
+  }
+  if (c == '/') {
+    return 63;
+  }
+  return -1;
+}
+
+size_t decodeBase64Bytes(const String &encoded, uint8_t *out, size_t outCapacity) {
+  uint32_t accumulator = 0;
+  uint8_t bits = 0;
+  size_t outLen = 0;
+  for (size_t i = 0; i < encoded.length(); ++i) {
+    const char c = encoded[i];
+    if (c == '=') {
+      break;
+    }
+    const int value = base64Value(c);
+    if (value < 0) {
+      continue;
+    }
+    accumulator = (accumulator << 6) | static_cast<uint32_t>(value);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (outLen >= outCapacity) {
+        return outLen;
+      }
+      out[outLen++] = static_cast<uint8_t>((accumulator >> bits) & 0xff);
+    }
+  }
+  return outLen;
+}
+
+void playRemoteVoicePcm(const uint8_t *pcmBytes, size_t byteLen) {
+  if (!audioOnline || byteLen < sizeof(int16_t)) {
+    return;
+  }
+  if (voiceCapture.pttActive || speakerMutedForCapture) {
+    cancelPushToTalkDueToBusy("remote_voice_preempted");
+  }
+  tone.active = false;
+  tone.remainingSamples = 0;
+  bootAudioPlaying = false;
+  digitalWrite(PA, HIGH);
+  setCodecOutputMuted(false);
+  if (!configureAudioTx(kAudioSampleRate)) {
+    return;
+  }
+
+  const size_t monoSamples = min<size_t>(byteLen / sizeof(int16_t), kVoiceFrameSamples);
+  int16_t stereo[kVoiceFrameSamples * 2];
+  for (size_t i = 0; i < monoSamples; ++i) {
+    const uint16_t raw = static_cast<uint16_t>(pcmBytes[i * 2]) |
+                         (static_cast<uint16_t>(pcmBytes[i * 2 + 1]) << 8);
+    const int16_t sample = static_cast<int16_t>(raw);
+    stereo[i * 2] = sample;
+    stereo[i * 2 + 1] = sample;
+  }
+  i2s.write(reinterpret_cast<uint8_t *>(stereo), monoSamples * 2 * sizeof(int16_t));
+  voiceCapture.playbackActive = true;
+  voiceCapture.lastPlaybackMs = millis();
+}
+
+bool handleRelayVoiceFrame(const String &json) {
+  if (json.indexOf("\"type\":\"relay_event\"") < 0 ||
+      json.indexOf("\"event\":\"voice_frame\"") < 0) {
+    return false;
+  }
+
+  String from;
+  if (extractJsonStringValue(json, "from", from) && from == localRelayPeerId()) {
+    return true;
+  }
+
+  String audioB64;
+  if (!extractJsonStringValue(json, "audio_b64", audioB64) || audioB64.length() == 0) {
+    return true;
+  }
+
+  int32_t sequence = 0;
+  extractJsonIntValue(json, "sequence", sequence);
+  uint8_t pcm[kVoicePcmBytes];
+  const size_t decodedBytes = decodeBase64Bytes(audioB64, pcm, sizeof(pcm));
+  if (decodedBytes < sizeof(int16_t)) {
+    return true;
+  }
+
+  voiceCapture.receivedSequence = sequence > 0 ? static_cast<uint32_t>(sequence) : voiceCapture.receivedSequence + 1;
+  remoteRoomSpeakerActive = true;
+  remoteRoomSpeakerUntilMs = millis() + kRemoteSpeakingHoldMs;
+  playRemoteVoicePcm(pcm, decodedBytes);
+  if (kSerialDiagnostics) {
+    Serial.print("DIAG voice_rx from=");
+    Serial.print(from.length() > 0 ? from : "peer");
+    Serial.print(" seq=");
+    Serial.print(voiceCapture.receivedSequence);
+    Serial.print(" bytes=");
+    Serial.println(decodedBytes);
+  }
+  notifyDeviceStatus(true);
+  return true;
+}
+
+bool handleRelayVoiceBusy(const String &json) {
+  if (json.indexOf("\"type\":\"voice_busy\"") < 0) {
+    return false;
+  }
+  remoteRoomSpeakerActive = true;
+  remoteRoomSpeakerUntilMs = millis() + kRemoteSpeakingHoldMs;
+  cancelPushToTalkDueToBusy("voice_busy");
+  provisioning.lastWrite = "voice_busy";
+  notifyDeviceStatus(true);
+  if (kSerialDiagnostics) {
+    Serial.println("DIAG voice=busy");
+  }
+  return true;
+}
+
+bool handleRelayRoomSwitch(const String &json) {
+  if (json.indexOf("\"type\":\"relay_event\"") < 0 ||
+      json.indexOf("\"event\":\"room_switch\"") < 0) {
+    return false;
+  }
+
+  String from;
+  extractJsonStringValue(json, "from", from);
+  if (from.length() > 0 && from != localAppRelayPeerId()) {
+    return true;
+  }
+
+  String relayUrl;
+  String roomToken;
+  String deviceToken;
+  extractJsonStringValue(json, "relay_url", relayUrl);
+  extractJsonStringValue(json, "room_token", roomToken);
+  extractJsonStringValue(json, "device_token", deviceToken);
+  if (relayUrl == provisioning.relayUrl &&
+      roomToken == provisioning.roomToken &&
+      deviceToken == provisioning.deviceToken) {
+    provisioning.lastWrite = "relay_room_switch_same";
+    notifyDeviceStatus(true);
+    return true;
+  }
+
+  return applyServerConfigJson(json, "relay");
+}
+
+void sendRelayJson(String payload) {
+  if (!provisioning.relayConnected) {
+    return;
+  }
+  relaySocket.sendTXT(payload);
+}
+
+void sendRelayHello() {
+  String payload = "{\"type\":\"hello\",\"device_id\":\"";
+  payload += jsonEscape(localRelayPeerId());
+  payload += "\",\"name\":\"";
+  payload += jsonEscape(provisioning.deviceName);
+  payload += "\",\"firmware\":\"dragon-radar-field\"";
+  payload += ",\"protocol_version\":";
+  payload += String(DRAGON_RADAR_PROTOCOL_VERSION);
+  payload += ",\"min_relay_protocol_version\":";
+  payload += String(DRAGON_RADAR_MIN_RELAY_PROTOCOL_VERSION);
+  payload += ",\"capabilities\":[\"display\",\"ble\",\"wifi\",\"location\",\"ptt_voice\"]";
+  payload += ",\"room\":\"";
+  payload += jsonEscape(provisioning.roomToken);
+  payload += "\"}";
+  sendRelayJson(payload);
+}
+
+void sendRelayDeviceStatus() {
+  String payload = "{\"type\":\"device_status\",\"device_id\":\"";
+  payload += jsonEscape(localRelayPeerId());
+  payload += "\",\"status\":";
+  payload += buildDeviceStatusJson();
+  payload += "}";
+  sendRelayJson(payload);
+}
+
+void sendRelayVoiceFrame(const int16_t *pcm, size_t sampleCount, bool includeAudio) {
+  if (!provisioning.relayConnected) {
+    return;
+  }
+
+  includeAudio = includeAudio && pcm != nullptr && sampleCount > 0 &&
+                 voiceCapture.pttActive && !voiceCapture.muted;
+  const size_t pcmBytes = min<size_t>(sampleCount, kVoiceFrameSamples) * sizeof(int16_t);
+  String payload = "{\"type\":\"voice_frame\",\"device_id\":\"";
+  payload += jsonEscape(localRelayPeerId());
+  payload += "\",\"voice_status\":{";
+  payload += "\"muted\":";
+  payload += voiceCapture.muted ? "true" : "false";
+  payload += ",\"ptt\":";
+  payload += voiceCapture.pttActive ? "true" : "false";
+  payload += ",\"vad\":";
+  payload += voiceCapture.vadActive ? "true" : "false";
+  payload += ",\"codec\":\"";
+  payload += includeAudio ? "pcm16" : "status-only";
+  payload += "\"";
+  payload += ",\"sample_rate\":";
+  payload += String(kAudioSampleRate);
+  payload += ",\"frame_ms\":";
+  payload += String(kVoiceFrameDurationMs);
+  payload += ",\"sequence\":";
+  payload += String(voiceCapture.sequence);
+  payload += ",\"rms\":";
+  payload += String(voiceCapture.rms);
+  payload += ",\"peak\":";
+  payload += String(voiceCapture.peak);
+  payload += "},\"muted\":";
+  payload += voiceCapture.muted ? "true" : "false";
+  payload += ",\"ptt\":";
+  payload += voiceCapture.pttActive ? "true" : "false";
+  payload += ",\"vad\":";
+  payload += voiceCapture.vadActive ? "true" : "false";
+  payload += ",\"codec\":\"";
+  payload += includeAudio ? "pcm16" : "status-only";
+  payload += "\",\"sample_rate\":";
+  payload += String(kAudioSampleRate);
+  payload += ",\"frame_ms\":";
+  payload += String(kVoiceFrameDurationMs);
+  payload += ",\"sequence\":";
+  payload += String(voiceCapture.sequence);
+  if (includeAudio) {
+    payload += ",\"audio_b64\":\"";
+    payload += base64::encode(reinterpret_cast<const uint8_t *>(pcm), pcmBytes);
+    payload += "\"";
+  }
+  payload += "}";
+  sendRelayJson(payload);
+}
+
+void sendRelayHeartbeat() {
+  String payload = "{\"type\":\"heartbeat\",\"device_id\":\"";
+  payload += jsonEscape(localRelayPeerId());
+  payload += "\",\"uptime_ms\":";
+  payload += String(millis());
+  payload += "}";
+  sendRelayJson(payload);
+}
+
+void cloudRelayEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      provisioning.relayConnected = true;
+      provisioning.relayState = "connected";
+      provisioning.lastWrite = "relay_connected";
+      lastRelayHeartbeatMs = 0;
+      Serial.println("Relay connected");
+      sendRelayHello();
+      sendRelayDeviceStatus();
+      notifyDeviceStatus(true);
+      break;
+    case WStype_DISCONNECTED:
+      if (provisioning.relayConnected) {
+        Serial.println("Relay disconnected");
+      }
+      provisioning.relayConnected = false;
+      provisioning.relayState = "disconnected";
+      notifyDeviceStatus(true);
+      break;
+    case WStype_TEXT: {
+      String text;
+      text.reserve(length);
+      for (size_t i = 0; i < length; ++i) {
+        text += static_cast<char>(payload[i]);
+      }
+      Serial.print("Relay event ");
+      Serial.println(text);
+      handleRelayVoiceBusy(text);
+      handleRelayVoiceFrame(text);
+      handleRelayRoomSwitch(text);
+      if (text.indexOf("\"type\":\"relay_event\"") >= 0 &&
+          text.indexOf("\"event\":\"app_location\"") >= 0 &&
+          parseRelayAppLocation(text)) {
+        notifyDeviceStatus(true);
+        const RemoteLocationFrame &loggedFrame =
+            lastRelayAppLocationWasSelf ? selfLocationFrame : remoteAppLocationFrame;
+        Serial.print(lastRelayAppLocationWasSelf ? "Relay self_location latE7=" : "Relay app_location latE7=");
+        Serial.print(loggedFrame.latE7);
+        Serial.print(" lonE7=");
+        Serial.print(loggedFrame.lonE7);
+        Serial.print(" accCm=");
+        Serial.print(loggedFrame.horizontalAccuracyCm);
+        if (!lastRelayAppLocationWasSelf && selfLocationFrame.valid && selfLocationFrame.receivedMs > 0) {
+          Serial.print(" distanceM=");
+          Serial.print(geoDistanceMeters(selfLocationFrame, remoteAppLocationFrame), 1);
+          Serial.print(" bearing=");
+          Serial.print(geoBearingDeg(selfLocationFrame, remoteAppLocationFrame), 1);
+        }
+        Serial.println();
+      }
+      if (text.indexOf("\"type\":\"room_state\"") >= 0) {
+        if (parseRelayRoomState(text)) {
+          Serial.print("Relay room_state locations self=");
+          Serial.print(selfLocationFrame.valid ? "yes" : "no");
+          Serial.print(" remoteCount=");
+          Serial.println(activeRemoteAppLocationCount(millis()));
+        }
+        provisioning.relayState = "room_state";
+        notifyDeviceStatus(true);
+      }
+      break;
+    }
+    case WStype_ERROR:
+      provisioning.relayConnected = false;
+      provisioning.relayState = "error";
+      Serial.println("Relay error");
+      notifyDeviceStatus(true);
+      break;
+    default:
+      break;
+  }
+}
+
+void connectCloudRelay() {
+  String host;
+  String basePath;
+  uint16_t port = 0;
+  bool secure = false;
+  if (!parseRelayBaseUrl(provisioning.relayUrl, host, port, basePath, secure)) {
+    provisioning.relayState = "invalid_url";
+    Serial.print("Relay invalid url=");
+    Serial.println(provisioning.relayUrl);
+    notifyDeviceStatus(true);
+    return;
+  }
+
+  String path = basePath;
+  path += relaySocketPath();
+  relaySocket.disconnect();
+  relaySocket.onEvent(cloudRelayEvent);
+  relaySocket.setReconnectInterval(kRelayReconnectMs);
+  if (secure) {
+    relaySocket.beginSSL(host.c_str(), port, path.c_str());
+  } else {
+    relaySocket.begin(host.c_str(), port, path.c_str());
+  }
+  provisioning.relaySocketConfigured = true;
+  provisioning.relayConnected = false;
+  provisioning.relayState = "connecting";
+  Serial.print("Relay connect url=");
+  Serial.print(secure ? "wss://" : "ws://");
+  Serial.print(host);
+  Serial.print(":");
+  Serial.print(port);
+  Serial.println(path);
+  notifyDeviceStatus(true);
+}
+
+void cloudRelayTick() {
+  if (!kRemoteBleEnabled || !provisioning.serverConfigured) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (WiFi.status() != WL_CONNECTED) {
+    if (provisioning.relaySocketConfigured) {
+      relaySocket.disconnect();
+      provisioning.relaySocketConfigured = false;
+      provisioning.relayConnected = false;
+      provisioning.relayState = "waiting_wifi";
+      notifyDeviceStatus(true);
+    }
+    return;
+  }
+
+  if (!provisioning.relaySocketConfigured && now - lastRelayAttemptMs > kRelayReconnectMs) {
+    lastRelayAttemptMs = now;
+    connectCloudRelay();
+  }
+
+  if (provisioning.relaySocketConfigured) {
+    relaySocket.loop();
+  }
+
+  if (provisioning.relayConnected && now - lastRelayHeartbeatMs > kRelayHeartbeatMs) {
+    lastRelayHeartbeatMs = now;
+    sendRelayHeartbeat();
+    sendRelayDeviceStatus();
+  }
+
+  if (now - lastRelayStatusMs > kRelayStatusMs) {
+    lastRelayStatusMs = now;
+    notifyDeviceStatus(false);
+  }
+}
+
+void beginPushToTalk() {
+  if (voiceCapture.pttActive) {
+    return;
+  }
+  if (remoteRoomVoiceBusy()) {
+    provisioning.lastWrite = "ptt_busy";
+    notifyDeviceStatus(true);
+    if (kSerialDiagnostics) {
+      Serial.println("DIAG ptt=busy");
+    }
+    return;
+  }
+  pttRippleStartedMs = millis();
+  pttRippleEndedMs = 0;
+  tone.active = false;
+  tone.remainingSamples = 0;
+  bootAudioPlaying = false;
+  voiceCapture.playbackActive = false;
+  voiceCapture.pttActive = true;
+  voiceCapture.vadActive = false;
+  voiceCapture.lastFrameMs = 0;
+  setSpeakerMutedForCapture(true);
+  provisioning.lastWrite = "ptt_start";
+  notifyDeviceStatus(true);
+  if (kSerialDiagnostics) {
+    Serial.println("DIAG ptt=start");
+  }
+}
+
+void cancelPushToTalkDueToBusy(const char *reason) {
+  if (!voiceCapture.pttActive && !speakerMutedForCapture) {
+    return;
+  }
+  voiceCapture.pttActive = false;
+  voiceCapture.vadActive = false;
+  voiceCapture.playbackActive = false;
+  pttRippleEndedMs = millis();
+  setSpeakerMutedForCapture(false);
+  provisioning.lastWrite = reason;
+  if (provisioning.relayConnected) {
+    ++voiceCapture.sequence;
+    sendRelayVoiceFrame(nullptr, 0, false);
+  }
+  notifyDeviceStatus(true);
+  if (kSerialDiagnostics) {
+    Serial.print("DIAG ptt=cancel reason=");
+    Serial.println(reason);
+  }
+}
+
+void endPushToTalk() {
+  if (!voiceCapture.pttActive) {
+    return;
+  }
+  voiceCapture.pttActive = false;
+  voiceCapture.vadActive = false;
+  pttRippleEndedMs = millis();
+  setSpeakerMutedForCapture(false);
+  provisioning.lastWrite = "ptt_stop";
+  if (provisioning.relayConnected) {
+    ++voiceCapture.sequence;
+    sendRelayVoiceFrame(nullptr, 0, false);
+  }
+  notifyDeviceStatus(true);
+  if (kSerialDiagnostics) {
+    Serial.println("DIAG ptt=stop");
+  }
+}
+
+void voiceCaptureTick() {
+  if (!voiceInputOnline) {
+    voiceCapture.captureOnline = false;
+    voiceCapture.vadActive = false;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (voiceCapture.playbackActive && now - voiceCapture.lastPlaybackMs > 120) {
+    voiceCapture.playbackActive = false;
+  }
+  if (now - voiceCapture.lastSampleMs < kVoiceSampleTickMs) {
+    return;
+  }
+  voiceCapture.lastSampleMs = now;
+  voiceCapture.captureOnline = true;
+
+  if (tone.active || bootAudioPlaying) {
+    voiceCapture.vadActive = false;
+    voiceCapture.rms = 0;
+    voiceCapture.peak = 0;
+    return;
+  }
+  if (!configureAudioRx()) {
+    voiceCapture.captureOnline = false;
+    voiceCapture.vadActive = false;
+    voiceCapture.rms = 0;
+    voiceCapture.peak = 0;
+    return;
+  }
+
+  int16_t stereoSamples[kVoiceFrameSamples * 2];
+  int16_t monoPcm[kVoiceFrameSamples];
+  const bool rxMono = i2s.rxSlotMode() == I2S_SLOT_MODE_MONO;
+  const size_t requestedBytes = (rxMono ? kVoiceFrameSamples : kVoiceFrameSamples * 2) * sizeof(int16_t);
+  const size_t readBytes = i2s.readBytes(reinterpret_cast<char *>(stereoSamples), requestedBytes);
+  const size_t sampleCount = readBytes / sizeof(int16_t);
+  if (sampleCount == 0) {
+    voiceCapture.vadActive = false;
+    voiceCapture.rms = 0;
+    voiceCapture.peak = 0;
+    return;
+  }
+
+  uint64_t sumSquares = 0;
+  uint16_t peak = 0;
+  size_t monoSamples = 0;
+  for (size_t i = 0; i < sampleCount && monoSamples < kVoiceFrameSamples; i += rxMono ? 1 : 2) {
+    const int32_t first = stereoSamples[i];
+    const int32_t second = (!rxMono && i + 1 < sampleCount) ? stereoSamples[i + 1] : first;
+    const uint32_t firstMagnitude = static_cast<uint32_t>(first < 0 ? -first : first);
+    const uint32_t secondMagnitude = static_cast<uint32_t>(second < 0 ? -second : second);
+    const int32_t sample = secondMagnitude > firstMagnitude ? second : first;
+    monoPcm[monoSamples++] = static_cast<int16_t>(sample);
+    const uint32_t magnitude = max<uint32_t>(firstMagnitude, secondMagnitude);
+    peak = max<uint16_t>(peak, static_cast<uint16_t>(min<uint32_t>(magnitude, UINT16_MAX)));
+    const int64_t signedSample = sample;
+    sumSquares += static_cast<uint64_t>(signedSample * signedSample);
+  }
+
+  if (monoSamples == 0) {
+    voiceCapture.vadActive = false;
+    voiceCapture.rms = 0;
+    voiceCapture.peak = 0;
+    return;
+  }
+
+  const uint32_t meanSquare = monoSamples > 0 ? static_cast<uint32_t>(sumSquares / monoSamples) : 0;
+  const uint16_t rms = static_cast<uint16_t>(min<uint32_t>(sqrtf(static_cast<float>(meanSquare)), UINT16_MAX));
+  voiceCapture.rms = rms;
+  voiceCapture.peak = peak;
+  voiceCapture.vadActive = voiceCapture.pttActive && !voiceCapture.muted &&
+                           (rms >= kVoiceVadRmsThreshold || peak >= kVoiceVadPeakThreshold);
+
+  const uint32_t voiceFrameIntervalMs = voiceCapture.pttActive ? kVoiceFrameTickMs : 200;
+  if (provisioning.relayConnected && now - voiceCapture.lastFrameMs >= voiceFrameIntervalMs) {
+    voiceCapture.lastFrameMs = now;
+    ++voiceCapture.sequence;
+    sendRelayVoiceFrame(monoPcm, monoSamples, voiceCapture.pttActive);
+    if (kSerialDiagnostics) {
+      Serial.print("DIAG voice seq=");
+      Serial.print(voiceCapture.sequence);
+      Serial.print(" ptt=");
+      Serial.print(voiceCapture.pttActive ? 1 : 0);
+      Serial.print(" vad=");
+      Serial.print(voiceCapture.vadActive ? 1 : 0);
+      Serial.print(" rms=");
+      Serial.print(voiceCapture.rms);
+      Serial.print(" peak=");
+      Serial.print(voiceCapture.peak);
+      Serial.print(" audio=");
+      Serial.println(voiceCapture.pttActive ? "pcm16" : "status");
+    }
+  }
+}
+
+int halfPixelFloorOffset(int halfPx) {
+  if (halfPx >= 0) {
+    return halfPx / 2;
+  }
+  return -(((-halfPx) + 1) / 2);
+}
+
+void drawGridHLineHalfOffset(int x, int y, int width, uint16_t color, uint16_t halfColor) {
+  const int xBase = halfPixelFloorOffset(kRadarGridXOffsetHalfPx);
+  const int yBase = halfPixelFloorOffset(kRadarGridYOffsetHalfPx);
+  const bool splitY = (kRadarGridYOffsetHalfPx & 1) != 0;
+  if (splitY) {
+    gfx->drawFastHLine(x + xBase, y + yBase, width, halfColor);
+    gfx->drawFastHLine(x + xBase, y + yBase + 1, width, halfColor);
+  } else {
+    gfx->drawFastHLine(x + xBase, y + yBase, width, color);
+  }
+}
+
+void drawGridVLineHalfOffset(int x, int y, int height, uint16_t color, uint16_t halfColor) {
+  const int xBase = halfPixelFloorOffset(kRadarGridXOffsetHalfPx);
+  const int yBase = halfPixelFloorOffset(kRadarGridYOffsetHalfPx);
+  const bool splitX = (kRadarGridXOffsetHalfPx & 1) != 0;
+  if (splitX) {
+    gfx->drawFastVLine(x + xBase, y + yBase, height, halfColor);
+    gfx->drawFastVLine(x + xBase + 1, y + yBase, height, halfColor);
+  } else {
+    gfx->drawFastVLine(x + xBase, y + yBase, height, color);
   }
 }
 
@@ -2319,6 +4588,7 @@ void drawRadarGrid() {
 
   const int pitch = currentGridPitch();
   const uint16_t gridColor = RGB565(12, 157, 71);
+  const uint16_t gridHalfColor = RGB565(7, 104, 50);
   const int start = -((kRadarGridRadius / pitch) * pitch);
 
   for (int offset = start; offset <= -start; offset += pitch) {
@@ -2326,8 +4596,8 @@ void drawRadarGrid() {
     if (half <= 0) {
       continue;
     }
-    gfx->drawFastHLine(kCx - half, kCy + offset, half * 2, gridColor);
-    gfx->drawFastVLine(kCx + offset, kCy - half, half * 2, gridColor);
+    drawGridHLineHalfOffset(kCx - half, kCy + offset, half * 2, gridColor, gridHalfColor);
+    drawGridVLineHalfOffset(kCx + offset, kCy - half, half * 2, gridColor, gridHalfColor);
   }
 
   if (kShowDebugHud) {
@@ -2381,7 +4651,7 @@ void drawSweep() {
 }
 
 void drawIdleSearchLattice(uint32_t now) {
-  if (kShowDebugHud || kShowStarBlips || demoMode || summonMode || activeTargetCount() > 0) {
+  if (kShowDebugHud || kShowStarBlips || demoMode || retiredTargetOverlayMode || activeTargetCount() > 0) {
     return;
   }
 
@@ -2541,20 +4811,128 @@ void drawOrbPhosphorBloom(int x, int y, bool fresh, bool trace, uint8_t pulse) {
 }
 
 void drawOrb(int x, int y, int star, bool fresh, bool trace, uint8_t pulse) {
-  const uint32_t now = millis();
-  if ((now % 1000) < 180) {
+  if (fresh) {
     return;
   }
 
   const int r = 7;
-  gfx->fillCircle(x, y, r + 2, RGB565(138, 42, 0));
-  gfx->fillCircle(x, y, r, RGB565(255, 122, 22));
+  const uint16_t outer = trace ? RGB565(78, 54, 18) : RGB565(138, 42, 0);
+  const uint16_t body = trace ? RGB565(132, 112, 28) : RGB565(255, 122, 22);
+  gfx->fillCircle(x, y, r + 2, outer);
+  gfx->fillCircle(x, y, r, body);
   gfx->fillCircle(x - 2, y - 2, 2, kAmber);
   gfx->drawPixel(x - 3, y - 3, kWhite);
   (void)star;
-  (void)fresh;
-  (void)trace;
   (void)pulse;
+}
+
+void formatDistanceLabel(float meters, char *buf, size_t len) {
+  if (meters < 995.0f) {
+    snprintf(buf, len, "%dm", static_cast<int>(roundf(meters)));
+  } else if (meters < 9950.0f) {
+    snprintf(buf, len, "%.1fkm", meters / 1000.0f);
+  } else {
+    snprintf(buf, len, "%.0fkm", meters / 1000.0f);
+  }
+}
+
+void drawDistanceLabel(int x, int y, float meters) {
+  if (!isfinite(meters) || meters < 0.0f) {
+    return;
+  }
+
+  char buf[12];
+  formatDistanceLabel(meters, buf, sizeof(buf));
+  const int textW = static_cast<int>(strlen(buf)) * 6 * kDistanceLabelTextSize;
+  const int textH = 8 * kDistanceLabelTextSize;
+  int tx = constrain(x - textW / 2, kCx - kRadarGridRadius + 18,
+                     kCx + kRadarGridRadius - textW - 18);
+  int ty = y + 18;
+  if (ty + textH > kCy + kRadarGridRadius - 16) {
+    ty = y - textH - 12;
+  }
+  ty = constrain(ty, kCy - kRadarGridRadius + 16,
+                 kCy + kRadarGridRadius - textH - 16);
+
+  gfx->fillRect(tx - 5, ty - 4, textW + 10, textH + 7, kBlack);
+  gfx->drawRect(tx - 6, ty - 5, textW + 12, textH + 9, kGridDeep);
+  gfx->setTextSize(kDistanceLabelTextSize);
+  gfx->setTextColor(kGridBright);
+  gfx->setCursor(tx, ty);
+  gfx->print(buf);
+}
+
+void drawMotionBadge(int x, int y, float courseDeg, float speedMps) {
+  if (!isfinite(courseDeg) || !isfinite(speedMps)) {
+    return;
+  }
+
+  constexpr int kOrbRadius = 7;
+  constexpr int kHiddenBoxSide = kOrbRadius * 2;
+  constexpr int kHiddenBoxGap = 4;
+  constexpr int kCellOffset = 5;
+  const int boxCx = x - kOrbRadius - kHiddenBoxGap - kHiddenBoxSide / 2;
+  const int boxCy = y;
+
+  int cellX = 0;
+  int cellY = 0;
+  if (speedMps >= 0.05f) {
+    const int bin = static_cast<int>(floorf((wrap360(courseDeg) + 22.5f) / 45.0f)) & 7;
+    static const int8_t kDirCells[8][2] = {
+        {0, -1}, {1, -1}, {1, 0}, {1, 1},
+        {0, 1}, {-1, 1}, {-1, 0}, {-1, -1},
+    };
+    cellX = kDirCells[bin][0];
+    cellY = kDirCells[bin][1];
+  }
+
+  const uint16_t color = speedMps >= 1.4f ? kGridBright : (speedMps >= 0.45f ? kGrid : kGridDim);
+  const int px = boxCx + cellX * kCellOffset;
+  const int py = boxCy + cellY * kCellOffset;
+
+  if (cellX == 0 && cellY == 0) {
+    const int dotR = speedMps >= 1.4f ? 2 : 1;
+    gfx->fillCircle(px + 1, py + 1, dotR + 1, kBlack);
+    gfx->fillCircle(px, py, dotR + 1, kGridDeep);
+    gfx->fillCircle(px, py, dotR, color);
+    return;
+  }
+
+  const int tailX = boxCx - cellX * 2;
+  const int tailY = boxCy - cellY * 2;
+  const int headX = boxCx + cellX * 6;
+  const int headY = boxCy + cellY * 6;
+  const int sideX = cellY;
+  const int sideY = -cellX;
+  const bool fast = speedMps >= 1.4f;
+
+  gfx->drawLine(tailX + 1, tailY + 1, headX + 1, headY + 1, kBlack);
+  gfx->drawLine(headX + 1, headY + 1, headX - cellX * 3 + sideX * 3 + 1,
+                headY - cellY * 3 + sideY * 3 + 1, kBlack);
+  gfx->drawLine(headX + 1, headY + 1, headX - cellX * 3 - sideX * 3 + 1,
+                headY - cellY * 3 - sideY * 3 + 1, kBlack);
+
+  gfx->drawLine(tailX, tailY, headX, headY, color);
+  gfx->drawLine(headX, headY, headX - cellX * 3 + sideX * 3,
+                headY - cellY * 3 + sideY * 3, color);
+  gfx->drawLine(headX, headY, headX - cellX * 3 - sideX * 3,
+                headY - cellY * 3 - sideY * 3, color);
+  if (fast) {
+    gfx->drawLine(tailX + sideX, tailY + sideY, headX + sideX, headY + sideY, color);
+  }
+}
+
+void drawSpeakingBadge(int x, int y, uint32_t now) {
+  const bool flash = ((now / 170) & 1) == 0;
+  const uint16_t color = flash ? kGridBright : kGrid;
+  const uint16_t dim = flash ? kGrid : kGridDim;
+  const int bx = x + 12;
+  const int by = y - 11;
+  gfx->drawPixel(bx, by, color);
+  gfx->drawFastVLine(bx + 2, by - 2, 5, color);
+  gfx->drawFastVLine(bx + 5, by - 4, 9, dim);
+  gfx->drawPixel(bx + 7, by - 5, dim);
+  gfx->drawPixel(bx + 7, by + 5, dim);
 }
 
 void drawCaptureGlyph(int x, int y, uint32_t ageMs) {
@@ -2613,7 +4991,7 @@ void drawAcquisitionEcho(int x, int y, uint32_t ageMs) {
   }
 }
 
-void pushTargetTrail(DragonTarget &target, int x, int y, uint32_t now) {
+void pushTargetTrail(RetiredTarget &target, int x, int y, uint32_t now) {
   for (int i = kTargetTrailCount - 1; i > 0; --i) {
     target.trailX[i] = target.trailX[i - 1];
     target.trailY[i] = target.trailY[i - 1];
@@ -2624,7 +5002,7 @@ void pushTargetTrail(DragonTarget &target, int x, int y, uint32_t now) {
   target.trailMs[0] = now;
 }
 
-void updateTargetTrail(DragonTarget &target, int x, int y, uint32_t now) {
+void updateTargetTrail(RetiredTarget &target, int x, int y, uint32_t now) {
   if (kShowDebugHud || kShowStarBlips) {
     return;
   }
@@ -2648,7 +5026,7 @@ void updateTargetTrail(DragonTarget &target, int x, int y, uint32_t now) {
   target.lastTrailMs = now;
 }
 
-void drawTargetTrail(const DragonTarget &target, uint32_t now) {
+void drawTargetTrail(const RetiredTarget &target, uint32_t now) {
   if (kShowDebugHud || kShowStarBlips) {
     return;
   }
@@ -2709,13 +5087,13 @@ void drawProximityLock(int x, int y, uint32_t heldMs) {
     return;
   }
 
-  const uint32_t held = min(heldMs, kCollectHoldMs);
+  const uint32_t held = min(heldMs, kRetiredTargetHoldMs);
   const bool flash = ((millis() / 86) & 1) == 0;
   const uint16_t c = flash ? kGridBright : kGrid;
   const int r = min(16, edgeRoom);
   const int frame = min(r + 4, edgeRoom);
   const int side = frame * 2;
-  const int progress = static_cast<int>((held * side * 4UL) / kCollectHoldMs);
+  const int progress = static_cast<int>((held * side * 4UL) / kRetiredTargetHoldMs);
   const int corner = 8;
 
   gfx->drawFastHLine(x - r, y - r, corner, c);
@@ -2807,19 +5185,19 @@ void drawRssiCalibrationStrip() {
     gfx->setTextSize(1);
     gfx->setTextColor(kGridDim);
     gfx->setCursor(kCx - 36, 422);
-    gfx->print("NO BEACON");
+    gfx->print("NO ROOM");
     return;
   }
 
-  DragonTarget &target = targets[idx];
+  RetiredTarget &target = targets[idx];
   const int x = kCx - 118;
   const int y = 408;
   const int w = 236;
   const int h = 8;
   const int filteredW = rssiToBarWidth(target.filteredRssi, w - 2);
   const int rawX = x + 1 + rssiToBarWidth(target.rssi, w - 2);
-  const int collectX = x + 1 + rssiToBarWidth(kCollectRssi, w - 2);
-  const bool close = target.rssi >= kCollectRssi;
+  const int collectX = x + 1 + rssiToBarWidth(kRetiredTargetCloseRssi, w - 2);
+  const bool close = target.rssi >= kRetiredTargetCloseRssi;
 
   gfx->drawRect(x, y, w, h, kGridDim);
   gfx->fillRect(x + 1, y + 2, filteredW, h - 4, close ? kOrange : kGrid);
@@ -2827,8 +5205,8 @@ void drawRssiCalibrationStrip() {
   gfx->drawFastVLine(rawX, y - 1, h + 2, kWhite);
 
   if (target.closeSinceMs > 0 && !target.collected) {
-    const uint32_t held = min(millis() - target.closeSinceMs, kCollectHoldMs);
-    const int holdW = (held * (w - 2)) / kCollectHoldMs;
+    const uint32_t held = min(millis() - target.closeSinceMs, kRetiredTargetHoldMs);
+    const int holdW = (held * (w - 2)) / kRetiredTargetHoldMs;
     gfx->drawFastHLine(x + 1, y + h + 3, holdW, kAmber);
   }
 
@@ -2866,8 +5244,8 @@ void drawBearingCalibrationStrip() {
   }
 }
 
-void summonStartPoint(const DragonTarget &target, uint8_t index, int &x, int &y) {
-  const float screenAngle = wrap360(target.worldAngleDeg - headingDeg);
+void retiredTargetStartPoint(const RetiredTarget &target, uint8_t index, int &x, int &y) {
+  const float screenAngle = wrap360(target.worldAngleDeg);
   float radius = target.rangeNorm * currentMapScale() * (kRadarRadius - 28);
   if (radius < 58.0f) {
     radius = 58.0f + index * 7.0f;
@@ -2877,7 +5255,7 @@ void summonStartPoint(const DragonTarget &target, uint8_t index, int &x, int &y)
   snapPointToGrid(x, y);
 }
 
-void drawSummonGathering(uint32_t elapsed) {
+void drawRetiredTargetOverlayGathering(uint32_t elapsed) {
   const float t = smoothStep(0.0f, 1.0f,
                              clampf(elapsed / static_cast<float>(kSummonGatherMs), 0.0f, 1.0f));
   const bool flash = ((elapsed / 92) & 1) == 0;
@@ -2891,7 +5269,7 @@ void drawSummonGathering(uint32_t elapsed) {
   for (uint8_t i = 0; i < 7; ++i) {
     int sx;
     int sy;
-    summonStartPoint(targets[i], i, sx, sy);
+    retiredTargetStartPoint(targets[i], i, sx, sy);
 
     gfx->drawFastHLine(min(sx, kCx), sy, abs(sx - kCx) + 1, pathColor);
     gfx->drawFastVLine(kCx, min(sy, kCy), abs(sy - kCy) + 1, pathColor);
@@ -2917,7 +5295,7 @@ void drawSummonGathering(uint32_t elapsed) {
   }
 }
 
-void drawSummonCorePulse(uint32_t elapsed) {
+void drawRetiredTargetOverlayCorePulse(uint32_t elapsed) {
   const bool flash = ((elapsed / 74) & 1) == 0;
   const uint16_t core = flash ? kGridBright : kGrid;
   const uint16_t dim = flash ? kGridDim : kGridDeep;
@@ -2951,12 +5329,12 @@ void drawSummonCorePulse(uint32_t elapsed) {
   }
 }
 
-void drawSummonOverlay() {
-  if (!summonMode) {
+void drawRetiredTargetOverlayOverlay() {
+  if (!retiredTargetOverlayMode) {
     return;
   }
 
-  const uint32_t elapsed = millis() - summonStartedMs;
+  const uint32_t elapsed = millis() - retiredTargetOverlayStartedMs;
   const int band = (elapsed / 48) % 64;
   for (int offset = -192 + band; offset <= 192; offset += 64) {
     if (abs(offset) <= kRadarRadius) {
@@ -2971,11 +5349,11 @@ void drawSummonOverlay() {
   gfx->drawRect(kCx - 34 - halo / 2, kCy - 34 - halo / 2, 68 + halo, 68 + halo, kGridDim);
   gfx->drawFastHLine(kCx - 46, kCy, 92, kGridBright);
   gfx->drawFastVLine(kCx, kCy - 46, 92, kGridBright);
-  drawSummonCorePulse(elapsed);
+  drawRetiredTargetOverlayCorePulse(elapsed);
 
   if (elapsed < kSummonGatherMs) {
-    drawSummonGathering(elapsed);
-    drawSummonCorePulse(elapsed);
+    drawRetiredTargetOverlayGathering(elapsed);
+    drawRetiredTargetOverlayCorePulse(elapsed);
     return;
   }
 
@@ -2993,12 +5371,11 @@ void drawSummonOverlay() {
 }
 
 bool targetScreenPoint(float worldAngle, float range, int &x, int &y) {
-  const float screenAngle = kSimulatedBle ? worldAngle : wrap360(worldAngle - headingDeg);
+  const float screenAngle = wrap360(worldAngle);
   float radius = range * currentMapScale() * kTargetMaxRadius;
-  if (zoomLevel > 0 && radius > kTargetMaxRadius) {
+  if (radius > static_cast<float>(kTargetMaxRadius)) {
     return false;
   }
-  radius = min(radius, static_cast<float>(kTargetMaxRadius));
   polarToPoint(screenAngle, radius, x, y);
   return true;
 }
@@ -3021,47 +5398,131 @@ void snapPointToGrid(int &x, int &y) {
   }
 }
 
+void drawFocusedMemberFrame(int x, int y, uint32_t now) {
+  if (focusedTargetSlot == kFocusNone || now > focusFlashUntilMs) {
+    return;
+  }
+
+  const bool flash = ((focusFlashUntilMs - now) / 84) & 1;
+  const uint16_t color = flash ? kGridBright : kAmber;
+  const int r = 18 + static_cast<int>(((focusFlashUntilMs - now) / 110) % 3);
+  gfx->drawFastHLine(x - r, y - r, 10, color);
+  gfx->drawFastVLine(x - r, y - r, 10, color);
+  gfx->drawFastHLine(x + r - 9, y - r, 10, color);
+  gfx->drawFastVLine(x + r, y - r, 10, color);
+  gfx->drawFastHLine(x - r, y + r, 10, color);
+  gfx->drawFastVLine(x - r, y + r - 9, 10, color);
+  gfx->drawFastHLine(x + r - 9, y + r, 10, color);
+  gfx->drawFastVLine(x + r, y + r - 9, 10, color);
+}
+
 void drawTargets() {
+  return;
+}
+
+void drawRemoteAppMarker() {
   const uint32_t now = millis();
-
-  for (int i = 0; i < 7; ++i) {
-    DragonTarget &target = targets[i];
-    if (target.collected) {
-      continue;
-    }
-
-    bool visible = false;
-    float range = target.rangeNorm;
-    float worldAngle = target.worldAngleDeg;
-    bool fresh = false;
-    bool trace = false;
-
-    if (target.seen && now - target.lastSeenMs < kBeaconTraceMs) {
-      const uint32_t age = now - target.lastSeenMs;
-      visible = true;
-      fresh = target.revealedAtMs > 0 && now - target.revealedAtMs < kBeaconFreshMs;
-      trace = age >= kBeaconTtlMs;
-    } else if (demoMode) {
-      visible = true;
-      const float t = now / 1000.0f;
-      worldAngle = wrap360(28.0f + i * 51.3f + sinf(t * 0.35f + i) * 15.0f);
-      range = 0.25f + 0.1f * (i % 5) + 0.08f * sinf(t * 0.6f + i * 1.7f);
-      range = clampf(range, 0.18f, 0.88f);
-    }
-
-    if (!visible) {
+  RemoteMarkerDrawState markers[kRemoteAppSlotCount];
+  for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
+    float angle = 42.0f;
+    float range = 0.42f;
+    float distanceM = 0.0f;
+    bool distanceKnown = false;
+    if (!remoteAppDisplayCandidate(slot, now, angle, range, distanceM, distanceKnown)) {
       continue;
     }
 
     int x;
     int y;
-    if (!targetScreenPoint(worldAngle, range, x, y)) {
+    if (!targetScreenPoint(angle, range, x, y)) {
       continue;
     }
     snapPointToGrid(x, y);
-    const float pulseF = (sinf((now / 130.0f) + i) + 1.0f) * 0.5f;
-    drawOrb(x, y, target.star, fresh, trace, static_cast<uint8_t>(pulseF * 2.0f));
+
+    const bool fresh = remoteAppBlinkStartedSlotsMs[slot] > 0 &&
+                       now - remoteAppBlinkStartedSlotsMs[slot] < kLocationReceiveBlinkMs;
+    const float pulseF = (sinf(now / 130.0f + slot) + 1.0f) * 0.5f;
+    markers[slot].visible = true;
+    markers[slot].distanceKnown = distanceKnown;
+    markers[slot].fresh = fresh;
+    markers[slot].speaking = remoteAppSpeakingUntilMs[slot] > now;
+    markers[slot].slot = slot;
+    markers[slot].pulse = static_cast<uint8_t>(pulseF * 2.0f);
+    markers[slot].x = x;
+    markers[slot].y = y;
+    markers[slot].distanceM = distanceM;
+    const RemoteLocationFrame &frame = remoteAppLocationFrames[slot];
+    markers[slot].speedMps = static_cast<float>(frame.speedCms) / 100.0f;
+    markers[slot].courseDeg = static_cast<float>(frame.courseDeg100) / 100.0f;
+    markers[slot].motionKnown = frame.speedCms > 5;
   }
+
+  for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
+    if (!markers[slot].visible || !markers[slot].distanceKnown) {
+      continue;
+    }
+    drawDistanceLabel(markers[slot].x, markers[slot].y, markers[slot].distanceM);
+  }
+
+  for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
+    if (!markers[slot].visible) {
+      continue;
+    }
+    if (markers[slot].motionKnown) {
+      drawMotionBadge(markers[slot].x, markers[slot].y, markers[slot].courseDeg, markers[slot].speedMps);
+    }
+    drawOrb(markers[slot].x, markers[slot].y, 1 + slot, markers[slot].fresh, false, markers[slot].pulse);
+    if (markers[slot].speaking) {
+      drawSpeakingBadge(markers[slot].x, markers[slot].y, now);
+    }
+    if (focusedTargetSlot == static_cast<uint8_t>(kFocusRemoteApp + slot)) {
+      drawFocusedMemberFrame(markers[slot].x, markers[slot].y, now);
+    }
+  }
+}
+
+void drawSignalStatusBanner(uint32_t now) {
+  updateBatteryStatus(false);
+  const bool networkLost = !radarRelayOnline();
+  const bool lowBattery = !networkLost && batteryLevelLow();
+  const bool noRemoteGps = !networkLost && !lowBattery && activeRemoteAppLocationCount(now) == 0;
+  if (!networkLost && !lowBattery && !noRemoteGps) {
+    lastSignalLostBeepPhase = UINT32_MAX;
+    return;
+  }
+  const uint32_t blinkPhase = now / 320;
+  if ((blinkPhase & 1) != 0) {
+    return;
+  }
+  if ((networkLost || noRemoteGps) && blinkPhase != lastSignalLostBeepPhase) {
+    startAlertTone(networkLost ? 1320.0f : 2200.0f, networkLost ? 52 : 28, 11000, true);
+    lastSignalLostBeepPhase = blinkPhase;
+    if (kSerialDiagnostics) {
+      Serial.println("DIAG signal_lost_beep");
+    }
+  } else if (lowBattery) {
+    lastSignalLostBeepPhase = UINT32_MAX;
+  }
+
+  const char *text = networkLost ? "SIGNAL LOST" : (lowBattery ? "LOW BATTERY" : "NO SIGNAL");
+  const int textSize = 2;
+  const int textW = static_cast<int>(strlen(text)) * 6 * textSize;
+  const int textH = 8 * textSize;
+  const int x = kCx - textW / 2;
+  const int y = kCy - (kRadarGridRadius / 2);
+  gfx->fillRect(x - 8, y - 6, textW + 16, textH + 12, kBlack);
+  gfx->drawRect(x - 9, y - 7, textW + 18, textH + 14, kGridDeep);
+  gfx->setTextSize(textSize);
+  gfx->setTextColor(RGB565(74, 52, 0));
+  gfx->setCursor(x + 1, y + 1);
+  gfx->print(text);
+  gfx->setTextColor(kAmber);
+  gfx->setCursor(x, y);
+  gfx->print(text);
+}
+
+void drawSignalLostBanner(uint32_t now) {
+  drawSignalStatusBanner(now);
 }
 
 void drawZoomFlash() {
@@ -3145,6 +5606,150 @@ void drawTouchEcho() {
   gfx->drawFastVLine(x, y + side + 2, 10, active);
   if (flash) {
     gfx->fillRect(x - 2, y - 2, 4, 4, active);
+  }
+}
+
+int normalizeAngleDeg(float degrees) {
+  int value = static_cast<int>(roundf(degrees)) % 360;
+  if (value < 0) {
+    value += 360;
+  }
+  return value;
+}
+
+void drawPttRippleArc(float centerDeg, float spanDeg, int radius, uint16_t color, uint8_t thickness) {
+  if (radius <= 0 || spanDeg <= 0.0f) {
+    return;
+  }
+
+  const int startDeg = normalizeAngleDeg(centerDeg - spanDeg * 0.5f);
+  const int endDeg = normalizeAngleDeg(centerDeg + spanDeg * 0.5f);
+  for (uint8_t i = 0; i < thickness; ++i) {
+    const int r = radius - i;
+    if (r > 0) {
+      gfx->drawArc(kCx, kCy, r, r - 1, startDeg, endDeg, color);
+    }
+  }
+}
+
+void drawButtonTapEffect(uint32_t now, float originDeg, uint32_t &pressStartedMs,
+                         uint32_t &releaseStartedMs, bool pressed) {
+  if (pressStartedMs > 0) {
+    const uint32_t age = now - pressStartedMs;
+    if (age >= kButtonTapPressMs && !pressed) {
+      pressStartedMs = 0;
+    } else if (age < kButtonTapPressMs) {
+      const float phase = static_cast<float>(age) / static_cast<float>(kButtonTapPressMs);
+      const float rise = smoothStep(0.0f, 1.0f, phase);
+      const float settle = pressed ? 1.0f : (1.0f - phase);
+      const float span = 10.0f + rise * 18.0f;
+      drawPttRippleArc(originDeg, span, kRadarGridRadius - 2, kRippleHead, 2);
+      drawPttRippleArc(originDeg, span + 12.0f * settle, kRadarGridRadius - 10, kRippleMid, 1);
+      drawPttRippleArc(originDeg - span * 0.48f, 6.0f, kRadarGridRadius - 7, kRippleDim, 1);
+      drawPttRippleArc(originDeg + span * 0.48f, 6.0f, kRadarGridRadius - 7, kRippleDim, 1);
+    }
+  }
+
+  if (releaseStartedMs == 0) {
+    return;
+  }
+
+  const uint32_t releasedAge = now - releaseStartedMs;
+  if (releasedAge >= kButtonTapReleaseMs) {
+    releaseStartedMs = 0;
+    return;
+  }
+
+  const float phase = static_cast<float>(releasedAge) / static_cast<float>(kButtonTapReleaseMs);
+  const float fade = 1.0f - phase;
+  const float travel = 8.0f + smoothStep(0.0f, 1.0f, phase) * 46.0f;
+  const float span = max(5.0f, 15.0f * fade);
+  const uint16_t headColor = fade > 0.44f ? kRippleHead : kRippleMid;
+  for (int dir = -1; dir <= 1; dir += 2) {
+    drawPttRippleArc(originDeg + static_cast<float>(dir) * travel,
+                     span, kRadarGridRadius - 5, headColor, 1);
+    drawPttRippleArc(originDeg + static_cast<float>(dir) * (travel - 11.0f),
+                     max(4.0f, span - 4.0f), kRadarGridRadius - 13, kRippleDim, 1);
+  }
+}
+
+void drawButtonTapEffects(uint32_t now) {
+  drawButtonTapEffect(now, kPttRippleOriginDeg, bootTapPressedMs, bootTapReleasedMs,
+                      bootButtonWasPressed);
+  drawButtonTapEffect(now, kAltButtonOriginDeg, altTapPressedMs, altTapReleasedMs,
+                      altButtonWasPressed);
+}
+
+void drawPttEdgeRipple(uint32_t now) {
+  if (pttRippleStartedMs == 0) {
+    return;
+  }
+
+  const float originDeg = kPttRippleOriginDeg;
+  const uint32_t holdMs = now - pttRippleStartedMs;
+  const float voiceBoost = clampf(static_cast<float>(voiceCapture.peak) / 4200.0f, 0.0f, 1.0f);
+  const float rise = smoothStep(0.0f, static_cast<float>(kPttRippleArchRiseMs),
+                                static_cast<float>(min<uint32_t>(holdMs, kPttRippleArchRiseMs)));
+
+  if (voiceCapture.pttActive) {
+    const float pulse = (sinf(static_cast<float>(holdMs) / 150.0f) + 1.0f) * 0.5f;
+    const float archSpan = 16.0f + rise * 22.0f + pulse * 4.0f + voiceBoost * 8.0f;
+    drawPttRippleArc(originDeg, archSpan, kRadarGridRadius - 3, kRippleHead, 3);
+    drawPttRippleArc(originDeg, archSpan + 12.0f, kRadarGridRadius - 11, kRippleMid, 2);
+    drawPttRippleArc(originDeg, archSpan + 24.0f, kRadarGridRadius - 20, kRippleDim, 1);
+    drawPttRippleArc(originDeg - archSpan * 0.58f, 8.0f, kRadarGridRadius - 8, kRippleMid, 1);
+    drawPttRippleArc(originDeg + archSpan * 0.58f, 8.0f, kRadarGridRadius - 8, kRippleMid, 1);
+    return;
+  }
+
+  if (pttRippleEndedMs == 0) {
+    return;
+  }
+
+  const uint32_t releasedMs = now - pttRippleEndedMs;
+  if (releasedMs >= kPttRippleReleaseMs) {
+    pttRippleStartedMs = 0;
+    pttRippleEndedMs = 0;
+    return;
+  }
+
+  const float releasePhase = static_cast<float>(releasedMs) /
+                             static_cast<float>(kPttRippleReleaseMs);
+  const float eased = 1.0f - (1.0f - releasePhase) * (1.0f - releasePhase) *
+                      (1.0f - releasePhase);
+  const float fade = 1.0f - releasePhase;
+  const float originFade = max(0.0f, 1.0f - releasePhase * 2.1f);
+  const float travelDeg = 12.0f + eased * 182.0f;
+  const float headSpan = 24.0f * fade + voiceBoost * 8.0f;
+  const uint16_t headColor = fade > 0.55f ? kRippleHead : (fade > 0.28f ? kRippleMid : kRippleDim);
+  const uint16_t midColor = fade > 0.38f ? kRippleMid : kRippleDim;
+
+  if (originFade > 0.0f) {
+    drawPttRippleArc(originDeg, 38.0f * originFade, kRadarGridRadius - 4, headColor, 2);
+    drawPttRippleArc(originDeg, 52.0f * originFade, kRadarGridRadius - 13, midColor, 1);
+  }
+
+  for (int dir = -1; dir <= 1; dir += 2) {
+    for (uint8_t trail = 0; trail < 4; ++trail) {
+      const float lag = static_cast<float>(trail) * 19.0f;
+      if (travelDeg <= lag) {
+        continue;
+      }
+      const float center = originDeg + static_cast<float>(dir) * (travelDeg - lag);
+      const float span = max(7.0f, headSpan - static_cast<float>(trail) * 4.0f);
+      const int radius = kRadarGridRadius - 5 - static_cast<int>(trail) * 7;
+      const uint16_t color = trail == 0 ? headColor :
+                             (trail == 1 ? midColor :
+                              (trail == 2 ? kRippleDim : kGridDeep));
+      drawPttRippleArc(center, span, radius, color, trail == 0 ? 2 : 1);
+    }
+
+    if (releasePhase > 0.68f) {
+      const float arrive = (releasePhase - 0.68f) / 0.32f;
+      const float farSpan = (10.0f + arrive * 26.0f) * fade;
+      drawPttRippleArc(originDeg + static_cast<float>(dir) * 180.0f, farSpan,
+                       kRadarGridRadius - 19, midColor, 1);
+    }
   }
 }
 
@@ -3244,7 +5849,6 @@ void drawStatus() {
   gfx->drawRect(kCx - 44, 398, 88, 8, kGridDim);
   gfx->fillRect(kCx - 42, 400, energy, 4, kGrid);
   drawRssiCalibrationStrip();
-  drawCollectionStrip();
   drawBearingCalibrationStrip();
   drawResetFlash();
   drawBrightnessFlash();
@@ -3252,38 +5856,262 @@ void drawStatus() {
   drawTouchEcho();
 }
 
-void handleAudioEvents() {
-  const uint8_t active = activeTargetCount();
-  const uint8_t collected = collectedTargetCount();
+bool radarRelayOnline() {
+  return WiFi.status() == WL_CONNECTED && provisioning.relayConnected;
+}
+
+bool radarNetworkOnline() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+const uint8_t *networkStatusGlyph(char ch) {
+  static const uint8_t glyphA[7] = {
+      0b01110,
+      0b10001,
+      0b10001,
+      0b11111,
+      0b10001,
+      0b10001,
+      0b10001,
+  };
+  static const uint8_t glyphC[7] = {
+      0b01111,
+      0b10000,
+      0b10000,
+      0b10000,
+      0b10000,
+      0b10000,
+      0b01111,
+  };
+  static const uint8_t glyphD[7] = {
+      0b11110,
+      0b10001,
+      0b10001,
+      0b10001,
+      0b10001,
+      0b10001,
+      0b11110,
+  };
+  static const uint8_t glyphE[7] = {
+      0b11111,
+      0b10000,
+      0b10000,
+      0b11110,
+      0b10000,
+      0b10000,
+      0b11111,
+  };
+  static const uint8_t glyphF[7] = {
+      0b11111,
+      0b10000,
+      0b10000,
+      0b11110,
+      0b10000,
+      0b10000,
+      0b10000,
+  };
+  static const uint8_t glyphG[7] = {
+      0b01110,
+      0b10001,
+      0b10000,
+      0b10111,
+      0b10001,
+      0b10001,
+      0b01110,
+  };
+  static const uint8_t glyphI[7] = {
+      0b11111,
+      0b00100,
+      0b00100,
+      0b00100,
+      0b00100,
+      0b00100,
+      0b11111,
+  };
+  static const uint8_t glyphL[7] = {
+      0b10000,
+      0b10000,
+      0b10000,
+      0b10000,
+      0b10000,
+      0b10000,
+      0b11111,
+  };
+  static const uint8_t glyphN[7] = {
+      0b10001,
+      0b11001,
+      0b10101,
+      0b10011,
+      0b10001,
+      0b10001,
+      0b10001,
+  };
+  static const uint8_t glyphO[7] = {
+      0b01110,
+      0b10001,
+      0b10001,
+      0b10001,
+      0b10001,
+      0b10001,
+      0b01110,
+  };
+  static const uint8_t glyphR[7] = {
+      0b11110,
+      0b10001,
+      0b10001,
+      0b11110,
+      0b10100,
+      0b10010,
+      0b10001,
+  };
+  static const uint8_t glyphT[7] = {
+      0b11111,
+      0b00100,
+      0b00100,
+      0b00100,
+      0b00100,
+      0b00100,
+      0b00100,
+  };
+  static const uint8_t glyphW[7] = {
+      0b10001,
+      0b10001,
+      0b10001,
+      0b10101,
+      0b10101,
+      0b11011,
+      0b10001,
+  };
+  static const uint8_t glyphY[7] = {
+      0b10001,
+      0b10001,
+      0b01010,
+      0b00100,
+      0b00100,
+      0b00100,
+      0b00100,
+  };
+
+  switch (ch) {
+    case 'A':
+      return glyphA;
+    case 'C':
+      return glyphC;
+    case 'D':
+      return glyphD;
+    case 'E':
+      return glyphE;
+    case 'F':
+      return glyphF;
+    case 'G':
+      return glyphG;
+    case 'I':
+      return glyphI;
+    case 'L':
+      return glyphL;
+    case 'N':
+      return glyphN;
+    case 'O':
+      return glyphO;
+    case 'R':
+      return glyphR;
+    case 'T':
+      return glyphT;
+    case 'W':
+      return glyphW;
+    case 'Y':
+      return glyphY;
+    default:
+      return nullptr;
+  }
+}
+
+void drawRotatedNetworkGlyph(char ch, float cx, float cy, float angle, int scale, uint16_t color) {
+  const uint8_t *glyph = networkStatusGlyph(ch);
+  if (!glyph) {
+    return;
+  }
+
+  const float xAxisX = cosf(angle);
+  const float xAxisY = sinf(angle);
+  const float yAxisX = -sinf(angle);
+  const float yAxisY = cosf(angle);
+  const float halfW = 2.0f;
+  const float halfH = 3.0f;
+  const int dotR = max(1, scale / 2);
+
+  for (int row = 0; row < 7; ++row) {
+    for (int col = 0; col < 5; ++col) {
+      if ((glyph[row] & (1 << (4 - col))) == 0) {
+        continue;
+      }
+      const float localX = (static_cast<float>(col) - halfW) * scale;
+      const float localY = (static_cast<float>(row) - halfH) * scale;
+      const int px = static_cast<int>(roundf(cx + localX * xAxisX + localY * yAxisX));
+      const int py = static_cast<int>(roundf(cy + localX * xAxisY + localY * yAxisY));
+      gfx->fillCircle(px, py, dotR, color);
+    }
+  }
+}
+
+void drawRotatedNetworkText(const char *text, float baseTheta, int textSize, float stepDeg,
+                            uint16_t textColor, uint16_t shadowColor) {
+  const int charH = 7 * textSize;
+  const int textLen = strlen(text);
+  const int radius = kRadarGridRadius - (charH / 2) - 5;
+
+  for (int i = 0; i < textLen; ++i) {
+    const float theta = baseTheta +
+                        (static_cast<float>(i) - static_cast<float>(textLen - 1) * 0.5f) *
+                            stepDeg * kPi / 180.0f;
+    const float x = static_cast<float>(kCx) + sinf(theta) * radius;
+    const float y = static_cast<float>(kCy) - cosf(theta) * radius;
+    drawRotatedNetworkGlyph(text[i], x + 1.0f, y + 1.0f, theta, textSize, shadowColor);
+    drawRotatedNetworkGlyph(text[i], x, y, theta, textSize, textColor);
+  }
+}
+
+void drawNetworkErrorBanner() {
+  static uint32_t offlineSinceMs = 0;
+  static uint32_t connectedSinceMs = 0;
+  static uint32_t connectedUntilMs = 0;
+  static float lastErrorTheta = 0.0f;
+
   const uint32_t now = millis();
-
-  if (active > lastActiveCount) {
-    startTone(1480.0f, 70, 3800, true);
-  }
-  if (collected > lastCollectedCount) {
-    startTone(1880.0f, 120, 4400, true);
-  }
-  if (scanning && active > 0) {
-    const int idx = strongestActiveTargetIndex();
-    uint16_t intervalMs = 620;
-    float frequency = 1040.0f + active * 70.0f;
-    uint16_t durationMs = 32;
-    int16_t level = 2400;
-    if (idx >= 0) {
-      DragonTarget &target = targets[idx];
-      intervalMs = targetChirpIntervalMs(target);
-      frequency = targetChirpFrequency(target, active);
-      durationMs = targetChirpDurationMs(target);
-      level = targetChirpLevel(target);
+  const bool wifiOnline = radarNetworkOnline();
+  const bool relayOnline = radarRelayOnline();
+  if (relayOnline) {
+    if (offlineSinceMs != 0) {
+      connectedSinceMs = now;
+      connectedUntilMs = now + 880;
+      offlineSinceMs = 0;
     }
-    if (now - lastScanChirpMs > intervalMs) {
-      startTone(frequency, durationMs, level, false);
-      lastScanChirpMs = now;
+    if (connectedUntilMs != 0 && now < connectedUntilMs) {
+      const uint32_t flashSegment = (now - connectedSinceMs) / 220;
+      if ((flashSegment & 1) == 0) {
+        drawRotatedNetworkText("CONNECTED", lastErrorTheta, 2, 7.4f, kGridBright, RGB565(0, 66, 28));
+      }
+    } else {
+      connectedSinceMs = 0;
+      connectedUntilMs = 0;
     }
+    return;
   }
 
-  lastActiveCount = active;
-  lastCollectedCount = collected;
+  connectedUntilMs = 0;
+  if (offlineSinceMs == 0) {
+    offlineSinceMs = now;
+  }
+}
+
+void handleAudioEvents() {
+  const uint32_t now = millis();
+  const bool signalLost = !radarRelayOnline() || activeRemoteAppLocationCount(now) == 0;
+
+  if (signalLost && now - lastScanChirpMs > 1800) {
+    startAlertTone(760.0f, 48, 9000, false);
+    lastScanChirpMs = now;
+  }
 }
 
 void printHardwareSummary() {
@@ -3304,12 +6132,26 @@ void printHardwareSummary() {
   Serial.print(imuOnline ? "online" : "offline");
   Serial.print(" ble=");
   Serial.print(bleOnline ? "online" : "offline");
+  Serial.print(" remoteBle=");
+  Serial.print(provisioning.serviceOnline ? "online" : "offline");
+  Serial.print(" wifi=");
+  Serial.print(wifiStatusText());
+  Serial.print(" paired=");
+  Serial.print(provisioning.paired ? "yes" : "no");
   Serial.print(" audio=");
   Serial.println(audioOnline ? "online" : "offline");
   Serial.print("DIAG pwrButton=");
   Serial.println(powerButtonOnline ? "online" : "offline");
-  if (kSimulatedBle) {
-    Serial.println("DIAG simulatedBle=enabled");
+  Serial.print("DIAG battery=");
+  if (!batteryStatus.online) {
+    Serial.println("offline");
+  } else if (!batteryStatus.present) {
+    Serial.println("absent");
+  } else {
+    Serial.print(static_cast<int>(batteryStatus.percent));
+    Serial.print("% ");
+    Serial.print(batteryStatus.voltageMv);
+    Serial.println("mV");
   }
   Serial.print("DIAG heap=");
   Serial.print(ESP.getFreeHeap());
@@ -3329,7 +6171,8 @@ void printSerialCommandHelp() {
     return;
   }
 
-  Serial.println("DIAG commands: ? help, h hardware, d display_test, z zoom, r reset/beach_right, b brightness, a audio, f frame_rate, t frame_turbo, c collect_demo, p ping, s scan, l beach_left, x beach_swipe_left_test, y beach_swipe_right_test");
+  Serial.println("DIAG commands: ? help, h hardware, d display_test, z zoom, r reset/beach_right, b brightness, a audio, f frame_rate, t frame_turbo, p ping, l beach_left, x beach_swipe_left_test, y beach_swipe_right_test");
+  Serial.println("DIAG line: relay <ws_url> <room_token> <device_token>");
 }
 
 void printSerialCommandResult(char command, const char *action) {
@@ -3378,8 +6221,8 @@ void handleSerialCommand(char rawCommand) {
         handleBeachSwipe(1);
         printSerialCommandResult(command, "beach_right");
       } else {
-        resetHuntSession();
-        printSerialCommandResult(command, "reset");
+        resetRadarDisplayState();
+        printSerialCommandResult(command, "reset_display");
       }
       break;
     case 'l':
@@ -3406,19 +6249,9 @@ void handleSerialCommand(char rawCommand) {
       setFrameTurbo();
       printFrameRateCommandResult(command, "frame_turbo");
       break;
-    case 'c':
-      demoMode = true;
-      collectNextDemoTarget();
-      startTone(1320.0f, 70, 3600, true);
-      printSerialCommandResult(command, "collect_demo");
-      break;
     case 'p':
       startTone(1568.0f, 120, 4200, true);
       printSerialCommandResult(command, "ping");
-      break;
-    case 's':
-      startBleScan();
-      printSerialCommandResult(command, "scan");
       break;
     case 'x':
       if (kBeachSceneMode && handleBeachSwipeGesture(kCx + 86, kCy, kCx - 86, kCy)) {
@@ -3440,17 +6273,95 @@ void handleSerialCommand(char rawCommand) {
   }
 }
 
+bool nextSerialToken(const String &line, int &offset, String &token) {
+  while (offset < line.length() && line[offset] == ' ') {
+    ++offset;
+  }
+  if (offset >= line.length()) {
+    return false;
+  }
+  const int start = offset;
+  while (offset < line.length() && line[offset] != ' ') {
+    ++offset;
+  }
+  token = line.substring(start, offset);
+  return true;
+}
+
+void handleRelaySerialCommand(const String &line) {
+  int offset = 0;
+  String command;
+  String relayUrl;
+  String roomToken;
+  String deviceToken;
+  nextSerialToken(line, offset, command);
+  if (!nextSerialToken(line, offset, relayUrl) ||
+      !nextSerialToken(line, offset, roomToken) ||
+      !nextSerialToken(line, offset, deviceToken)) {
+    Serial.println("DIAG relay usage: relay <ws_url> <room_token> <device_token>");
+    return;
+  }
+
+  provisioning.relayUrl = relayUrl;
+  provisioning.roomToken = roomToken;
+  provisioning.deviceToken = deviceToken;
+  provisioning.serverConfigured = provisioning.relayUrl.length() > 0 && provisioning.deviceToken.length() > 0;
+  provisioning.relayConnected = false;
+  provisioning.relaySocketConfigured = false;
+  provisioning.relayState = provisioning.serverConfigured ? "configured" : "unconfigured";
+  provisioning.lastWrite = "serial_relay";
+  lastRelayAttemptMs = 0;
+  lastRelayHeartbeatMs = 0;
+  relaySocket.disconnect();
+  saveProvisioningState();
+  notifyDeviceStatus(true);
+
+  Serial.print("DIAG relay configured url=");
+  Serial.print(provisioning.relayUrl);
+  Serial.print(" room=");
+  Serial.print(provisioning.roomToken);
+  Serial.print(" device=");
+  Serial.println(provisioning.deviceToken);
+}
+
+void handleSerialLine(String line) {
+  line.trim();
+  while (line.indexOf("  ") >= 0) {
+    line.replace("  ", " ");
+  }
+  if (line.length() == 0) {
+    return;
+  }
+  String lower = line;
+  lower.toLowerCase();
+  if (lower.startsWith("relay ")) {
+    handleRelaySerialCommand(line);
+    return;
+  }
+  if (line.length() == 1) {
+    handleSerialCommand(line[0]);
+    return;
+  }
+  Serial.print("DIAG command ");
+  Serial.print(line);
+  Serial.println(" action=unknown");
+}
+
 void serialCommandTick() {
   if (!kSerialDiagnostics) {
     return;
   }
 
   while (Serial.available() > 0) {
-    const char command = static_cast<char>(Serial.read());
-    if (command == '\n' || command == '\r' || command == ' ' || command == '\t') {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\n' || c == '\r') {
+      handleSerialLine(serialCommandLine);
+      serialCommandLine = "";
       continue;
     }
-    handleSerialCommand(command);
+    if (serialCommandLine.length() < 160) {
+      serialCommandLine += c;
+    }
   }
 }
 
@@ -3491,13 +6402,8 @@ void serialDiagnosticsTick() {
     return;
   }
 
-  const int idx = strongestActiveTargetIndex();
   Serial.print("DIAG tick ms=");
   Serial.print(now);
-  Serial.print(" active=");
-  Serial.print(activeTargetCount());
-  Serial.print(" collected=");
-  Serial.print(collectedTargetCount());
   Serial.print(" zoom=");
   Serial.print(zoomLevel);
   Serial.print(" brightPreset=");
@@ -3520,21 +6426,29 @@ void serialDiagnosticsTick() {
   Serial.print(headingDeg, 1);
   Serial.print(" tilt=");
   Serial.print(tiltEnergy, 2);
-  Serial.print(" strongest=");
-  if (idx >= 0) {
-    Serial.print(idx + 1);
-    Serial.print("/");
-    Serial.print(targets[idx].filteredRssi);
-  } else {
-    Serial.print("none");
-  }
   Serial.print(" online=");
   Serial.print(touchOnline ? "T" : "-");
   Serial.print(imuOnline ? "I" : "-");
   Serial.print(bleOnline ? "B" : "-");
   Serial.print(audioOnline ? "A" : "-");
-  Serial.print(" summon=");
-  Serial.println(summonMode ? "yes" : "no");
+  Serial.print(" remoteBle=");
+  Serial.print(provisioning.serviceOnline ? "online" : "offline");
+  Serial.print(" app=");
+  Serial.print(provisioning.appConnected ? "connected" : "idle");
+  Serial.print(" wifi=");
+  Serial.print(wifiStatusText());
+  Serial.print(" loc=");
+  Serial.print(provisioning.locationReceived ? "yes" : "no");
+  Serial.print(" relay=");
+  Serial.print(provisioning.relayConnected ? "connected" : "idle");
+  Serial.print(" ptt=");
+  Serial.print(voiceCapture.pttActive ? "active" : "idle");
+  Serial.print(" muted=");
+  Serial.print(voiceCapture.muted ? "yes" : "no");
+  Serial.print(" voiceTx=");
+  Serial.print(voiceCapture.sequence);
+  Serial.print(" voiceRx=");
+  Serial.println(voiceCapture.receivedSequence);
 }
 
 void drawSettingsIconBrightness(int x, int y, uint16_t color) {
@@ -3555,9 +6469,15 @@ void drawSettingsIconVolume(int x, int y, uint16_t color) {
   gfx->drawLine(x - 17, y - 12, x, y - 25, color);
   gfx->drawLine(x - 17, y + 12, x, y + 25, color);
   gfx->drawLine(x, y - 25, x, y + 25, color);
+  if (audioPreset == 0) {
+    gfx->drawLine(x + 13, y + 18, x + 33, y - 18, color);
+    return;
+  }
+
+  const uint8_t arcCount = audioPreset < 3 ? audioPreset : 3;
   for (int i = 0; i < 3; ++i) {
     const int r = 16 + i * 10;
-    gfx->drawArc(x + 4, y, r, r - 1, 300, 60, i <= audioPreset ? color : kGridDim);
+    gfx->drawArc(x + 4, y, r, r - 1, 300, 60, i < arcCount ? color : kGridDim);
   }
 }
 
@@ -3582,11 +6502,12 @@ void drawSettingsRow(int y0, const char *label, uint8_t preset, bool brightnessR
   for (uint8_t i = 0; i < 5; ++i) {
     const int x = startX + i * 42;
     const int h = 28 + i * 12;
-    const bool on = i <= preset;
+    const int activePreset = brightnessRow ? preset : static_cast<int>(preset) - 1;
+    const bool on = i <= activePreset;
     const uint16_t c = on ? active : kGridDim;
     gfx->drawRect(x, baseY - h, 24, h, c);
     if (on) {
-      gfx->fillRect(x + 5, baseY - h + 5, 14, h - 10, i == preset ? kGridBright : kGrid);
+      gfx->fillRect(x + 5, baseY - h + 5, 14, h - 10, i == activePreset ? kGridBright : kGrid);
     }
     gfx->drawFastHLine(x + 1, baseY + 8, 22, c);
   }
@@ -3651,9 +6572,17 @@ void drawCurrentModeFrame() {
     return;
   }
 
+  const uint32_t now = millis();
   drawRadarGrid();
-  drawTargets();
-  drawHomeMarker(millis());
+  if (!radarNetworkOnline() || activeRemoteAppLocationCount(now) == 0) {
+    drawTargets();
+  }
+  drawRemoteAppMarker();
+  drawButtonTapEffects(now);
+  drawPttEdgeRipple(now);
+  drawHomeMarker(now);
+  drawSignalLostBanner(now);
+  drawNetworkErrorBanner();
   gfx->flush();
 }
 
@@ -3670,8 +6599,10 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("Dragon Radar firmware boot");
+  Serial.println("AUDIO_PATH_FULL_DUPLEX_20260609_01");
 
   loadRuntimeSettings();
+  loadProvisioningState();
   if (kBeachSceneMode) {
     audioPreset = kAudioPresetCount - 1;
   }
@@ -3679,11 +6610,16 @@ void setup() {
   randomSeed(esp_random());
   Wire.begin(IIC_SDA, IIC_SCL);
 
+  setupBatteryGauge();
   setupPowerButton();
   setupButtons();
   resetPanelAndTouch();
   setupTouch();
-  setupAudio();
+  if (kBeachSceneMode) {
+    setupAudio();
+  } else {
+    setupBootAudio();
+  }
 
   if (!gfx->begin(kDisplayBusHz)) {
     Serial.println("Display init failed.");
@@ -3697,6 +6633,7 @@ void setup() {
   } else {
     initTargets();
     runBootAnimation();
+    setupAudio();
   }
 
   setupImu();
@@ -3705,7 +6642,7 @@ void setup() {
   }
   printHardwareSummary();
   printSerialCommandHelp();
-  printHuntEvent("start", millis());
+  printRadarEvent("start", millis());
   radarStartedMs = millis();
 }
 
@@ -3714,8 +6651,9 @@ void loop() {
   pollPowerButton();
   pollButtons();
   pollTouch();
-  updateBleScan();
-  simulatedBleTick();
+  provisioningTick();
+  cloudRelayTick();
+  voiceCaptureTick();
   serialCommandTick();
   serialDiagnosticsTick();
   handleAudioEvents();
