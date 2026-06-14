@@ -18,9 +18,7 @@ COMMANDS = {
     "frame_rate": "f",
     "turbo": "t",
     "frame_turbo": "t",
-    "collect": "c",
     "ping": "p",
-    "scan": "s",
 }
 
 

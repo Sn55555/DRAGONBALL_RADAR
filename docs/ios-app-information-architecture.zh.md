@@ -4,7 +4,7 @@
 
 这份文档定义 Dragon Radar 配套 iOS App 的产品结构。它基于
 `docs/remote-multi-radar-architecture.zh.md`，服务于“最多 7 台 ESP + 7 台
-iPhone 异地远程定位与同时语音”的产品形态。
+iPhone 异地远程定位与房间抢麦语音”的产品形态。
 
 iOS App 的首版定位：
 
@@ -23,7 +23,7 @@ iOS App 的首版定位：
 | `Room` | 最多 7 人的远程定位/语音会话 | 创建、加入、邀请、成员管理 |
 | `RoomMember` | 房间中的一名用户和其活跃设备 | 在线、定位、语音、设备状态 |
 | `LocationState` | iPhone 当前定位状态 | 上传 Relay，写给本机 ESP |
-| `VoiceState` | 服务端语音混音状态 | 展示谁在说话、静音、丢包、延迟 |
+| `VoiceState` | 服务端抢麦语音状态 | 展示当前抢麦者、静音、丢包、延迟 |
 
 关键约束：
 
@@ -220,7 +220,7 @@ Launch
 成员操作：
 
 - 设为关注成员。
-- 静音该成员在 App 侧提示音，不影响 ESP 混音。
+- 静音该成员在 App 侧提示音，不影响 ESP 抢麦和 Relay 转发。
 - 查看定位详情。
 - 从房间移除，仅房主可见。
 
@@ -247,7 +247,7 @@ Launch
 - 成员名、头像或缩写。
 - 距离、方位、定位精度、更新时间。
 - 设备状态：ESP 在线、Wi-Fi RSSI、电量、固件版本。
-- 语音状态：静音、VAD 活跃、上行帧、下行混音帧。
+- 语音状态：静音、抢麦状态、上行帧、下行语音帧。
 
 交互：
 
@@ -576,7 +576,8 @@ Launch
 - ESP `device_status`。
 - 房间状态。
 - 语音上行帧。
-- 混音下行帧。
+- 语音下行帧。
+- 当前抢麦者。
 - 丢包和延迟。
 
 交互：
@@ -695,19 +696,20 @@ LocationModule 获取定位
 - 定位超过 10 秒未更新：显示 stale。
 - 定位权限关闭：房间内该成员显示定位无效。
 
-### E. 7 人同时语音状态展示
+### E. 7 人房间抢麦语音状态展示
 
 ```text
-ESP 上传 audio_frame
--> Relay 混音
+ESP 发送 voice_claim
+-> Relay 抢麦仲裁
+-> 抢麦成功的 ESP 上传 audio_frame
 -> Relay 下发 voice_state 给 App
--> App 在雷达 Tab 显示活跃说话成员
--> ESP 播放 audio_mix_frame
+-> App 在雷达 Tab 显示当前抢麦成员
+-> 其他 ESP 播放 voice_frame
 ```
 
 App 不播放首版语音，只展示：
 
-- 谁正在说话。
+- 谁正在抢麦说话。
 - 谁静音。
 - 谁的设备离线。
 - 语音质量是否下降。
