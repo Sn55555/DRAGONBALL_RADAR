@@ -43,6 +43,9 @@
   ],
   "name": "Waveshare ESP32-S3-Touch-AMOLED-1.75C (32 MB Flash, 8 MB PSRAM)",
   "upload": {
+    "arduino": {
+      "boot_app0": "0x19000"
+    },
     "flash_size": "32MB",
     "maximum_ram_size": 327680,
     "maximum_size": 33554432,

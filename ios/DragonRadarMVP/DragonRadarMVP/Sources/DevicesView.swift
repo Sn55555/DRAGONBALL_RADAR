@@ -11,21 +11,34 @@ struct DevicesView: View {
         @Bindable var state = appState
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
-                ToyBezel {
-                    VStack(alignment: .leading, spacing: 14) {
-                        HStack(alignment: .top) {
-                            Text("雷达状态")
-                                .font(.largeTitle.weight(.black))
-                            Spacer()
-                            StatusChip(text: setupReady ? "准备完成" : "继续配置", filled: setupReady)
+                if appState.isReviewExperienceActive {
+                    MangaPanel("本地审核体验") {
+                        Text("设备页未创建或伪造任何雷达。演示期间不会扫描、绑定或连接真实硬件。")
+                            .font(.headline.weight(.black))
+                        ReviewExperienceSafetyNotice()
+                        Button("返回演示雷达") {
+                            state.selectedTab = .radar
                         }
-
-                        DeviceInventorySection()
-                        DeviceConnectionGuidePanel()
+                        .buttonStyle(InkButtonStyle())
+                        .accessibilityIdentifier("devices.reviewExperience.backToRadar")
                     }
-                }
+                } else {
+                    ToyBezel {
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack(alignment: .top) {
+                                Text("雷达状态")
+                                    .font(.largeTitle.weight(.black))
+                                Spacer()
+                                StatusChip(text: setupReady ? "准备完成" : "继续配置", filled: setupReady)
+                            }
 
-                DeviceActionMenuPanel()
+                            DeviceInventorySection()
+                            DeviceConnectionGuidePanel()
+                        }
+                    }
+
+                    DeviceActionMenuPanel()
+                }
             }
             .padding(18)
         }
@@ -233,6 +246,7 @@ struct DeviceConnectionGuidePanel: View {
                 ConnectionStepRow(index: 5, title: "当前房间", detail: roomDetail, isReady: roomReady && radarRuntime.relayPhase == .ready)
             }
         }
+        .accessibilityIdentifier("devices.radar.connection.status")
     }
 
     private var setupReady: Bool {
@@ -244,7 +258,7 @@ struct DeviceConnectionGuidePanel: View {
     }
 
     private var bleCharacteristicsReady: Bool {
-        RadarBLECharacteristic.allCases.allSatisfy { bleBridge.hasCharacteristic($0) }
+        RadarBLECharacteristic.requiredProvisioningRoles.allSatisfy { bleBridge.hasCharacteristic($0) }
     }
 
     private var espProtocolReady: Bool {
@@ -489,6 +503,8 @@ struct DeviceActionMenuPanel: View {
                 )
             }
             .buttonStyle(.plain)
+
+            FirmwareSummaryRow()
         }
     }
 }
@@ -541,6 +557,9 @@ struct DeviceStatusDetailView: View {
                         registrationText: bleBridge.registrationText,
                         configChannelText: bleBridge.connectedPeripheralName
                     )
+                }
+                MangaPanel("固件") {
+                    FirmwareSummaryRow()
                 }
             }
             .padding(18)
@@ -1206,6 +1225,8 @@ struct DeviceCard: View {
             InfoRow(label: "联网配置", value: status?.serverText ?? registrationText)
             InfoRow(label: "配置连接", value: configChannelText)
             InfoRow(label: "定位", value: status?.locationText ?? "等待雷达上报")
+            InfoRow(label: "固件", value: status?.firmwareText ?? "未上报")
+            InfoRow(label: "硬件", value: status?.hardware ?? "未上报")
             InfoRow(label: "最近状态", value: status?.last ?? "等待雷达上报")
         }
         .padding(12)
@@ -1361,6 +1382,17 @@ struct PairingSheet: View {
                         }
                     }
                 }
+                Section("系统蓝牙配对") {
+                    Label("连接后，iPhone 会弹出系统蓝牙配对窗口。", systemImage: "lock.shield.fill")
+                        .font(.subheadline.weight(.bold))
+                    Text("请把雷达圆屏上临时显示的 6 位数字输入 iPhone。配对码会自动变化；不要把配对码发给其他人。")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    LabeledContent(
+                        "链路保护",
+                        value: bleBridge.deviceStatus?.bleSecurityText ?? "连接雷达后自动检查"
+                    )
+                }
                 Section("绑定流程") {
                     ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
                         HStack {
@@ -1421,30 +1453,47 @@ struct PairingSheet: View {
             pairingPhase = .failed(readinessError)
             return
         }
+        guard !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            pairingPhase = .failed("请先创建或加入房间，再绑定雷达。")
+            return
+        }
         pairingPhase = .loading
 
         do {
             let device = try await appState.registerDevice(
                 pairingChallenge: bleBridge.pairingChallengeText,
-                name: bleBridge.connectedPeripheralName == "未连接" ? "Dragon Radar" : bleBridge.connectedPeripheralName
+                name: bleBridge.connectedPeripheralName == "未连接" ? "Capsule Radar" : bleBridge.connectedPeripheralName
             )
+            let pairingWriteStartedAt = Date()
             guard bleBridge.writePairingResponse(device.pairingResponse) else {
+                await appState.cancelRegisteredDevice(device)
                 pairingPhase = .failed("绑定失败。请重新连接雷达后再试。")
                 return
             }
-            appState.simulatePairingComplete()
-            guard !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                pairingPhase = .failed("雷达已绑定。请先创建或加入房间，再完成配置。")
+            guard await bleBridge.confirmPairingResponse(startedAt: pairingWriteStartedAt) else {
+                await appState.cancelRegisteredDevice(device)
+                pairingPhase = .failed("雷达未确认本次绑定，请保持连接后重试。")
                 return
             }
+            let serverConfigWriteStartedAt = Date()
             guard bleBridge.writeServerConfig(
                 relayURL: radarRuntime.relayBaseURL,
                 roomToken: appState.inviteCode,
                 deviceToken: device.deviceToken
             ) else {
+                await appState.cancelRegisteredDevice(device)
                 pairingPhase = .failed("配置写入失败。请确认雷达仍然连接，然后重试。")
                 return
             }
+            guard await bleBridge.confirmServerConfig(
+                deviceToken: device.deviceToken,
+                startedAt: serverConfigWriteStartedAt
+            ) else {
+                pairingPhase = .failed("雷达未确认新设备身份，App 未切换到该身份。请保持连接后重试。")
+                return
+            }
+            appState.commitRegisteredDevice(device)
+            appState.simulatePairingComplete()
             await radarRuntime.provisionESP(
                 deviceName: device.name,
                 roomCode: appState.inviteCode
@@ -1471,6 +1520,7 @@ struct PairingSheet: View {
         if !appState.isSignedIn { return "先登录" }
         if bleBridge.stateText != "可用" { return "打开 iPhone 蓝牙" }
         if bleBridge.selectedPeripheralID == nil { return "扫描并连接雷达" }
+        if bleBridge.deviceStatus?.bleSecure != 1 { return "完成 iPhone 系统蓝牙配对" }
         if !bleBridge.hasCharacteristic(.pairingResponse) || !bleBridge.hasCharacteristic(.serverConfig) {
             return "等待雷达准备完成"
         }
@@ -1492,6 +1542,9 @@ struct PairingSheet: View {
         if bleBridge.selectedPeripheralID == nil {
             return AppError.ble(.deviceNotConnected).localizedDescription
         }
+        if let status = bleBridge.deviceStatus, status.bleSecure != 1 {
+            return "请先在 iPhone 系统配对窗口输入雷达屏幕显示的 6 位数字。"
+        }
         if !bleBridge.hasCharacteristic(.pairingResponse) {
             return "雷达还没准备好。请等待几秒，或重新扫描连接雷达。"
         }
@@ -1500,6 +1553,13 @@ struct PairingSheet: View {
         }
         if bleBridge.pairingChallengeText == "未读取" {
             return "雷达还在准备身份确认。请等待几秒，或重新连接雷达。"
+        }
+        if
+            let status = bleBridge.deviceStatus,
+            status.paired == 1,
+            status.server == 1
+        {
+            return "这台雷达已经绑定。请返回设备页恢复现有绑定，不要重复创建绑定。"
         }
         return nil
     }
@@ -1519,8 +1579,9 @@ struct PairingSheet: View {
         case 0:
             bleBridge.selectedPeripheralID != nil
         case 1:
-            RadarBLECharacteristic.allCases.allSatisfy { bleBridge.hasCharacteristic($0) }
+            RadarBLECharacteristic.requiredProvisioningRoles.allSatisfy { bleBridge.hasCharacteristic($0) }
                 && bleBridge.pairingChallengeText != "未读取"
+                && bleBridge.deviceStatus?.bleSecure == 1
         case 2:
             bleBridge.persistedPaired || (bleBridge.deviceStatus?.paired ?? 0) == 1 || bleBridge.lastWriteEvent.contains("pairing_response_verified")
         case 3:

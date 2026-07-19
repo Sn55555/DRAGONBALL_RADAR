@@ -5,7 +5,9 @@ import Observation
 enum AppTab: String, CaseIterable, Identifiable {
     case radar
     case rooms
+    #if !APP_ONLY
     case devices
+    #endif
     case account
 
     var id: String { rawValue }
@@ -14,7 +16,9 @@ enum AppTab: String, CaseIterable, Identifiable {
         switch self {
         case .radar: "雷达"
         case .rooms: "房间"
+        #if !APP_ONLY
         case .devices: "设备"
+        #endif
         case .account: "我的"
         }
     }
@@ -23,18 +27,22 @@ enum AppTab: String, CaseIterable, Identifiable {
         switch self {
         case .radar: "scope"
         case .rooms: "person.3.sequence.fill"
+        #if !APP_ONLY
         case .devices: "dot.radiowaves.left.and.right"
+        #endif
         case .account: "person.crop.circle"
         }
     }
 }
 
+#if !APP_ONLY
 enum DeviceConnectionState: String {
     case cloudConnected = "云端在线"
     case wifiConnected = "Wi-Fi 在线"
     case pairing = "正在绑定"
     case offline = "离线"
 }
+#endif
 
 struct RoomMember: Identifiable, Hashable {
     let id: UUID
@@ -44,6 +52,7 @@ struct RoomMember: Identifiable, Hashable {
     var accuracy: String
     var locationPaused: Bool
     var isOnline: Bool
+    #if !APP_ONLY
     var isSpeaking: Bool
     var isMuted: Bool
     var voiceStatusText: String
@@ -52,7 +61,16 @@ struct RoomMember: Identifiable, Hashable {
     var deviceBattery: Int
     var wifiRSSI: Int
     var firmware: String
+    #endif
     var lastUpdate: String
+    var moderationRef: String = ""
+    var role: String = "app"
+    var isLocal: Bool = false
+    var isCurrentUser: Bool = false
+
+    var canUseModerationActions: Bool {
+        !isLocal && !isCurrentUser && role == "app" && !moderationRef.isEmpty
+    }
 }
 
 struct RadarRoom: Identifiable, Hashable {
@@ -62,7 +80,7 @@ struct RadarRoom: Identifiable, Hashable {
     var capacity: Int
     var onlineGroups: Int
     var latency: Int
-    var voiceQuality: String
+    var roomStatus: String
     var members: [RoomMember]
 
     var onlineMembers: Int {
@@ -98,11 +116,112 @@ struct ServerRoomsEnvelope: Decodable {
     var rooms: [ServerRoom]
 }
 
+struct RadarReminderReceipt: Decodable, Hashable {
+    var eventID: String
+    var requestID: String
+    var roomCode: String
+    var recipientCount: Int
+    var onlineDelivered: Int
+    var pushStatus: String
+    var cooldownSeconds: Int
+    var serverTime: Int
+    var duplicate: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case eventID = "event_id"
+        case requestID = "request_id"
+        case roomCode = "room_code"
+        case recipientCount = "recipient_count"
+        case onlineDelivered = "online_delivered"
+        case pushStatus = "push_status"
+        case cooldownSeconds = "cooldown_seconds"
+        case serverTime = "server_time"
+        case duplicate
+    }
+}
+
+struct RadarReminderEnvelope: Decodable {
+    var reminder: RadarReminderReceipt
+}
+
+struct RadarReminderEvent: Identifiable, Hashable {
+    var id: String { eventID }
+
+    var eventID: String
+    var roomCode: String
+    var senderName: String
+    var action: String
+    var serverTime: Int
+
+    var message: String {
+        "\(senderName)提醒你查看雷达"
+    }
+
+    init?(payload: [AnyHashable: Any]) {
+        let nested = Self.dictionary(payload["data"])
+        guard Self.string(payload["type"]) == "radar_reminder" else { return nil }
+        guard let eventID = Self.string(payload["event_id"]) ?? Self.string(nested["event_id"]), !eventID.isEmpty else {
+            return nil
+        }
+        self.eventID = eventID
+        roomCode = Self.string(payload["room_code"])
+            ?? Self.string(payload["room"])
+            ?? Self.string(nested["room_code"])
+            ?? ""
+        senderName = Self.string(payload["sender_name"])
+            ?? Self.string(nested["sender_name"])
+            ?? "房间成员"
+        action = Self.string(payload["action"])
+            ?? Self.string(nested["action"])
+            ?? "open_radar"
+        serverTime = Self.integer(payload["server_time"])
+            ?? Self.integer(nested["server_time"])
+            ?? 0
+    }
+
+    private static func dictionary(_ value: Any?) -> [AnyHashable: Any] {
+        if let dictionary = value as? [AnyHashable: Any] {
+            return dictionary
+        }
+        if let dictionary = value as? NSDictionary {
+            var result: [AnyHashable: Any] = [:]
+            dictionary.forEach { key, value in
+                if let key = key as? AnyHashable {
+                    result[key] = value
+                }
+            }
+            return result
+        }
+        return [:]
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean.isEmpty ? nil : clean
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+}
+
 struct ServerErrorEnvelope: Decodable {
     var code: String
     var detail: String?
+    var retryAfter: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case detail
+        case retryAfter = "retry_after"
+    }
 }
 
+#if !APP_ONLY
 struct ServerDevice: Decodable, Hashable {
     var deviceID: String
     var deviceShortID: String
@@ -126,18 +245,27 @@ struct ServerDeviceEnvelope: Decodable {
 struct ServerDevicesEnvelope: Decodable {
     var devices: [ServerDevice]
 }
+#endif
 
 enum RoomRepositoryError: LocalizedError {
     case server(code: String, detail: String?)
+    case rateLimited(code: String, detail: String?, retryAfter: Int)
     case badResponse
 
     var errorDescription: String? {
         switch self {
         case .server(let code, let detail):
             return RoomError.displayText(for: code, detail: detail)
+        case .rateLimited(let code, let detail, _):
+            return RoomError.displayText(for: code, detail: detail)
         case .badResponse:
             return "服务暂时不可用。请稍后重试。"
         }
+    }
+
+    var retryAfterSeconds: Int? {
+        guard case .rateLimited(_, _, let retryAfter) = self else { return nil }
+        return max(1, retryAfter)
     }
 }
 
@@ -150,6 +278,7 @@ enum RoomError: String, LocalizedError {
     case forbidden
     case unauthorized
     case pairingChallengeRequired = "pairing_challenge_required"
+    case radarReminderRateLimited = "radar_reminder_rate_limited"
     case unknown
 
     init(code: String) {
@@ -174,12 +303,40 @@ enum RoomError: String, LocalizedError {
             return "登录已失效。请到“我的”重新登录。"
         case .pairingChallengeRequired:
             return "请先连接雷达。"
+        case .radarReminderRateLimited:
+            return "提醒发送太频繁，请稍后再试。"
         case .unknown:
             return "房间服务暂时不可用。请稍后重试。"
         }
     }
 
     static func displayText(for code: String, detail: String? = nil) -> String {
+        let moderationText: String?
+        switch code {
+        case "invalid_report_type":
+            moderationText = "请选择有效的内容类型。"
+        case "invalid_report_category":
+            moderationText = "请选择有效的举报类别。"
+        case "report_details_too_long":
+            moderationText = "补充说明不能超过 1000 字。"
+        case "cannot_report_self":
+            moderationText = "不能举报自己。"
+        case "content_report_rate_limited":
+            moderationText = "举报提交过于频繁，请稍后再试。"
+        case "invalid_moderation_ref", "moderation_target_not_found":
+            moderationText = "该成员已离开或状态已更新，请刷新房间后重试。"
+        case "cannot_block_self":
+            moderationText = "不能屏蔽自己。"
+        case "block_not_found":
+            moderationText = "这条屏蔽记录已不存在，请刷新列表。"
+        case "blocked_relationship":
+            moderationText = "你与该成员存在屏蔽关系，不能加入同一房间。"
+        default:
+            moderationText = nil
+        }
+        if let moderationText {
+            return moderationText
+        }
         let base = RoomError(code: code).errorDescription ?? code
         guard let detail, !detail.isEmpty else { return base }
         return "\(base) · \(detail)"
@@ -188,9 +345,13 @@ enum RoomError: String, LocalizedError {
 
 enum RelayError: String, LocalizedError {
     case unauthorized
+    #if !APP_ONLY
     case deviceRevoked = "device_revoked"
+    #endif
     case protocolUnsupported = "protocol_unsupported"
+    #if !APP_ONLY
     case voiceBusy = "voice_busy"
+    #endif
     case networkUnavailable = "network_unavailable"
     case unknown
 
@@ -198,12 +359,20 @@ enum RelayError: String, LocalizedError {
         switch self {
         case .unauthorized:
             return "房间连接鉴权失败。请重新登录并检查当前房间。"
+        #if !APP_ONLY
         case .deviceRevoked:
             return "雷达已解绑或授权已撤销。请重新绑定这台雷达。"
+        #endif
         case .protocolUnsupported:
+            #if APP_ONLY
+            return "App 与房间服务版本不兼容。请更新 App 后重试。"
+            #else
             return "App、房间服务或雷达版本不兼容。请更新到同一版本。"
+            #endif
+        #if !APP_ONLY
         case .voiceBusy:
             return "当前已有成员正在说话，请松开后重试。"
+        #endif
         case .networkUnavailable:
             return "网络不可用。请检查蜂窝网络、Wi-Fi 或热点。"
         case .unknown:
@@ -212,6 +381,7 @@ enum RelayError: String, LocalizedError {
     }
 }
 
+#if !APP_ONLY
 enum BLEError: LocalizedError {
     case unauthorized
     case poweredOff
@@ -237,11 +407,14 @@ enum BLEError: LocalizedError {
         }
     }
 }
+#endif
 
 enum AppError: LocalizedError {
     case room(RoomError)
     case relay(RelayError)
+    #if !APP_ONLY
     case ble(BLEError)
+    #endif
     case locationPermissionDenied
     case notSignedIn
     case network(String)
@@ -253,8 +426,10 @@ enum AppError: LocalizedError {
             return error.localizedDescription
         case .relay(let error):
             return error.localizedDescription
+        #if !APP_ONLY
         case .ble(let error):
             return error.localizedDescription
+        #endif
         case .locationPermissionDenied:
             return "定位权限不可用。请到“我的 > 隐私与权限”检查定位授权。"
         case .notSignedIn:
@@ -313,6 +488,19 @@ struct AppOperationResult {
     var message: String
 }
 
+struct RadarReminderOperationResult {
+    var succeeded: Bool
+    var message: String
+    var cooldownSeconds: Int
+}
+
+enum RadarReminderNavigationResult: Equatable {
+    case opened
+    case unavailable
+    case retryable
+}
+
+#if !APP_ONLY
 struct RadarDevice: Identifiable, Hashable {
     let id: UUID
     var name: String
@@ -331,6 +519,7 @@ struct DiagnosticItem: Identifiable {
     var detail: String
     var passed: Bool
 }
+#endif
 
 @MainActor
 @Observable
@@ -365,9 +554,22 @@ final class SessionStore {
     var displayName: String {
         let cleanName = profileDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !cleanName.isEmpty {
-            return cleanName
+            return Self.normalizedDisplayName(cleanName)
         }
-        return session?.displayName ?? "未登录"
+        guard let session else { return "未登录" }
+        return Self.normalizedDisplayName(session.displayName)
+    }
+
+    static func normalizedDisplayName(_ value: String) -> String {
+        let cleanName = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanName.isEmpty
+            || cleanName == "胶囊用户"
+            || cleanName == "Dragon Radar User"
+            || cleanName.hasPrefix("apple:")
+        {
+            return "Capsule Radar 用户"
+        }
+        return cleanName
     }
 
     var avatarData: Data? {
@@ -382,6 +584,14 @@ final class SessionStore {
     func signOut() {
         session = nil
         KeychainAuthStore.delete()
+        profileDisplayName = ""
+        profileAvatarData = nil
+        defaults.removeObject(forKey: Self.profileDisplayNameKey)
+        defaults.removeObject(forKey: Self.profileAvatarDataKey)
+    }
+
+    func deleteAccountData() {
+        signOut()
     }
 
     func updateProfile(displayName: String, avatarData: Data?) {
@@ -428,7 +638,7 @@ final class RoomsStore {
     var roomCapacity = 7
     var roomOnlineGroups = 0
     var roomLatency = 0
-    var voiceQuality = "等待房间"
+    var roomStatus = "等待房间"
     var locationHealth = "定位有效"
     var members: [RoomMember] = []
 
@@ -450,9 +660,11 @@ final class RoomsStore {
         max(roomOnlineGroups, members.filter(\.isOnline).count)
     }
 
+    #if !APP_ONLY
     var activeSpeakers: [RoomMember] {
         members.filter { $0.isSpeaking && $0.isOnline }
     }
+    #endif
 
     func createRoom(named name: String) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -463,7 +675,7 @@ final class RoomsStore {
         inviteCode = Self.makeInviteCode()
         roomOnlineGroups = 0
         roomLatency = 0
-        voiceQuality = "等待房间"
+        roomStatus = "等待房间"
         members = []
         persistActiveRoom()
         syncActiveRoomSnapshot()
@@ -484,7 +696,7 @@ final class RoomsStore {
         activeRoomName = "房间 \(normalizedCode)"
         roomOnlineGroups = 0
         roomLatency = 0
-        voiceQuality = "等待房间"
+        roomStatus = "等待房间"
         members = []
         persistActiveRoom()
         syncActiveRoomSnapshot()
@@ -499,7 +711,7 @@ final class RoomsStore {
         roomCapacity = room.capacity
         roomOnlineGroups = room.onlineGroups
         roomLatency = room.latency
-        voiceQuality = "等待房间"
+        roomStatus = "等待房间"
         members = []
         persistActiveRoom()
         syncActiveRoomSnapshot()
@@ -521,7 +733,7 @@ final class RoomsStore {
         roomCapacity = room.maxMembers
         roomOnlineGroups = room.onlineGroups ?? roomOnlineGroups
         roomLatency = 0
-        voiceQuality = room.memberCount > 0 ? "等待房间" : "等待成员"
+        roomStatus = room.memberCount > 0 ? "等待房间" : "等待成员"
         members = []
         persistActiveRoom()
         syncActiveRoomSnapshot()
@@ -544,7 +756,7 @@ final class RoomsStore {
                 capacity: room.maxMembers,
                 onlineGroups: room.onlineGroups ?? existing?.onlineGroups ?? 0,
                 latency: existing?.latency ?? 0,
-                voiceQuality: existing?.voiceQuality ?? "等待房间",
+                roomStatus: existing?.roomStatus ?? "等待房间",
                 members: room.roomCode == activeCode ? members : []
             )
         }
@@ -556,7 +768,7 @@ final class RoomsStore {
         roomCapacity = selected.capacity
         roomOnlineGroups = selected.onlineGroups
         roomLatency = selected.latency
-        voiceQuality = selected.voiceQuality
+        roomStatus = selected.roomStatus
         if selected.inviteCode != activeCode {
             members = []
         }
@@ -608,7 +820,7 @@ final class RoomsStore {
             capacity: roomCapacity,
             onlineGroups: max(roomOnlineGroups, members.filter(\.isOnline).count),
             latency: roomLatency,
-            voiceQuality: voiceQuality,
+            roomStatus: roomStatus,
             members: members
         )
         if let index = rooms.firstIndex(where: { $0.id == activeRoomID }) {
@@ -627,7 +839,7 @@ final class RoomsStore {
         roomCapacity = 7
         roomOnlineGroups = 0
         roomLatency = 0
-        voiceQuality = "等待房间"
+        roomStatus = "等待房间"
         locationHealth = "等待房间"
         Self.clearPersistedState(defaults: defaults)
     }
@@ -635,26 +847,79 @@ final class RoomsStore {
     func clearRelayRoomMembers() {
         members = []
         roomOnlineGroups = 0
-        voiceQuality = "等待房间"
+        roomStatus = "等待房间"
         syncActiveRoomSnapshot()
     }
 
-    func applyRelayRoomState(_ snapshot: RelayRoomStateSnapshot, localAppPeerID: String) {
+    func removeModerationMember(reference: String) {
+        guard !reference.isEmpty else { return }
+        members.removeAll { $0.moderationRef == reference }
+        roomOnlineGroups = min(roomOnlineGroups, members.count)
+        syncActiveRoomSnapshot()
+    }
+
+    func removeRooms(withCodes codes: Set<String>) {
+        guard !codes.isEmpty else { return }
+        let normalizedCodes = Set(codes.map { $0.uppercased() })
+        rooms.removeAll { normalizedCodes.contains($0.inviteCode.uppercased()) }
+        guard !normalizedCodes.contains(inviteCode.uppercased()) else {
+            if let nextRoom = rooms.first {
+                activeRoomID = nextRoom.id
+                activeRoomName = nextRoom.name
+                inviteCode = nextRoom.inviteCode
+                roomCapacity = nextRoom.capacity
+                roomOnlineGroups = nextRoom.onlineGroups
+                roomLatency = nextRoom.latency
+                roomStatus = nextRoom.roomStatus
+                members = nextRoom.members
+                persistActiveRoom()
+                syncActiveRoomSnapshot()
+            } else {
+                clearRooms()
+            }
+            return
+        }
+        syncActiveRoomSnapshot()
+    }
+
+    func applyRelayRoomState(
+        _ snapshot: RelayRoomStateSnapshot,
+        localAppPeerID: String,
+        localDisplayName: String? = nil
+    ) {
         roomCapacity = snapshot.maxMembers
-        roomOnlineGroups = snapshot.members.count
         inviteCode = snapshot.room
-        voiceQuality = voiceQualityText(snapshot)
+        roomStatus = roomStatusText(snapshot)
         locationHealth = locationHealthText(snapshot)
 
-        let localMember = snapshot.members.first(where: { $0.peerID == localAppPeerID })
+        #if APP_ONLY
+        let visibleMembers = snapshot.members.filter { $0.role == "app" }
+        #else
+        let visibleMembers = snapshot.members
+        #endif
+        roomOnlineGroups = visibleMembers.count
+        let localMember = visibleMembers.first(where: { $0.peerID == localAppPeerID })
         let localCoordinate = localMember?.locationStale == true ? nil : localMember?.location
-        members = snapshot.members.prefix(snapshot.maxMembers).map { member in
+        let localModerationRef = localMember?.moderationRef
+        members = visibleMembers.prefix(snapshot.maxMembers).map { member in
+            #if APP_ONLY
             makeRoomMember(
                 from: member,
                 localCoordinate: localCoordinate,
                 localAppPeerID: localAppPeerID,
+                localModerationRef: localModerationRef,
+                localDisplayName: localDisplayName
+            )
+            #else
+            makeRoomMember(
+                from: member,
+                localCoordinate: localCoordinate,
+                localAppPeerID: localAppPeerID,
+                localModerationRef: localModerationRef,
+                localDisplayName: localDisplayName,
                 voiceFloor: snapshot.voiceFloor
             )
+            #endif
         }
         persistActiveRoom()
         syncActiveRoomSnapshot()
@@ -672,13 +937,65 @@ final class RoomsStore {
         defaults.removeObject(forKey: activeRoomCodeKey)
     }
 
+    #if APP_ONLY
     private func makeRoomMember(
         from relayMember: RelayRoomMemberSnapshot,
         localCoordinate: RelayLocationSnapshot?,
         localAppPeerID: String,
+        localModerationRef: String?,
+        localDisplayName: String?
+    ) -> RoomMember {
+        let isLocal = relayMember.peerID == localAppPeerID
+        let moderationRef = relayMember.moderationRef ?? ""
+        let isCurrentUser = isLocal || (
+            !moderationRef.isEmpty
+                && localModerationRef?.isEmpty == false
+                && moderationRef == localModerationRef
+        )
+        let relation = relativeLocationText(
+            member: relayMember,
+            localCoordinate: localCoordinate,
+            isLocal: isLocal
+        )
+        return RoomMember(
+            id: stableID(for: relayMember.peerID),
+            name: displayName(
+                for: relayMember,
+                isLocal: isLocal,
+                localDisplayName: localDisplayName
+            ),
+            distance: relation.distance,
+            bearing: relation.bearing,
+            accuracy: accuracyText(
+                for: relayMember.location,
+                paused: relayMember.locationPaused == true,
+                stale: relayMember.locationStale == true
+            ),
+            locationPaused: relayMember.locationPaused == true,
+            isOnline: relayMember.online,
+            lastUpdate: lastUpdateText(milliseconds: relayMember.lastSeenMS),
+            moderationRef: moderationRef,
+            role: relayMember.role,
+            isLocal: isLocal,
+            isCurrentUser: isCurrentUser
+        )
+    }
+    #else
+    private func makeRoomMember(
+        from relayMember: RelayRoomMemberSnapshot,
+        localCoordinate: RelayLocationSnapshot?,
+        localAppPeerID: String,
+        localModerationRef: String?,
+        localDisplayName: String?,
         voiceFloor: RelayVoiceFloorSnapshot?
     ) -> RoomMember {
         let isLocal = relayMember.peerID == localAppPeerID
+        let moderationRef = relayMember.moderationRef ?? ""
+        let isCurrentUser = isLocal || (
+            !moderationRef.isEmpty
+                && localModerationRef?.isEmpty == false
+                && moderationRef == localModerationRef
+        )
         let relation = relativeLocationText(
             member: relayMember,
             localCoordinate: localCoordinate,
@@ -687,7 +1004,11 @@ final class RoomsStore {
         let rssi = relayMember.deviceStatus?.rssi ?? -999
         return RoomMember(
             id: stableID(for: relayMember.peerID),
-            name: displayName(for: relayMember, isLocal: isLocal),
+            name: displayName(
+                for: relayMember,
+                isLocal: isLocal,
+                localDisplayName: localDisplayName
+            ),
             distance: relation.distance,
             bearing: relation.bearing,
             accuracy: accuracyText(
@@ -705,14 +1026,27 @@ final class RoomsStore {
             deviceBattery: relayMember.deviceStatus?.batteryPercentValue ?? -1,
             wifiRSSI: rssi,
             firmware: relayMember.firmware ?? relayMember.lastType,
-            lastUpdate: lastUpdateText(milliseconds: relayMember.lastSeenMS)
+            lastUpdate: lastUpdateText(milliseconds: relayMember.lastSeenMS),
+            moderationRef: moderationRef,
+            role: relayMember.role,
+            isLocal: isLocal,
+            isCurrentUser: isCurrentUser
         )
     }
+    #endif
 
-    private func voiceQualityText(_ snapshot: RelayRoomStateSnapshot) -> String {
-        guard !snapshot.members.isEmpty else {
+    private func roomStatusText(_ snapshot: RelayRoomStateSnapshot) -> String {
+        #if APP_ONLY
+        let relevantMembers = snapshot.members.filter { $0.role == "app" }
+        #else
+        let relevantMembers = snapshot.members
+        #endif
+        guard !relevantMembers.isEmpty else {
             return "等待成员"
         }
+        #if APP_ONLY
+        return "成员在线"
+        #else
         guard snapshot.voiceFloor?.active == true else {
             return "成员在线"
         }
@@ -724,19 +1058,25 @@ final class RoomsStore {
             return "\(speakerName) 说话中"
         }
         return "有人说话"
+        #endif
     }
 
     private func locationHealthText(_ snapshot: RelayRoomStateSnapshot) -> String {
-        guard !snapshot.members.isEmpty else {
+        #if APP_ONLY
+        let relevantMembers = snapshot.members.filter { $0.role == "app" }
+        #else
+        let relevantMembers = snapshot.members
+        #endif
+        guard !relevantMembers.isEmpty else {
             return "等待成员"
         }
-        if snapshot.members.contains(where: { $0.locationPaused == true }) {
+        if relevantMembers.contains(where: { $0.locationPaused == true }) {
             return "有成员暂停定位"
         }
-        if snapshot.members.contains(where: { $0.locationStale == true }) {
+        if relevantMembers.contains(where: { $0.locationStale == true }) {
             return "有成员定位过期"
         }
-        if snapshot.members.contains(where: { $0.location != nil }) {
+        if relevantMembers.contains(where: { $0.location != nil }) {
             return "定位有效"
         }
         return "等待定位"
@@ -751,15 +1091,26 @@ final class RoomsStore {
         return id
     }
 
-    private func displayName(for member: RelayRoomMemberSnapshot, isLocal: Bool) -> String {
-        if isLocal {
-            return "隼人 iPhone"
+    private func displayName(
+        for member: RelayRoomMemberSnapshot,
+        isLocal: Bool,
+        localDisplayName: String?
+    ) -> String {
+        if isLocal,
+           let localDisplayName,
+           !localDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return localDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         if let name = member.name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
             return name
         }
         let suffix = member.peerID.count > 6 ? String(member.peerID.suffix(6)) : member.peerID
+        #if APP_ONLY
+        return "手机 \(suffix)"
+        #else
         return member.role == "device" ? "雷达 \(suffix)" : "手机 \(suffix)"
+        #endif
     }
 
     private func relativeLocationText(
@@ -782,7 +1133,11 @@ final class RoomsStore {
             let remoteLat = member.location?.latE7,
             let remoteLon = member.location?.lonE7
         else {
+            #if APP_ONLY
+            return ("等待定位", "手机")
+            #else
             return ("等待定位", member.role == "device" ? "雷达" : "手机")
+            #endif
         }
 
         let distance = haversineMeters(
@@ -820,6 +1175,7 @@ final class RoomsStore {
         return "旧坐标 \(lastUpdateText(milliseconds: milliseconds))"
     }
 
+    #if !APP_ONLY
     private func isVoiceActive(_ member: RelayRoomMemberSnapshot, voiceFloor: RelayVoiceFloorSnapshot?) -> Bool {
         if member.voiceStatus?.muted == true {
             return false
@@ -917,6 +1273,7 @@ final class RoomsStore {
         }
         return parts.isEmpty ? "voice_status 已收到" : parts.joined(separator: " · ")
     }
+    #endif
 
     private func lastUpdateText(milliseconds: Int) -> String {
         if milliseconds < 2_000 {
@@ -966,10 +1323,11 @@ final class RoomsStore {
     private static func makeInviteCode() -> String {
         let letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         let suffix = String((0..<4).compactMap { _ in letters.randomElement() })
-        return "KAME-\(suffix)"
+        return "CAPS-\(suffix)"
     }
 }
 
+#if !APP_ONLY
 @MainActor
 @Observable
 final class DevicesStore {
@@ -990,7 +1348,13 @@ final class DevicesStore {
         let shortID = defaults.string(forKey: Self.activeDeviceShortIDKey) ?? ""
         let wifi = defaults.string(forKey: Self.activeDeviceWifiKey) ?? "未同步"
         let deviceID = defaults.string(forKey: Self.activeDeviceIDKey) ?? ""
-        let deviceToken = defaults.string(forKey: Self.activeDeviceTokenKey) ?? ""
+        let legacyDeviceToken = defaults.string(forKey: Self.activeDeviceTokenKey) ?? ""
+        let keychainDeviceToken = KeychainDeviceCredentialStore.load()
+        let deviceToken = keychainDeviceToken.isEmpty ? legacyDeviceToken : keychainDeviceToken
+        if keychainDeviceToken.isEmpty, !legacyDeviceToken.isEmpty {
+            KeychainDeviceCredentialStore.save(legacyDeviceToken)
+        }
+        defaults.removeObject(forKey: Self.activeDeviceTokenKey)
         if deviceID.isEmpty && deviceToken.isEmpty && shortID.isEmpty {
             devices = []
         } else {
@@ -1034,7 +1398,7 @@ final class DevicesStore {
         defaults.set(devices[0].shortId, forKey: Self.activeDeviceShortIDKey)
         defaults.set(devices[0].name, forKey: Self.activeDeviceNameKey)
         defaults.set(devices[0].deviceID, forKey: Self.activeDeviceIDKey)
-        defaults.set(devices[0].deviceToken, forKey: Self.activeDeviceTokenKey)
+        KeychainDeviceCredentialStore.save(devices[0].deviceToken)
     }
 
     func applyServerDevice(_ device: ServerDevice) {
@@ -1061,7 +1425,7 @@ final class DevicesStore {
         defaults.set(devices[0].name, forKey: Self.activeDeviceNameKey)
         defaults.set(devices[0].shortId, forKey: Self.activeDeviceShortIDKey)
         defaults.set(devices[0].deviceID, forKey: Self.activeDeviceIDKey)
-        defaults.set(devices[0].deviceToken, forKey: Self.activeDeviceTokenKey)
+        KeychainDeviceCredentialStore.save(devices[0].deviceToken)
     }
 
     func updateRelayLatency(_ latency: Int) {
@@ -1088,6 +1452,7 @@ final class DevicesStore {
         defaults.removeObject(forKey: activeDeviceWifiKey)
         defaults.removeObject(forKey: activeDeviceIDKey)
         defaults.removeObject(forKey: activeDeviceTokenKey)
+        KeychainDeviceCredentialStore.delete()
     }
 }
 
@@ -1131,6 +1496,7 @@ final class DiagnosticsStore {
         ]
     }
 }
+#endif
 
 @MainActor
 @Observable
@@ -1171,6 +1537,15 @@ final class RoomsRepository {
         _ = try await request(path: "/v1/rooms/\(code)", method: "DELETE")
     }
 
+    func sendRadarReminder(roomCode: String, requestID: String) async throws -> RadarReminderReceipt {
+        let data = try await request(
+            path: "/v1/rooms/\(roomCode)/radar-reminders",
+            method: "POST",
+            payload: ["request_id": requestID]
+        )
+        return try JSONDecoder().decode(RadarReminderEnvelope.self, from: data).reminder
+    }
+
     private func requestRoom(path: String, method: String, payload: [String: String]? = nil) async throws -> ServerRoom {
         let data = try await request(path: path, method: method, payload: payload)
         return try JSONDecoder().decode(ServerRoomEnvelope.self, from: data).room
@@ -1197,6 +1572,14 @@ final class RoomsRepository {
         }
         guard (200..<300).contains(http.statusCode) else {
             if let error = try? JSONDecoder().decode(ServerErrorEnvelope.self, from: data) {
+                if http.statusCode == 429 {
+                    let headerRetryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
+                    throw RoomRepositoryError.rateLimited(
+                        code: error.code,
+                        detail: error.detail,
+                        retryAfter: error.retryAfter ?? headerRetryAfter ?? 1
+                    )
+                }
                 throw RoomRepositoryError.server(code: error.code, detail: error.detail)
             }
             throw RoomRepositoryError.badResponse
@@ -1211,6 +1594,7 @@ enum RoomsRepositoryUITestingScenario {
 }
 #endif
 
+#if !APP_ONLY
 @MainActor
 @Observable
 final class DevicesRepository {
@@ -1229,6 +1613,12 @@ final class DevicesRepository {
         ]
         let data = try await request(path: "/v1/devices/register-challenge", method: "POST", payload: payload)
         return try JSONDecoder().decode(ServerDeviceEnvelope.self, from: data).device
+    }
+
+    func revokeDevice(deviceID: String) async throws {
+        let cleanDeviceID = deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanDeviceID.isEmpty else { return }
+        _ = try await request(path: "/v1/devices/\(cleanDeviceID)", method: "DELETE")
     }
 
     private func request(path: String, method: String, payload: [String: String]? = nil) async throws -> Data {
@@ -1259,56 +1649,124 @@ final class DevicesRepository {
         return data
     }
 }
+#endif
 
 @MainActor
 @Observable
 final class AppState {
     var sessionStore: SessionStore
     var roomsStore: RoomsStore
+    #if !APP_ONLY
     var devicesStore: DevicesStore
     var diagnosticsStore = DiagnosticsStore()
+    #endif
     var roomsRepository = RoomsRepository()
+    #if !APP_ONLY
     var devicesRepository = DevicesRepository()
+    #endif
     var authRepository = AuthRepository()
+    var moderationRepository = ModerationRepository()
+    var reviewExperience = ReviewExperience()
 
     var selectedTab: AppTab = .rooms
     var selectedMember: RoomMember?
+    #if !APP_ONLY
     var showPairingSheet = false
     var showWifiSheet = false
+    #endif
     var showJoinRoomSheet = false
     var showCreateRoomSheet = false
     var focusedMemberID: RoomMember.ID?
     var lastRoomAPIEvent = "房间 API 尚未同步"
+    var blockedUsers: [UserBlockRecord] = []
+    var sessionRestorationCompleted = false
+    @ObservationIgnored private var radarReminderCooldowns: [String: Date] = [:]
     private var stateRevision = 0
 
     var activeRoomID: UUID { tracked { roomsStore.activeRoomID } }
     var rooms: [RadarRoom] { tracked { roomsStore.rooms } }
-    var activeRoomName: String { tracked { roomsStore.activeRoomName } }
+    var activeRoomName: String {
+        tracked { reviewExperience.isActive ? reviewExperience.room.name : roomsStore.activeRoomName }
+    }
     var inviteCode: String { tracked { roomsStore.inviteCode } }
-    var roomCapacity: Int { tracked { roomsStore.roomCapacity } }
-    var roomLatency: Int { tracked { roomsStore.roomLatency } }
-    var voiceQuality: String { tracked { roomsStore.voiceQuality } }
-    var locationHealth: String { tracked { roomsStore.locationHealth } }
-    var members: [RoomMember] { tracked { roomsStore.members } }
-    var onlineMembers: Int { tracked { roomsStore.onlineMembers } }
-    var activeSpeakers: [RoomMember] { tracked { roomsStore.activeSpeakers } }
+    var displayRoomCode: String {
+        tracked { reviewExperience.isActive ? reviewExperience.room.inviteCode : roomsStore.inviteCode }
+    }
+    var roomCapacity: Int {
+        tracked { reviewExperience.isActive ? reviewExperience.room.capacity : roomsStore.roomCapacity }
+    }
+    var roomLatency: Int {
+        tracked { reviewExperience.isActive ? reviewExperience.room.latency : roomsStore.roomLatency }
+    }
+    var roomStatus: String {
+        tracked { reviewExperience.isActive ? reviewExperience.room.roomStatus : roomsStore.roomStatus }
+    }
+    var locationHealth: String {
+        tracked { reviewExperience.isActive ? "本地演示未使用定位" : roomsStore.locationHealth }
+    }
+    var members: [RoomMember] {
+        tracked { reviewExperience.isActive ? reviewExperience.room.members : roomsStore.members }
+    }
+    var onlineMembers: Int {
+        tracked { reviewExperience.isActive ? reviewExperience.room.onlineMembers : roomsStore.onlineMembers }
+    }
+    #if !APP_ONLY
+    var activeSpeakers: [RoomMember] {
+        tracked {
+            reviewExperience.isActive
+                ? reviewExperience.room.members.filter { $0.isSpeaking && $0.isOnline }
+                : roomsStore.activeSpeakers
+        }
+    }
+    #endif
+    var isReviewExperienceActive: Bool { tracked { reviewExperience.isActive } }
+    #if !APP_ONLY
     var devices: [RadarDevice] { tracked { devicesStore.devices } }
     var activeDevice: RadarDevice? { tracked { devicesStore.activeDevice } }
     var activeDeviceToken: String { tracked { devicesStore.activeDeviceToken } }
     var diagnostics: [DiagnosticItem] { tracked { diagnosticsStore.diagnostics } }
+    #endif
     var isSignedIn: Bool { tracked { sessionStore.isSignedIn } }
     var displayName: String { tracked { sessionStore.displayName } }
     var profileAvatarData: Data? { tracked { sessionStore.avatarData } }
     var accessToken: String { tracked { sessionStore.accessToken } }
 
     init(resetPersistentState: Bool = false) {
+        if resetPersistentState {
+            KeychainPendingSessionRevocationStore.delete()
+        }
         sessionStore = SessionStore(resetPersistentState: resetPersistentState)
         roomsStore = RoomsStore(resetPersistentState: resetPersistentState)
+        #if !APP_ONLY
         devicesStore = DevicesStore(resetPersistentState: resetPersistentState)
+        #endif
         syncAuthenticatedRepositories()
         #if DEBUG
         configureUITestingStateIfNeeded()
+        if ProcessInfo.processInfo.arguments.contains("DRAGON_RADAR_UI_TESTING") {
+            sessionRestorationCompleted = true
+        }
         #endif
+    }
+
+    func startReviewExperience() {
+        guard isSignedIn, !reviewExperience.isActive else { return }
+        reviewExperience.start(displayName: displayName)
+        selectedMember = nil
+        focusedMemberID = nil
+        selectedTab = .radar
+        lastRoomAPIEvent = "已进入本地雷达演示 · 未连接服务器"
+        bump()
+    }
+
+    func stopReviewExperience() {
+        guard reviewExperience.isActive else { return }
+        reviewExperience.stop()
+        selectedMember = nil
+        focusedMemberID = nil
+        selectedTab = .rooms
+        lastRoomAPIEvent = roomsStore.inviteCode.isEmpty ? "已退出本地雷达演示" : "已恢复服务器房间"
+        bump()
     }
 
     func signInForDevelopment() {
@@ -1329,11 +1787,24 @@ final class AppState {
     }
 
     func restoreSessionIfNeeded() async {
+        defer {
+            sessionRestorationCompleted = true
+            bump()
+        }
+        await retryPendingSessionRevocation()
         guard let session = sessionStore.session else {
             syncAuthenticatedRepositories()
             return
         }
         syncAuthenticatedRepositories()
+        if session.appleUserID != "dev-local",
+           let credentialIsAuthorized = await appleCredentialIsAuthorized(session.appleUserID),
+           !credentialIsAuthorized {
+            clearAccountBoundState(accessToken: sessionStore.accessToken)
+            lastRoomAPIEvent = "Apple 登录授权已失效，请重新登录"
+            selectedTab = .account
+            return
+        }
         guard session.expiresAt.timeIntervalSinceNow < 10 * 60 else { return }
         do {
             let refreshed = try await authRepository.refresh(session)
@@ -1341,21 +1812,25 @@ final class AppState {
             syncAuthenticatedRepositories()
             lastRoomAPIEvent = "登录态已刷新"
         } catch {
-            sessionStore.signOut()
-            syncAuthenticatedRepositories()
+            clearAccountBoundState(accessToken: sessionStore.accessToken)
             lastRoomAPIEvent = "登录已失效，请重新登录"
             selectedTab = .account
         }
-        bump()
     }
 
-    func signInWithApple(credential: ASAuthorizationAppleIDCredential) {
-        Task { _ = await signInWithAppleAndWait(credential: credential) }
+    func signInWithApple(credential: ASAuthorizationAppleIDCredential, rawNonce: String) {
+        Task { _ = await signInWithAppleAndWait(credential: credential, rawNonce: rawNonce) }
     }
 
-    func signInWithAppleAndWait(credential: ASAuthorizationAppleIDCredential) async -> AppOperationResult {
+    func signInWithAppleAndWait(
+        credential: ASAuthorizationAppleIDCredential,
+        rawNonce: String
+    ) async -> AppOperationResult {
         do {
-            let session = try await authRepository.signInWithApple(credential: credential)
+            let session = try await authRepository.signInWithApple(
+                credential: credential,
+                rawNonce: rawNonce
+            )
             await applySignedInSession(session)
             return AppOperationResult(succeeded: true, message: "已登录 · \(session.displayName)")
         } catch {
@@ -1367,10 +1842,74 @@ final class AppState {
     }
 
     func signOut() {
-        sessionStore.signOut()
-        syncAuthenticatedRepositories()
-        clearRelayRoomMembers()
+        clearAccountBoundState(accessToken: sessionStore.accessToken)
+        sessionRestorationCompleted = true
         lastRoomAPIEvent = "已退出登录"
+        selectedTab = .account
+        bump()
+    }
+
+    func signOutAndWait() async -> AppOperationResult {
+        let accessToken = sessionStore.accessToken
+        guard !accessToken.isEmpty else {
+            return AppOperationResult(succeeded: true, message: "已退出登录")
+        }
+        var message = "已退出登录，服务器会话已撤销"
+        do {
+            try await authRepository.signOut(accessToken: accessToken)
+            KeychainPendingSessionRevocationStore.delete()
+        } catch {
+            KeychainPendingSessionRevocationStore.save(accessToken)
+            message = "已退出本机；联网后将自动撤销服务器会话"
+        }
+        clearAccountBoundState(accessToken: accessToken)
+        sessionRestorationCompleted = true
+        lastRoomAPIEvent = message
+        selectedTab = .account
+        bump()
+        return AppOperationResult(succeeded: true, message: message)
+    }
+
+    func deleteAccountAndWait() async -> AppOperationResult {
+        let accessToken = sessionStore.accessToken
+        guard !accessToken.isEmpty else {
+            return AppOperationResult(succeeded: false, message: AppError.notSignedIn.localizedDescription)
+        }
+        do {
+            let deletion = try await authRepository.deleteAccount(accessToken: accessToken)
+            KeychainPendingSessionRevocationStore.delete()
+            clearAccountBoundState(
+                accessToken: accessToken,
+                deleteLocalData: true,
+                notifyPushUnregister: false
+            )
+            #if !APP_ONLY
+            diagnosticsStore = DiagnosticsStore()
+            #endif
+            sessionRestorationCompleted = true
+            selectedTab = .account
+            let message: String
+            if deletion.requiresManualAppleRevocation {
+                message = "账户和数据已删除。请在 Apple 账户设置的“使用 Apple 登录”中停止使用“Capsule Radar”。"
+            } else {
+                message = "账户、云端数据及 Apple 登录授权已删除"
+            }
+            lastRoomAPIEvent = message
+            bump()
+            return AppOperationResult(succeeded: true, message: message)
+        } catch {
+            let message = "账户删除失败 · \(userFacingMessage(for: error))"
+            lastRoomAPIEvent = message
+            bump()
+            return AppOperationResult(succeeded: false, message: message)
+        }
+    }
+
+    func handleAppleCredentialRevoked() {
+        guard isSignedIn else { return }
+        clearAccountBoundState(accessToken: sessionStore.accessToken)
+        sessionRestorationCompleted = true
+        lastRoomAPIEvent = "Apple 登录授权已撤销，请重新登录"
         selectedTab = .account
         bump()
     }
@@ -1398,6 +1937,9 @@ final class AppState {
             bump()
             return AppOperationResult(succeeded: false, message: message)
         }
+        guard !reviewExperience.isActive else {
+            return AppOperationResult(succeeded: false, message: "请先退出本地雷达演示")
+        }
         do {
             let room = try await roomsRepository.createRoom(named: cleanName)
             roomsStore.applyServerRoom(room)
@@ -1419,6 +1961,11 @@ final class AppState {
             bump()
             return
         }
+        guard !reviewExperience.isActive else {
+            lastRoomAPIEvent = "本地雷达演示不会访问服务器"
+            bump()
+            return
+        }
         do {
             let rooms = try await roomsRepository.listRooms()
             roomsStore.applyServerRooms(rooms)
@@ -1429,13 +1976,23 @@ final class AppState {
         bump()
     }
 
+    #if !APP_ONLY
     func refreshDevicesFromServer() async {
         guard isSignedIn else { return }
+        guard !reviewExperience.isActive else {
+            lastRoomAPIEvent = "本地雷达演示不会访问服务器或雷达"
+            bump()
+            return
+        }
         do {
             let devices = try await devicesRepository.listDevices()
-            if let newest = devices.first {
-                devicesStore.applyServerDevice(newest)
-                lastRoomAPIEvent = "雷达列表已同步 · \(newest.deviceShortID)"
+            let activeDeviceID = devicesStore.activeDevice?.deviceID
+            let preferred = activeDeviceID.flatMap { activeDeviceID in
+                devices.first { $0.deviceID == activeDeviceID }
+            } ?? devices.first
+            if let preferred {
+                devicesStore.applyServerDevice(preferred)
+                lastRoomAPIEvent = "雷达列表已同步 · \(preferred.deviceShortID)"
             } else {
                 devicesStore.clearDevices()
                 lastRoomAPIEvent = "暂无已绑定雷达"
@@ -1446,6 +2003,7 @@ final class AppState {
             bump()
         }
     }
+    #endif
 
     func joinRoom(code: String) {
         let cleanCode = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
@@ -1465,6 +2023,9 @@ final class AppState {
             bump()
             return AppOperationResult(succeeded: false, message: message)
         }
+        guard !reviewExperience.isActive else {
+            return AppOperationResult(succeeded: false, message: "请先退出本地雷达演示")
+        }
         do {
             let room = try await roomsRepository.joinRoom(code: cleanCode)
             roomsStore.applyServerRoom(room)
@@ -1481,11 +2042,17 @@ final class AppState {
     }
 
     func switchRoom(to roomID: RadarRoom.ID) {
+        if reviewExperience.isActive {
+            reviewExperience.stop()
+            selectedMember = nil
+            focusedMemberID = nil
+        }
         roomsStore.switchRoom(to: roomID)
         bump()
     }
 
     func renameActiveRoom(to name: String) {
+        guard !reviewExperience.isActive else { return }
         let previousCode = roomsStore.inviteCode
         roomsStore.renameActiveRoom(to: name)
         bump()
@@ -1493,28 +2060,338 @@ final class AppState {
         Task { await renameRoomOnServer(code: previousCode, name: cleanName) }
     }
 
+    func sendRadarReminderAndWait(
+        roomCode requestedRoomCode: String? = nil,
+        requestID: String = UUID().uuidString
+    ) async -> RadarReminderOperationResult {
+        guard !reviewExperience.isActive else {
+            let message = "本地演示不会发送提醒或调用服务器"
+            lastRoomAPIEvent = message
+            bump()
+            return RadarReminderOperationResult(succeeded: false, message: message, cooldownSeconds: 0)
+        }
+        let roomCode = (requestedRoomCode ?? inviteCode)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        guard !roomCode.isEmpty else {
+            return RadarReminderOperationResult(
+                succeeded: false,
+                message: RoomError.invalidRoom.localizedDescription,
+                cooldownSeconds: 0
+            )
+        }
+        guard isSignedIn else {
+            selectedTab = .account
+            let message = AppError.notSignedIn.localizedDescription
+            lastRoomAPIEvent = message
+            bump()
+            return RadarReminderOperationResult(succeeded: false, message: message, cooldownSeconds: 0)
+        }
+        do {
+            let receipt = try await roomsRepository.sendRadarReminder(roomCode: roomCode, requestID: requestID)
+            let delivery = radarReminderDeliveryMessage(receipt)
+            setRadarReminderCooldown(roomCode: roomCode, seconds: receipt.cooldownSeconds)
+            let message = delivery.message
+            lastRoomAPIEvent = message
+            bump()
+            return RadarReminderOperationResult(
+                succeeded: delivery.succeeded,
+                message: message,
+                cooldownSeconds: receipt.cooldownSeconds
+            )
+        } catch {
+            let retryAfter = (error as? RoomRepositoryError)?.retryAfterSeconds ?? 0
+            if retryAfter > 0 {
+                setRadarReminderCooldown(roomCode: roomCode, seconds: retryAfter)
+            }
+            let message = "提醒发送失败 · \(userFacingMessage(for: error))"
+            lastRoomAPIEvent = message
+            bump()
+            return RadarReminderOperationResult(
+                succeeded: false,
+                message: message,
+                cooldownSeconds: retryAfter
+            )
+        }
+    }
+
+    func reportMemberAndWait(
+        _ member: RoomMember,
+        contentType: ModerationContentType,
+        category: ModerationReportCategory,
+        details: String
+    ) async -> ModerationReportOperationResult {
+        guard isSignedIn else {
+            selectedTab = .account
+            return ModerationReportOperationResult(
+                succeeded: false,
+                message: AppError.notSignedIn.localizedDescription,
+                caseNumber: nil
+            )
+        }
+        guard !reviewExperience.isActive else {
+            return ModerationReportOperationResult(
+                succeeded: false,
+                message: "本地雷达演示没有真实成员可举报",
+                caseNumber: nil
+            )
+        }
+        guard member.canUseModerationActions else {
+            return ModerationReportOperationResult(
+                succeeded: false,
+                message: member.isLocal ? "不能举报自己。" : "该槽位不是可举报的 App 成员。",
+                caseNumber: nil
+            )
+        }
+        let roomCode = inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !roomCode.isEmpty else {
+            return ModerationReportOperationResult(
+                succeeded: false,
+                message: RoomError.invalidRoom.localizedDescription,
+                caseNumber: nil
+            )
+        }
+        guard details.count <= 1_000 else {
+            return ModerationReportOperationResult(
+                succeeded: false,
+                message: "补充说明不能超过 1000 字。",
+                caseNumber: nil
+            )
+        }
+
+        do {
+            let receipt = try await moderationRepository.submitReport(
+                roomCode: roomCode,
+                moderationRef: member.moderationRef,
+                contentType: contentType,
+                category: category,
+                details: details
+            )
+            let message = "举报已提交 · 案件号 \(receipt.caseNumber)"
+            lastRoomAPIEvent = message
+            bump()
+            return ModerationReportOperationResult(
+                succeeded: true,
+                message: message,
+                caseNumber: receipt.caseNumber
+            )
+        } catch {
+            let message = "举报提交失败 · \(userFacingMessage(for: error))"
+            lastRoomAPIEvent = message
+            bump()
+            return ModerationReportOperationResult(succeeded: false, message: message, caseNumber: nil)
+        }
+    }
+
+    func blockMemberAndWait(_ member: RoomMember) async -> ModerationBlockOperationResult {
+        guard isSignedIn else {
+            selectedTab = .account
+            return ModerationBlockOperationResult(
+                succeeded: false,
+                message: AppError.notSignedIn.localizedDescription,
+                leftCurrentRoom: false
+            )
+        }
+        guard !reviewExperience.isActive else {
+            return ModerationBlockOperationResult(
+                succeeded: false,
+                message: "本地雷达演示没有真实成员可屏蔽",
+                leftCurrentRoom: false
+            )
+        }
+        guard member.canUseModerationActions else {
+            return ModerationBlockOperationResult(
+                succeeded: false,
+                message: member.isLocal ? "不能屏蔽自己。" : "该槽位不是可屏蔽的 App 成员。",
+                leftCurrentRoom: false
+            )
+        }
+        let originRoomCode = inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !originRoomCode.isEmpty else {
+            return ModerationBlockOperationResult(
+                succeeded: false,
+                message: RoomError.invalidRoom.localizedDescription,
+                leftCurrentRoom: false
+            )
+        }
+
+        do {
+            let response = try await moderationRepository.block(
+                roomCode: originRoomCode,
+                moderationRef: member.moderationRef
+            )
+            blockedUsers.removeAll {
+                $0.blockID == response.block.blockID || $0.moderationRef == response.block.moderationRef
+            }
+            blockedUsers.insert(response.block, at: 0)
+
+            let leftRoomCodes = Set(
+                response.effects
+                    .filter { $0.action == .blockerLeft }
+                    .map { $0.roomCode.uppercased() }
+            )
+            let removedFromCurrentRoom = response.effects.contains {
+                $0.action == .blockedUserRemoved && $0.roomCode.uppercased() == originRoomCode
+            }
+            if removedFromCurrentRoom {
+                roomsStore.removeModerationMember(reference: member.moderationRef)
+            }
+            roomsStore.removeRooms(withCodes: leftRoomCodes)
+
+            if !moderationRepository.usesInMemoryTestingStore,
+               let serverRooms = try? await roomsRepository.listRooms() {
+                roomsStore.applyServerRooms(serverRooms)
+            }
+
+            let leftCurrentRoom = leftRoomCodes.contains(originRoomCode)
+            let message: String
+            if leftCurrentRoom {
+                message = "已屏蔽 \(member.name) · 你已退出双方共同房间"
+            } else if removedFromCurrentRoom {
+                message = "已屏蔽 \(member.name) · 对方已从共同房间移除"
+            } else {
+                message = "已屏蔽 \(member.name) · 双方不能再加入同一房间"
+            }
+            lastRoomAPIEvent = message
+            bump()
+            return ModerationBlockOperationResult(
+                succeeded: true,
+                message: message,
+                leftCurrentRoom: leftCurrentRoom
+            )
+        } catch {
+            let message = "屏蔽失败 · \(userFacingMessage(for: error))"
+            lastRoomAPIEvent = message
+            bump()
+            return ModerationBlockOperationResult(succeeded: false, message: message, leftCurrentRoom: false)
+        }
+    }
+
+    func refreshBlockedUsersFromServer() async -> AppOperationResult {
+        guard isSignedIn else {
+            blockedUsers = []
+            return AppOperationResult(succeeded: false, message: AppError.notSignedIn.localizedDescription)
+        }
+        guard !reviewExperience.isActive else {
+            return AppOperationResult(succeeded: false, message: "本地雷达演示不访问屏蔽列表")
+        }
+        do {
+            blockedUsers = try await moderationRepository.listBlocks()
+            bump()
+            return AppOperationResult(
+                succeeded: true,
+                message: blockedUsers.isEmpty ? "暂无已屏蔽成员" : "已同步 \(blockedUsers.count) 条屏蔽记录"
+            )
+        } catch {
+            let message = "屏蔽列表加载失败 · \(userFacingMessage(for: error))"
+            bump()
+            return AppOperationResult(succeeded: false, message: message)
+        }
+    }
+
+    func unblockAndWait(blockID: String) async -> AppOperationResult {
+        guard isSignedIn else {
+            return AppOperationResult(succeeded: false, message: AppError.notSignedIn.localizedDescription)
+        }
+        do {
+            let block = try await moderationRepository.unblock(blockID: blockID)
+            blockedUsers.removeAll { $0.blockID == block.blockID }
+            let message = "已解除屏蔽 · 不会自动恢复原房间关系"
+            lastRoomAPIEvent = message
+            bump()
+            return AppOperationResult(succeeded: true, message: message)
+        } catch {
+            let message = "解除屏蔽失败 · \(userFacingMessage(for: error))"
+            lastRoomAPIEvent = message
+            bump()
+            return AppOperationResult(succeeded: false, message: message)
+        }
+    }
+
+    func radarReminderCooldownRemaining(roomCode: String, at date: Date = .now) -> Int {
+        let key = radarReminderCooldownKey(roomCode: roomCode)
+        guard let cooldownUntil = radarReminderCooldowns[key] else { return 0 }
+        let remaining = max(0, Int(ceil(cooldownUntil.timeIntervalSince(date))))
+        if remaining == 0 {
+            radarReminderCooldowns.removeValue(forKey: key)
+        }
+        return remaining
+    }
+
+    func openRadarReminder(roomCode: String) async -> RadarReminderNavigationResult {
+        let cleanCode = roomCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard isSignedIn else { return .retryable }
+        guard !reviewExperience.isActive else {
+            lastRoomAPIEvent = "请先退出本地演示，再打开服务器房间提醒"
+            bump()
+            return .retryable
+        }
+        guard !cleanCode.isEmpty else {
+            lastRoomAPIEvent = "提醒中没有有效房间"
+            selectedTab = .rooms
+            bump()
+            return .unavailable
+        }
+
+        if rooms.first(where: { $0.inviteCode == cleanCode }) == nil {
+            do {
+                let serverRooms = try await roomsRepository.listRooms()
+                roomsStore.applyServerRooms(serverRooms)
+            } catch {
+                lastRoomAPIEvent = "暂时无法打开提醒房间 · \(userFacingMessage(for: error))"
+                bump()
+                return .retryable
+            }
+        }
+        guard let room = rooms.first(where: { $0.inviteCode == cleanCode }) else {
+            lastRoomAPIEvent = "你已不在提醒对应的房间"
+            selectedTab = .rooms
+            bump()
+            return .unavailable
+        }
+        if room.id != activeRoomID {
+            roomsStore.switchRoom(to: room.id)
+        }
+        selectedTab = .radar
+        bump()
+        return .opened
+    }
+
     func clearRelayRoomMembers() {
+        guard !reviewExperience.isActive else { return }
         roomsStore.clearRelayRoomMembers()
         bump()
     }
 
     func applyRelayRoomState(_ snapshot: RelayRoomStateSnapshot, localAppPeerID: String) {
-        roomsStore.applyRelayRoomState(snapshot, localAppPeerID: localAppPeerID)
+        guard !reviewExperience.isActive else { return }
+        roomsStore.applyRelayRoomState(
+            snapshot,
+            localAppPeerID: localAppPeerID,
+            localDisplayName: displayName
+        )
         bump()
     }
 
+    #if !APP_ONLY
     func updateActiveDeviceBattery(percent: Int?) {
         devicesStore.updateBattery(percent: percent)
         bump()
     }
 
     func applyWifiConfig(ssid: String) {
+        guard !reviewExperience.isActive else { return }
         devicesStore.applyWifiConfig(ssid: ssid)
         diagnosticsStore.applyWifiConfig(ssid: ssid)
         bump()
     }
 
     func runDiagnostics() {
+        guard !reviewExperience.isActive else {
+            lastRoomAPIEvent = "本地雷达演示不运行真实链路诊断"
+            bump()
+            return
+        }
         let cleanRoomCode = inviteCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasRoom = !cleanRoomCode.isEmpty
         let nextLatency = hasRoom ? max(24, roomLatency == 0 ? 42 : roomLatency) : 0
@@ -1533,6 +2410,7 @@ final class AppState {
     }
 
     func simulatePairingComplete() {
+        guard !reviewExperience.isActive else { return }
         showPairingSheet = false
         devicesStore.markPairingComplete()
         bump()
@@ -1544,11 +2422,82 @@ final class AppState {
             bump()
             throw RoomRepositoryError.server(code: "unauthorized", detail: nil)
         }
+        guard !reviewExperience.isActive else {
+            throw RoomRepositoryError.server(
+                code: "review_experience_active",
+                detail: "请先退出本地雷达演示"
+            )
+        }
         let device = try await devicesRepository.registerDevice(pairingChallenge: pairingChallenge, name: name)
+        lastRoomAPIEvent = "等待雷达确认绑定 · \(device.deviceShortID)"
+        bump()
+        return device
+    }
+
+    func commitRegisteredDevice(_ device: ServerDevice) {
         devicesStore.applyServerDevice(device)
         lastRoomAPIEvent = "雷达已绑定 · \(device.deviceShortID)"
         bump()
-        return device
+    }
+
+    func cancelRegisteredDevice(_ device: ServerDevice) async {
+        do {
+            try await devicesRepository.revokeDevice(deviceID: device.deviceID)
+            lastRoomAPIEvent = "雷达未接受绑定，临时凭证已撤销"
+        } catch {
+            lastRoomAPIEvent = "雷达未接受绑定，临时凭证撤销待重试"
+        }
+        bump()
+    }
+    #endif
+
+    private func radarReminderDeliveryMessage(_ receipt: RadarReminderReceipt) -> (succeeded: Bool, message: String) {
+        let recipientCount = max(0, receipt.recipientCount)
+        let onlineDelivered = min(recipientCount, max(0, receipt.onlineDelivered))
+        let pushStatus = receipt.pushStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if recipientCount == 0 {
+            return (true, "房间内暂无其他成员可提醒")
+        }
+        if onlineDelivered == recipientCount {
+            return (true, "已提醒 \(recipientCount) 位成员 · 均已在线收到")
+        }
+        if onlineDelivered > 0 {
+            if pushStatus == "sent" {
+                return (true, "已提醒 \(recipientCount) 位成员 · \(onlineDelivered) 位在线收到")
+            }
+            if pushStatus == "partial" {
+                return (true, "\(onlineDelivered) 位在线收到 · 其余成员推送部分送达")
+            }
+            return (true, "\(onlineDelivered) 位在线成员已收到 · 其余成员暂未送达")
+        }
+
+        switch pushStatus {
+        case "sent":
+            return (true, "已向 \(recipientCount) 位成员发出系统提醒")
+        case "partial":
+            return (true, "提醒已部分送达，请稍后查看成员状态")
+        case "dry_run":
+            return (true, "提醒链路验证完成（推送演练）")
+        case "pending":
+            return (false, "上一条提醒仍在处理中")
+        case "failed":
+            return (false, "成员当前不在线，系统推送发送失败")
+        default:
+            return (false, "当前没有在线成员，后台系统推送尚未送达")
+        }
+    }
+
+    private func setRadarReminderCooldown(roomCode: String, seconds: Int) {
+        guard seconds > 0 else { return }
+        radarReminderCooldowns[radarReminderCooldownKey(roomCode: roomCode)] = Date()
+            .addingTimeInterval(TimeInterval(seconds))
+    }
+
+    private func radarReminderCooldownKey(roomCode: String) -> String {
+        let userID = sessionStore.session?.userID ?? "signed-out"
+        let cleanRoomCode = roomCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        return userID + "|" + cleanRoomCode
     }
 
     private func tracked<T>(_ value: () -> T) -> T {
@@ -1562,7 +2511,10 @@ final class AppState {
 
     private func syncAuthenticatedRepositories() {
         roomsRepository.accessToken = sessionStore.accessToken
+        #if !APP_ONLY
         devicesRepository.accessToken = sessionStore.accessToken
+        #endif
+        moderationRepository.accessToken = sessionStore.accessToken
     }
 
     #if DEBUG
@@ -1586,16 +2538,16 @@ final class AppState {
         if arguments.contains("DRAGON_RADAR_UI_TESTING_SEEDED_ROOMS") {
             roomsStore.applyServerRooms([
                 ServerRoom(
-                    roomID: "room-KAME-1001",
-                    roomCode: "KAME-1001",
-                    name: "西都小队",
+                    roomID: "room-CAPS-1001",
+                    roomCode: "CAPS-1001",
+                    name: "周末小队",
                     maxMembers: 7,
                     memberCount: 1
                 ),
                 ServerRoom(
-                    roomID: "room-KAME-2002",
-                    roomCode: "KAME-2002",
-                    name: "龟屋频道",
+                    roomID: "room-CAPS-2002",
+                    roomCode: "CAPS-2002",
+                    name: "城市漫步",
                     maxMembers: 7,
                     memberCount: 2
                 )
@@ -1604,6 +2556,67 @@ final class AppState {
 
         if arguments.contains("DRAGON_RADAR_UI_TESTING_ROOM_FULL") {
             roomsRepository.uiTestingScenario = .roomFull
+        }
+
+        if arguments.contains("DRAGON_RADAR_UI_TESTING_MODERATION") {
+            moderationRepository.uiTestingEnabled = true
+            let snapshotJSON = #"""
+            {
+              "room": "CAPS-1001",
+              "server_time": 1784000000,
+              "max_members": 7,
+              "members": [
+                {
+                  "role": "app",
+                  "member_id": "ui-local",
+                  "peer_id": "ui-local-app",
+                  "name": "本机用户",
+                  "online": true,
+                  "age_ms": 0,
+                  "last_seen_ms": 100,
+                  "last_type": "app_location",
+                  "moderation_ref": "mod_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                  "app_online": true,
+                  "device_online": false
+                },
+                {
+                  "role": "app",
+                  "member_id": "ui-remote",
+                  "peer_id": "ui-remote-app",
+                  "name": "测试成员",
+                  "online": true,
+                  "age_ms": 0,
+                  "last_seen_ms": 200,
+                  "last_type": "room_state",
+                  "moderation_ref": "mod_v1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                  "app_online": true,
+                  "device_online": false
+                },
+                {
+                  "role": "device",
+                  "member_id": "ui-device",
+                  "peer_id": "ui-device-peer",
+                  "name": "测试雷达设备",
+                  "online": true,
+                  "age_ms": 0,
+                  "last_seen_ms": 300,
+                  "last_type": "device_status",
+                  "app_online": false,
+                  "device_online": true
+                }
+              ]
+            }
+            """#.data(using: .utf8)
+            if let snapshotJSON,
+               let snapshot = try? JSONDecoder().decode(RelayRoomStateSnapshot.self, from: snapshotJSON) {
+                roomsStore.applyRelayRoomState(snapshot, localAppPeerID: "ui-local-app")
+            }
+            if arguments.contains("DRAGON_RADAR_UI_TESTING_MODERATION_BLOCKED") {
+                moderationRepository.seedUITestingBlock(
+                    roomCode: "CAPS-1001",
+                    moderationRef: "mod_v1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+                )
+            }
         }
     }
     #endif
@@ -1616,16 +2629,78 @@ final class AppState {
         _ = await signInForDevelopmentAndWait()
     }
 
-    private func signInWithAppleOnServer(credential: ASAuthorizationAppleIDCredential) async {
-        _ = await signInWithAppleAndWait(credential: credential)
+    private func signInWithAppleOnServer(
+        credential: ASAuthorizationAppleIDCredential,
+        rawNonce: String
+    ) async {
+        _ = await signInWithAppleAndWait(credential: credential, rawNonce: rawNonce)
+    }
+
+    private func retryPendingSessionRevocation() async {
+        let accessToken = KeychainPendingSessionRevocationStore.load()
+        guard !accessToken.isEmpty else { return }
+        do {
+            try await authRepository.signOut(accessToken: accessToken)
+            KeychainPendingSessionRevocationStore.delete()
+        } catch {
+            // Keep the token in the device-only Keychain for the next launch.
+        }
+    }
+
+    private func appleCredentialIsAuthorized(_ appleUserID: String) async -> Bool? {
+        await withCheckedContinuation { continuation in
+            ASAuthorizationAppleIDProvider().getCredentialState(forUserID: appleUserID) { state, error in
+                guard error == nil else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                switch state {
+                case .authorized, .transferred:
+                    continuation.resume(returning: true)
+                case .revoked, .notFound:
+                    continuation.resume(returning: false)
+                @unknown default:
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
     }
 
     private func applySignedInSession(_ session: AuthSession) async {
         sessionStore.apply(session)
+        sessionRestorationCompleted = true
         syncAuthenticatedRepositories()
         lastRoomAPIEvent = "已登录 · \(session.displayName)"
         await refreshRoomsFromServer()
+        #if !APP_ONLY
         await refreshDevicesFromServer()
+        #endif
+    }
+
+    private func clearAccountBoundState(
+        accessToken: String,
+        deleteLocalData: Bool = false,
+        notifyPushUnregister: Bool = true
+    ) {
+        reviewExperience.stop()
+        NotificationCenter.default.post(
+            name: .dragonRadarAccountSignedOut,
+            object: notifyPushUnregister ? accessToken : nil
+        )
+        if deleteLocalData {
+            sessionStore.deleteAccountData()
+            #if !APP_ONLY
+            devicesStore.clearDevices()
+            #endif
+        } else {
+            sessionStore.signOut()
+        }
+        syncAuthenticatedRepositories()
+        roomsStore.clearRooms()
+        radarReminderCooldowns.removeAll()
+        blockedUsers = []
+        selectedMember = nil
+        focusedMemberID = nil
     }
 
     private func createRoomOnServer(named name: String) async {

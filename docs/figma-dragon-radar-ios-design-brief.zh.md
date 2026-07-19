@@ -1,9 +1,9 @@
-# Figma 设计稿 Brief：Dragon Radar iOS App
+# Figma 设计稿 Brief：胶囊 iOS App
 
 目标文件：
 
 ```text
-Dragon Radar iOS App 功能设计图
+胶囊 iOS App 功能设计图
 https://www.figma.com/design/wLBJq4AGUVQIc2heMXekeS
 ```
 
@@ -15,7 +15,7 @@ https://www.figma.com/design/wLBJq4AGUVQIc2heMXekeS
 
 ## 设计目标
 
-做一版 iOS App 功能设计图，用于说明 Dragon Radar App 的信息架构、关键页面、用户流和状态。
+做一版 iOS App 功能设计图，用于说明胶囊 App 的信息架构、关键页面、用户流和状态。
 
 产品前提：
 
@@ -31,21 +31,21 @@ https://www.figma.com/design/wLBJq4AGUVQIc2heMXekeS
 
 - Apple iOS 原生结构
 - Liquid Glass / system material
-- 漫画分镜感
-- 能量线
+- 精密雷达坐标感
+- 雷达圆环与扫描线
 - 雷达绿色
-- 胶囊道具感
+- 中性圆形成员点
 
 禁止项：
 
-- 不使用官方龙珠角色、logo、龙珠星球图案或版权插画。
+- 使用“胶囊”自有原创视觉，不使用、仿制或暗示任何第三方角色、商标、标志、道具图案或版权插画。
 - 不做 Web SaaS 仪表盘风。
 - 不把 App 做成营销 landing page。
 
 设计语气：
 
 - iOS 信息层级清晰、可实现。
-- 功能界面为主，漫画风格只作为背景能量线、分镜边框、状态徽章和启动页氛围。
+- 功能界面为主，原创雷达圆环、网格和扫描线只作为背景、状态标识和启动页氛围。
 - 真实业务状态优先于装饰。
 
 ## Figma 页面结构
@@ -67,7 +67,7 @@ https://www.figma.com/design/wLBJq4AGUVQIc2heMXekeS
 
 内容：
 
-- 标题：`Dragon Radar iOS App 功能设计图`
+- 标题：`胶囊 iOS App 功能设计图`
 - 副标题：`最多 7 人房间抢麦 · iPhone 定位桥接 · ESP 圆屏现场终端`
 - 架构简图：
   - iPhone 1..7
@@ -80,7 +80,7 @@ https://www.figma.com/design/wLBJq4AGUVQIc2heMXekeS
 
 - 深绿色背景。
 - 雷达网格细线。
-- 漫画速度线从边缘向中心收束。
+- 低对比度扫描线从圆心向外扫过。
 - iOS glass 卡片承载架构说明。
 
 ### App IA Map
@@ -365,16 +365,16 @@ ESP voice_claim -> Relay floor grant/busy -> ESP audio_frame -> Relay voice_fram
 - 危险操作使用 confirmation dialog。
 - 文案短、直接、行动导向。
 
-### Manga Style Rules
+### Radar Style Rules
 
-- 漫画感只在：
+- 雷达氛围只在：
   - cover
   - radar background
   - voice active badge
   - section dividers
   - empty states
 - 不影响表单、权限、诊断页面的可读性。
-- 速度线透明度低，不能抢 iOS 层级。
+- 雷达圆环、网格和扫描线透明度低，不能抢 iOS 层级。
 
 ### Color Tokens
 
@@ -386,7 +386,7 @@ bgGrouped        #0D1713
 surfaceGlass     rgba(255,255,255,0.10)
 surfaceElevated  rgba(255,255,255,0.16)
 radarGreen       #7CFF8A
-energyYellow     #FFD86B
+signalYellow     #FFD86B
 alertOrange      #FF9D42
 signalBlue       #6CCBFF
 textPrimary      #F4F8EE

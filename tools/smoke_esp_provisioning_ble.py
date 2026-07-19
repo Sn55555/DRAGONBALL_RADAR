@@ -30,7 +30,7 @@ class ScanHit:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Smoke test the Dragon Radar ESP provisioning BLE GATT service."
+        description="Smoke test the Capsule ESP provisioning BLE GATT service."
     )
     parser.add_argument("--name-prefix", default="CapsuleRadar", help="BLE device name prefix to match.")
     parser.add_argument("--address", help="Connect to a specific BLE address/identifier.")

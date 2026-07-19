@@ -37,7 +37,7 @@ def default_auto_output_dir() -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Wait for a likely ESP32-S3 Dragon Radar serial port and optionally run the one-board smoke test."
+        description="Wait for a likely ESP32-S3 Capsule serial port and optionally run the one-board smoke test."
     )
     parser.add_argument("--timeout", default=os.environ.get("RADAR_PORT_WAIT_TIMEOUT", "300"), help="Seconds to wait, default: 300.")
     parser.add_argument("--interval", default=os.environ.get("RADAR_PORT_WAIT_INTERVAL", "2"), help="Polling interval seconds, default: 2.")
@@ -183,7 +183,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     selected = report.get("selectedPort") or "未选择"
     auto = report.get("autoCommand") or "未运行"
     lines = [
-        "# 龙珠雷达串口等待报告",
+        "# 胶囊串口等待报告",
         "",
         f"- 生成时间: {report['generated']}",
         f"- 状态: `{report['status']}`",
@@ -242,7 +242,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     if status in ("auto-passed", "ready"):
         lines.append("- 继续做完整验收：`RADAR_PORT=<选中串口> tools/run_release_acceptance.sh all`。")
     elif status == "multiple-candidates":
-        lines.append("- 拔掉其他 ESP32/USB 串口设备，只保留龙珠雷达主板后重跑。")
+        lines.append("- 拔掉其他 ESP32/USB 串口设备，只保留胶囊主板后重跑。")
     elif report.get("usbLayerStatus") == "radar-usb-present":
         lines.extend(
             [

@@ -2,11 +2,24 @@ import XCTest
 @testable import DragonRadarMVP
 
 final class RelayModelTests: XCTestCase {
+    @MainActor
+    func testLegacyPlaceholderUsernameIsNormalized() {
+        XCTAssertEqual(
+            SessionStore.normalizedDisplayName("胶囊用户"),
+            "Capsule Radar 用户"
+        )
+        XCTAssertEqual(
+            SessionStore.normalizedDisplayName("apple:internal-identifier"),
+            "Capsule Radar 用户"
+        )
+        XCTAssertEqual(SessionStore.normalizedDisplayName("隼人"), "隼人")
+    }
+
     func testRoomStateDecodesVoiceFloorAndVoiceStatus() throws {
         let json = """
         {
           "type": "room_state",
-          "room": "KAME-UNIT",
+          "room": "CAPS-UNIT",
           "server_time": 1781172600,
           "max_members": 7,
           "voice_floor": {
@@ -71,7 +84,7 @@ final class RelayModelTests: XCTestCase {
 
         let snapshot = try JSONDecoder().decode(RelayRoomStateSnapshot.self, from: json)
 
-        XCTAssertEqual(snapshot.room, "KAME-UNIT")
+        XCTAssertEqual(snapshot.room, "CAPS-UNIT")
         XCTAssertEqual(snapshot.maxMembers, 7)
         XCTAssertEqual(snapshot.voiceFloor?.speakerGroupID, "remote")
         XCTAssertEqual(snapshot.voiceFloor?.speakerPeerID, "remote-app")
@@ -86,7 +99,7 @@ final class RelayModelTests: XCTestCase {
     func testRoomStoreProjectsDistanceBearingAndSpeakingState() {
         let store = RoomsStore()
         let snapshot = RelayRoomStateSnapshot(
-            room: "KAME-UNIT",
+            room: "CAPS-UNIT",
             serverTime: 1_781_172_600,
             maxMembers: 7,
             voiceFloor: RelayVoiceFloorSnapshot(
@@ -165,15 +178,19 @@ final class RelayModelTests: XCTestCase {
             ]
         )
 
-        store.applyRelayRoomState(snapshot, localAppPeerID: "local-app")
+        store.applyRelayRoomState(
+            snapshot,
+            localAppPeerID: "local-app",
+            localDisplayName: "隼人"
+        )
 
-        XCTAssertEqual(store.inviteCode, "KAME-UNIT")
+        XCTAssertEqual(store.inviteCode, "CAPS-UNIT")
         XCTAssertEqual(store.roomCapacity, 7)
-        XCTAssertEqual(store.voiceQuality, "Remote 说话中")
+        XCTAssertEqual(store.roomStatus, "Remote 说话中")
         XCTAssertEqual(store.members.count, 2)
 
         let local = store.members[0]
-        XCTAssertEqual(local.name, "隼人 iPhone")
+        XCTAssertEqual(local.name, "隼人")
         XCTAssertEqual(local.distance, "本机")
         XCTAssertEqual(local.bearing, "0°")
 
@@ -192,7 +209,7 @@ final class RelayModelTests: XCTestCase {
     func testRoomStoreMarksStaleLocationInsteadOfProjectingFreshDistance() {
         let store = RoomsStore()
         let snapshot = RelayRoomStateSnapshot(
-            room: "KAME-STALE",
+            room: "CAPS-STALE",
             serverTime: 1_781_172_600,
             maxMembers: 7,
             voiceFloor: nil,
@@ -270,6 +287,210 @@ final class RelayModelTests: XCTestCase {
         XCTAssertEqual(
             error.errorDescription,
             "房间已满，最多 7 组。请让房主移除空闲成员，或创建新房间。"
+        )
+    }
+
+    func testRadarReminderDecodesRealtimePayload() throws {
+        let payload: [AnyHashable: Any] = [
+            "type": "radar_reminder",
+            "event_id": "rr_realtime_1",
+            "room": "CAPS-1001",
+            "sender_name": "成员甲",
+            "action": "open_radar",
+            "server_time": 1_784_000_000
+        ]
+
+        let reminder = try XCTUnwrap(RadarReminderEvent(payload: payload))
+
+        XCTAssertEqual(reminder.eventID, "rr_realtime_1")
+        XCTAssertEqual(reminder.roomCode, "CAPS-1001")
+        XCTAssertEqual(reminder.senderName, "成员甲")
+        XCTAssertEqual(reminder.action, "open_radar")
+        XCTAssertEqual(reminder.message, "成员甲提醒你查看雷达")
+    }
+
+    func testRadarReminderDecodesAPNsNestedPayload() throws {
+        let payload: [AnyHashable: Any] = [
+            "type": "radar_reminder",
+            "room_code": "CAPS-2002",
+            "data": [
+                "event_id": "rr_push_1",
+                "sender_name": "成员乙",
+                "action": "open_radar",
+                "server_time": 1_784_000_001
+            ]
+        ]
+
+        let reminder = try XCTUnwrap(RadarReminderEvent(payload: payload))
+
+        XCTAssertEqual(reminder.eventID, "rr_push_1")
+        XCTAssertEqual(reminder.roomCode, "CAPS-2002")
+        XCTAssertEqual(reminder.senderName, "成员乙")
+        XCTAssertEqual(reminder.serverTime, 1_784_000_001)
+    }
+
+    func testRadarReminderRejectsMalformedOrWrongTypePayload() {
+        XCTAssertNil(RadarReminderEvent(payload: ["type": "room_invite", "event_id": "rr_1"]))
+        XCTAssertNil(RadarReminderEvent(payload: ["type": "radar_reminder"]))
+    }
+
+    func testRadarReminderRateLimitUsesStableUserFacingText() {
+        let error = RoomRepositoryError.rateLimited(
+            code: "radar_reminder_rate_limited",
+            detail: nil,
+            retryAfter: 17
+        )
+
+        XCTAssertEqual(error.errorDescription, "提醒发送太频繁，请稍后再试。")
+        XCTAssertEqual(error.retryAfterSeconds, 17)
+    }
+
+    @MainActor
+    func testNotificationCenterDeduplicatesReminderAndRoutesOpenedNotification() async throws {
+        let center = NotificationPermissionCenter()
+        let payload: [AnyHashable: Any] = [
+            "type": "radar_reminder",
+            "event_id": "rr_center_1",
+            "room_code": "CAPS-3003",
+            "sender_name": "成员丙",
+            "action": "open_radar",
+            "server_time": 1_784_000_002
+        ]
+
+        NotificationCenter.default.post(name: .dragonRadarReminderReceived, object: payload)
+        await Task.yield()
+        XCTAssertEqual(center.latestRadarReminder?.senderName, "成员丙")
+        XCTAssertTrue(center.radarNavigationRequestID.isEmpty)
+
+        let duplicatePayload: [AnyHashable: Any] = [
+            "type": "radar_reminder",
+            "event_id": "rr_center_1",
+            "room_code": "CAPS-3003",
+            "sender_name": "不应覆盖",
+            "action": "open_radar"
+        ]
+        NotificationCenter.default.post(name: .dragonRadarReminderReceived, object: duplicatePayload)
+        await Task.yield()
+        XCTAssertEqual(center.latestRadarReminder?.senderName, "成员丙")
+
+        NotificationCenter.default.post(
+            name: .dragonRadarReminderReceived,
+            object: payload,
+            userInfo: ["opened": true]
+        )
+        await Task.yield()
+        XCTAssertEqual(center.radarNavigationRequestID, "rr_center_1")
+
+        center.consumeRadarNavigationRequest()
+        center.dismissRadarReminder(eventID: "rr_center_1")
+        XCTAssertTrue(center.radarNavigationRequestID.isEmpty)
+        XCTAssertNil(center.latestRadarReminder)
+
+        NotificationCenter.default.post(name: .dragonRadarReminderReceived, object: payload)
+        await Task.yield()
+        NotificationCenter.default.post(name: .dragonRadarAccountSignedOut, object: "")
+        await Task.yield()
+        XCTAssertNil(center.latestRadarReminder)
+        XCTAssertTrue(center.radarNavigationRequestID.isEmpty)
+
+        NotificationCenter.default.post(name: .dragonRadarReminderReceived, object: payload)
+        await Task.yield()
+        XCTAssertEqual(center.latestRadarReminder?.eventID, "rr_center_1")
+    }
+
+    @MainActor
+    func testReviewExperienceUsesLocalScenarioAndRestoresServerRoom() async {
+        let state = AppState(resetPersistentState: true)
+        state.sessionStore.apply(
+            AuthSession(
+                userID: "review-user",
+                displayName: "审核员",
+                appleUserID: "review-apple-user",
+                accessToken: "review-access-token",
+                refreshToken: "review-refresh-token",
+                expiresAt: Date(timeIntervalSinceNow: 3_600)
+            )
+        )
+        state.roomsStore.applyServerRoom(
+            ServerRoom(
+                roomID: "server-room-id",
+                roomCode: "REAL-1001",
+                name: "真实服务器房间",
+                maxMembers: 7,
+                memberCount: 1
+            )
+        )
+
+        state.startReviewExperience()
+
+        XCTAssertTrue(state.isReviewExperienceActive)
+        XCTAssertEqual(state.selectedTab, .radar)
+        XCTAssertEqual(state.displayRoomCode, "LOCAL-DEMO")
+        XCTAssertEqual(state.inviteCode, "REAL-1001", "演示房间不得覆盖持久化的真实房间码")
+        XCTAssertEqual(state.activeRoomName, "本地雷达体验房")
+        XCTAssertEqual(state.members.count, 4)
+        XCTAssertEqual(state.members.filter(\.isOnline).count, 3)
+        XCTAssertEqual(Set(state.members.map(\.distance)).count, 4)
+        XCTAssertEqual(Set(state.members.map(\.bearing)).count, 4)
+        XCTAssertTrue(state.activeSpeakers.isEmpty)
+
+        let reminder = await state.sendRadarReminderAndWait(roomCode: state.displayRoomCode)
+        XCTAssertFalse(reminder.succeeded)
+        XCTAssertEqual(reminder.message, "本地演示不会发送提醒或调用服务器")
+
+        state.stopReviewExperience()
+
+        XCTAssertFalse(state.isReviewExperienceActive)
+        XCTAssertEqual(state.selectedTab, .rooms)
+        XCTAssertEqual(state.displayRoomCode, "REAL-1001")
+        XCTAssertEqual(state.activeRoomName, "真实服务器房间")
+
+        state.roomsStore.clearRooms()
+        state.sessionStore.signOut()
+    }
+
+    func testRadarBlipsUseMemberBearingAndDistance() throws {
+        let north = makeRadarMember(name: "北侧", distance: "100m", bearing: "北 0°")
+        let east = makeRadarMember(name: "东侧", distance: "200m", bearing: "东 90°")
+
+        let blips = RadarBlipViewModel.make(from: [north, east])
+        let northPoint = try XCTUnwrap(blips.first { $0.id == north.id }).point(in: CGSize(width: 200, height: 200))
+        let eastPoint = try XCTUnwrap(blips.first { $0.id == east.id }).point(in: CGSize(width: 200, height: 200))
+
+        XCTAssertEqual(blips.count, 2)
+        XCTAssertEqual(RadarBlipViewModel.rangeText(for: blips), "250m")
+        XCTAssertEqual(northPoint.x, 100, accuracy: 0.01)
+        XCTAssertLessThan(northPoint.y, 100)
+        XCTAssertGreaterThan(eastPoint.x, 100)
+        XCTAssertEqual(eastPoint.y, 100, accuracy: 0.01)
+    }
+
+    func testRadarBlipsSkipMembersWithoutUsableLocation() {
+        let waiting = makeRadarMember(name: "等待", distance: "等待定位", bearing: "手机")
+        let paused = makeRadarMember(name: "暂停", distance: "定位已暂停", bearing: "隐私")
+
+        XCTAssertTrue(RadarBlipViewModel.make(from: [waiting, paused]).isEmpty)
+    }
+
+    private func makeRadarMember(name: String, distance: String, bearing: String) -> RoomMember {
+        RoomMember(
+            id: UUID(),
+            name: name,
+            distance: distance,
+            bearing: bearing,
+            accuracy: "±8m",
+            locationPaused: false,
+            isOnline: true,
+            isSpeaking: false,
+            isMuted: false,
+            voiceStatusText: "",
+            voiceCountdownText: "",
+            voiceHealthText: "",
+            deviceBattery: -1,
+            wifiRSSI: -999,
+            firmware: "",
+            lastUpdate: "刚刚",
+            role: "app"
         )
     }
 }

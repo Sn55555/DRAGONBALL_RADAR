@@ -46,7 +46,7 @@ iPhone-1 / iPhone-2 / iPhone-N ========+====+
 板载硬件使用：
 
 - 466x466 AMOLED：显示房间成员列表、选中成员位置、距离、方位、语音状态
-- CST9217 触摸：接听、静音、音量、页面切换
+- CST9217 触摸：北向校准、系统菜单、音量、亮度和 6/12 点屏幕方向切换
 - Wi-Fi：ESP 连接云端
 - BLE：iPhone 配对 ESP、配网、传本机定位摘要和状态
 - ES7210/双麦克风链路：ESP 采集语音
@@ -72,6 +72,7 @@ iPhone-1 / iPhone-2 / iPhone-N ========+====+
 - 播放远端语音
 - 通过 Wi-Fi 与云端保持 `wss://` 长连接
 - 通过 BLE 与 iPhone 完成配对、配网、设备绑定
+- 持久化本机 6/12 点握持方向，并让显示与触摸坐标共同旋转 180°；该设置不进入 Relay 或 LocationFrame
 
 ESP 不负责：
 
@@ -180,18 +181,28 @@ iPhone 写给 ESP，也上传给 Relay。
 ```c
 struct LocationFrame {
   uint8_t  version;          // 1
-  uint8_t  flags;            // bit0 valid, bit1 reduced_accuracy, bit2 heading_valid
+  uint8_t  flags;            // bit0 valid, bit1 reduced_accuracy, bit2 radar_heading_valid
   int32_t  lat_e7;           // latitude * 1e7
   int32_t  lon_e7;           // longitude * 1e7
   int32_t  altitude_cm;      // altitude meters * 100, unknown = INT32_MIN
   uint16_t h_accuracy_cm;    // horizontal accuracy
   uint16_t v_accuracy_cm;    // vertical accuracy
   uint16_t speed_cms;        // speed m/s * 100
-  uint16_t course_deg100;    // course degrees * 100
-  uint16_t heading_deg100;   // compass heading degrees * 100
+  uint16_t course_deg100;    // 行进方向 degrees * 100，不代表设备朝向
+  uint16_t heading_deg100;   // 雷达本体绝对朝向 * 100；bit2=0 时必须忽略
   uint32_t unix_time_s;
 };
 ```
+
+当前 v1 合同必须遵守以下边界：
+
+- iPhone 通常放在口袋中，手机 `CLHeading` 与手持雷达 12 点方向不存在可验证的姿态关系。
+- App 因此始终令 `radar_heading_valid`（bit2）为 `0`，并把 `heading_deg100` 写为 `0`；手机航向只允许进入本机诊断，不上传 Relay，也不能用于旋转雷达目标。
+- `course_deg100` 是 GPS 行进方向，只能用于成员运动标记，不能替代雷达朝向。
+- 当前 QMI8658 提供无感陀螺零偏校准、倾斜补偿和相对 yaw。启动动画结束后，ESP 只在本次真实开机显示一次北向零点教学提示；用户将雷达尽量平放、把机身零点/屏幕 12 点方向对准真北 N，并静止长按屏幕 1.2 秒。BOOT 短按只关闭提示并切换成员，不能重新唤出或触发校准；提示关闭后不再显示教学层，但主雷达静止长按 1.2 秒的校准入口永久可用，已校准时再次长按会覆盖旧偏移。设此刻 QMI 逆时针相对 yaw 为 `G0`，会话偏移 `C = wrap360(-G0)`，统一屏幕旋转 `R = wrap360(G+C)`，任一成员真北方位 `B_i` 的屏幕角为 `wrap360(B_i+R)`。
+- 校准只接受 QMI `RelativeStable`、250ms 内的新样本和不高于 3°/s 的角速度；不再使用成员 GPS 方位、成员距离、GPS 精度或手机 `CLHeading` 建立偏移。严格静止验证得到的零偏会立即保存；后续开机只有在保存结构有效、当前/保存温度均可用且温差不超过 6°C 时才直接复用，待机只清相对 yaw 与北向偏移、不清该可信零偏。物理触摸满 1.2 秒后即消费为长按；若首次使用或温差过大，手指仍按住时继续严格学习，在线学习显示 `HOLD STILL`，只有 IMU 离线或样本过期显示 `IMU WAIT`。松手前仍未通过则保持未校准且不得再误判为短触；成功只表示用户已设定北向零点，固件无法验证机身是否真的对准真北。
+- GPS 只更新东/北世界坐标，不参与旋转偏移。远程定位先做精度相关平滑，再按原有半格步长吸附并增加换格滞回，最后让绿色网格、成员和运动方向使用同一帧旋转矩阵整体转动；主雷达不额外绘制外圈 `N` 或目标真实方位刻度线。
+- 北向偏移是雷达本机的 IMU 会话状态，不设置 LocationFrame bit2，也不写入 NVS。切成员、切房、GPS 更新和网络重连不得修改；熄屏且 IMU 持续运行时保留；待机、重启、IMU 重置或积分采样断档时清除。只有真实重启会重新显示一次教学提示；待机唤醒或运行中断档不弹提示，用户通过常驻长按手势重新校准。将来只有雷达本体产生经过质量门限验证的绝对航向时，才允许设置 bit2；旧 App/Relay 仍按 bit2=0 兼容。
 
 ### ESP WebSocket
 
@@ -230,6 +241,12 @@ wss://api.example.com/v1/radar/device/ws?device_id=<id>
 | `voice_frame` | 当前抢麦者发给其他设备的语音帧 |
 | `voice_busy` | 本机抢麦失败，房间已有发言者 |
 | `config_update` | 服务器配置 |
+
+App 房间提醒使用独立的受鉴权命令和定向事件：
+
+- `POST /v1/rooms/{room_code}/radar-reminders`：仅房间成员可调用，服务端从持久成员关系派生其他收件人，不接受客户端指定目标、标题或跳转链接。
+- `radar_reminder`：只定向发送给收件人的 App WebSocket；相同事件同时尝试通过 APNs 覆盖后台或离线 App，ESP 不接收。
+- 服务端按 `room + sender` 做业务冷却和请求幂等，响应只返回收件人数、在线投递数和聚合推送状态，不暴露用户 ID、member/group ID 或设备 token。
 
 ## 7 人房间抢麦语音
 
@@ -338,6 +355,9 @@ ESP 屏幕不能同时清晰展示大量成员，首版 UI 采用两层：
 - 成员页：触摸选择一个成员后，显示该成员的大号距离、方位、精度和通话状态。
 - 语音覆盖层：显示当前活跃发声成员，最多同时显示 3 个名称，其余用 `+N` 表示。
 
+雷达端用户 UI 的完整屏幕状态、异常文案、PTT 反馈、设置页和验收标准见
+`docs/esp-radar-ui-spec.zh.md`。该文档是固件 UI 调整的产品合同；架构文档只保留职责和数据流。
+
 ## 服务端数据模型
 
 ```text
@@ -407,7 +427,7 @@ voice_member_states
   - 下发 Relay URL、device token、room token
 
 - `LocationModule`
-  - CoreLocation 获取定位、速度、course、heading
+  - CoreLocation 获取定位、速度和 course；手机 heading 仅用于诊断，不充当雷达 heading
   - 上传到 Relay
   - 写入 ESP `local_location`
 

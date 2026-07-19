@@ -80,10 +80,27 @@ struct AccountView: View {
                     .buttonStyle(.plain)
                 }
 
+                MangaPanel("安全与社区") {
+                    Text("查看社区规则，管理已屏蔽成员，并在需要时解除屏蔽。")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(MangaTheme.subtle)
+
+                    NavigationLink {
+                        SafetyCommunityView()
+                    } label: {
+                        AccountNavigationRow(
+                            title: "安全与社区",
+                            detail: "举报说明、屏蔽列表与社区规则",
+                            symbol: "checkmark.shield.fill"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("account.safety.open")
+                }
+
                 MangaPanel("系统状态") {
                     InfoRow(label: "活跃房间", value: appState.activeRoomName)
                     InfoRow(label: "在线成员", value: "\(appState.onlineMembers)/7")
-                    InfoRow(label: "语音", value: appState.voiceQuality)
                     InfoRow(label: "定位", value: locationBridge.uploadReadinessText)
                 }
 
@@ -101,6 +118,178 @@ struct AccountView: View {
                 await notificationCenter.refresh()
             }
         }
+    }
+}
+
+struct SafetyCommunityView: View {
+    @Environment(AppState.self) private var appState
+    @State private var loadPhase: AppOperationPhase = .idle
+    @State private var unblockTarget: UserBlockRecord?
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 18) {
+                MangaPanel("社区规则") {
+                    CommunityRuleRow(
+                        symbol: "person.2.fill",
+                        title: "尊重房间成员",
+                        detail: "不得骚扰、威胁、仇恨攻击、冒充他人或传播不当内容。"
+                    )
+                    CommunityRuleRow(
+                        symbol: "hand.raised.fill",
+                        title: "保护位置与隐私",
+                        detail: "不要擅自公开他人的位置、身份或房间信息。"
+                    )
+                    CommunityRuleRow(
+                        symbol: "exclamationmark.bubble.fill",
+                        title: "及时举报",
+                        detail: "在房间成员右侧菜单提交举报，并保存 DR 案件号。紧急危险请联系当地紧急服务。"
+                    )
+                }
+
+                MangaPanel("已屏蔽成员") {
+                    Text("屏蔽后双方不能加入同一房间。为保护双方隐私，此处不显示账号标识。")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(MangaTheme.subtle)
+
+                    if loadPhase.isLoading && appState.blockedUsers.isEmpty {
+                        ProgressView("正在加载")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else if appState.blockedUsers.isEmpty {
+                        Label("暂无已屏蔽成员", systemImage: "person.crop.circle.badge.checkmark")
+                            .font(.headline.weight(.black))
+                            .padding(.vertical, 8)
+                            .accessibilityIdentifier("account.safety.blocks.empty")
+                    } else {
+                        LazyVStack(spacing: 0) {
+                            ForEach(appState.blockedUsers) { block in
+                                BlockedMemberRow(block: block) {
+                                    unblockTarget = block
+                                }
+                            }
+                        }
+                    }
+
+                    if loadPhase != .idle {
+                        OperationStatusView(phase: loadPhase)
+                            .accessibilityIdentifier("account.safety.status")
+                    }
+                }
+            }
+            .padding(18)
+        }
+        .background(MangaBackground())
+        .navigationTitle("安全与社区")
+        .accessibilityIdentifier("account.safety.screen")
+        .task {
+            await refreshBlocks()
+        }
+        .refreshable {
+            await refreshBlocks()
+        }
+        .confirmationDialog(
+            "解除屏蔽？",
+            isPresented: Binding(
+                get: { unblockTarget != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        unblockTarget = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("解除屏蔽") {
+                guard let block = unblockTarget else { return }
+                unblockTarget = nil
+                Task { await unblock(block) }
+            }
+            .accessibilityIdentifier("account.safety.unblock.confirm")
+            Button("取消", role: .cancel) {
+                unblockTarget = nil
+            }
+        } message: {
+            Text("解除后不会自动恢复原房间关系；双方仍需重新加入房间。")
+        }
+    }
+
+    @MainActor
+    private func refreshBlocks() async {
+        loadPhase = .loading
+        let result = await appState.refreshBlockedUsersFromServer()
+        loadPhase = result.succeeded ? .success(result.message) : .failed(result.message)
+    }
+
+    @MainActor
+    private func unblock(_ block: UserBlockRecord) async {
+        loadPhase = .loading
+        let result = await appState.unblockAndWait(blockID: block.blockID)
+        loadPhase = result.succeeded ? .success(result.message) : .failed(result.message)
+    }
+}
+
+private struct CommunityRuleRow: View {
+    var symbol: String
+    var title: String
+    var detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol)
+                .font(.headline.weight(.black))
+                .frame(width: 34, height: 34)
+                .background(MangaTheme.panelLight, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(MangaTheme.ink, lineWidth: 1.7))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.headline.weight(.black))
+                Text(detail)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(MangaTheme.subtle)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct BlockedMemberRow: View {
+    var block: UserBlockRecord
+    var unblockAction: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "person.crop.circle.badge.xmark")
+                .font(.headline.weight(.black))
+                .frame(width: 34, height: 34)
+                .background(MangaTheme.panelLight, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(MangaTheme.ink, lineWidth: 1.7))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("已屏蔽成员")
+                    .font(.headline.weight(.black))
+                    .accessibilityIdentifier("account.safety.block.\(block.blockID)")
+                Text("房间 \(block.roomCode) · \(createdDateText)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(MangaTheme.subtle)
+                Text("记录 \(String(block.blockID.suffix(6)))")
+                    .font(.caption2.monospaced().weight(.semibold))
+                    .foregroundStyle(MangaTheme.subtle)
+            }
+
+            Spacer()
+
+            Button("解除屏蔽", action: unblockAction)
+                .font(.caption.weight(.black))
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("account.safety.unblock.\(block.blockID)")
+        }
+        .padding(.vertical, 7)
+    }
+
+    private var createdDateText: String {
+        Date(timeIntervalSince1970: TimeInterval(block.createdAt))
+            .formatted(date: .abbreviated, time: .omitted)
     }
 }
 
@@ -253,6 +442,9 @@ private struct AuthPanel: View {
     @Environment(LocationBridge.self) private var locationBridge
     @Environment(RadarRuntime.self) private var radarRuntime
     @State private var authPhase: AppOperationPhase = .idle
+    @State private var deletePhase: AppOperationPhase = .idle
+    @State private var showsDeleteConfirmation = false
+    @State private var appleSignInNonce = ""
 
     var body: some View {
         MangaPanel("账号会话") {
@@ -268,18 +460,40 @@ private struct AuthPanel: View {
                         Task {
                             await radarRuntime.pauseLocationSharing()
                             locationBridge.stopSharing(markUserPaused: true)
-                            await radarRuntime.stopObservingVoiceRoom()
                             radarRuntime.disconnectRelay()
-                            appState.signOut()
-                            authPhase = .idle
+                            let result = await appState.signOutAndWait()
+                            authPhase = result.succeeded ? .success(result.message) : .failed(result.message)
                         }
                     } label: {
                         Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
                     }
                     .buttonStyle(InkButtonStyle(filled: false))
+
+                    Divider()
+
+                    Text("删除账户会永久删除你创建的房间、成员关系、推送记录和诊断数据，且无法恢复。")
+                        .font(.caption)
+                        .foregroundStyle(MangaTheme.subtle)
+
+                    Button(role: .destructive) {
+                        showsDeleteConfirmation = true
+                    } label: {
+                        Label("永久删除账户", systemImage: "trash")
+                    }
+                    .buttonStyle(InkButtonStyle(filled: false))
+                    .disabled(deletePhase.isLoading)
+                    .accessibilityIdentifier("account.auth.delete")
                 } else {
                     SignInWithAppleButton(.signIn) { request in
                         request.requestedScopes = [.fullName]
+                        do {
+                            let nonce = try AppleSignInNonce.make()
+                            appleSignInNonce = nonce
+                            request.nonce = AppleSignInNonce.sha256(nonce)
+                        } catch {
+                            appleSignInNonce = ""
+                            authPhase = .failed("无法启动安全的 Apple 登录，请重试。")
+                        }
                     } onCompletion: { result in
                         handleAppleSignIn(result)
                     }
@@ -304,25 +518,46 @@ private struct AuthPanel: View {
             }
         }
         .accessibilityIdentifier("account.auth.panel")
+        .confirmationDialog(
+            "永久删除账户？",
+            isPresented: $showsDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("删除账户和全部数据", role: .destructive) {
+                Task { await deleteAccount() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("此操作无法撤销。你拥有的房间也会被删除。")
+        }
     }
 
     private func handleAppleSignIn(_ result: Result<ASAuthorization, Error>) {
+        let rawNonce = appleSignInNonce
+        appleSignInNonce = ""
         switch result {
         case .success(let authorization):
             guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
                 authPhase = .failed("Apple 登录凭证无效。请重试。")
                 return
             }
-            Task { await signInWithApple(credential: credential) }
+            guard !rawNonce.isEmpty else {
+                authPhase = .failed("Apple 登录安全校验失败，请重试。")
+                return
+            }
+            Task { await signInWithApple(credential: credential, rawNonce: rawNonce) }
         case .failure(let error):
             authPhase = .failed("Apple 登录取消或失败 · \(AppError.userFacingMessage(for: error))")
         }
     }
 
     @MainActor
-    private func signInWithApple(credential: ASAuthorizationAppleIDCredential) async {
+    private func signInWithApple(
+        credential: ASAuthorizationAppleIDCredential,
+        rawNonce: String
+    ) async {
         authPhase = .loading
-        let result = await appState.signInWithAppleAndWait(credential: credential)
+        let result = await appState.signInWithAppleAndWait(credential: credential, rawNonce: rawNonce)
         authPhase = result.succeeded ? .success(result.message) : .failed(result.message)
     }
 
@@ -333,7 +568,23 @@ private struct AuthPanel: View {
         authPhase = result.succeeded ? .success(result.message) : .failed(result.message)
     }
 
+    @MainActor
+    private func deleteAccount() async {
+        deletePhase = .loading
+        await radarRuntime.pauseLocationSharing()
+        locationBridge.stopSharing(markUserPaused: true)
+        radarRuntime.disconnectRelay()
+        let result = await appState.deleteAccountAndWait()
+        deletePhase = result.succeeded ? .success(result.message) : .failed(result.message)
+    }
+
     private var visibleAuthPhase: AppOperationPhase {
+        switch deletePhase {
+        case .idle:
+            break
+        default:
+            return deletePhase
+        }
         if appState.isSignedIn, case .idle = authPhase {
             return .success("已登录 · \(appState.displayName)")
         }
@@ -453,6 +704,18 @@ struct PrivacyPermissionsView: View {
                         }
                         .buttonStyle(InkButtonStyle(filled: locationBridge.isSharing))
                     }
+
+                    if locationBridge.authorizationStatus != .authorizedAlways {
+                        Text("只有你主动开启后，App 才会申请“始终允许”，用于手机放入口袋或锁屏后继续向当前房间共享位置。")
+                            .font(.caption)
+                            .foregroundStyle(MangaTheme.subtle)
+                        Button {
+                            locationBridge.requestBackgroundAccess()
+                        } label: {
+                            Label("开启口袋/锁屏共享", systemImage: "lock.iphone")
+                        }
+                        .buttonStyle(InkButtonStyle(filled: false))
+                    }
                 }
 
                 MangaPanel("蓝牙配置") {
@@ -465,7 +728,7 @@ struct PrivacyPermissionsView: View {
                 MangaPanel("推送通知") {
                     InfoRow(label: "授权", value: notificationCenter.statusText)
                     InfoRow(label: "投递", value: notificationCenter.deliveryText)
-                    InfoRow(label: "用途", value: "房间邀请、雷达离线、语音占用提醒")
+                    InfoRow(label: "用途", value: "查看雷达提醒和房间邀请")
 
                     if !notificationCenter.lastError.isEmpty {
                         Text(notificationCenter.lastError)
@@ -492,6 +755,13 @@ struct PrivacyPermissionsView: View {
                     }
                 }
 
+                MangaPanel("政策与支持") {
+                    Text("可在这里查看隐私政策、服务条款和联系支持。账户永久删除入口位于“我的 > 账号会话”。")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(MangaTheme.subtle)
+                    LegalSupportLinksView(includeSupport: true)
+                }
+
             }
             .padding(18)
         }
@@ -506,7 +776,6 @@ struct PrivacyPermissionsView: View {
 struct LocationBridgePanel: View {
     @Environment(LocationBridge.self) private var locationBridge
     @Environment(RadarRuntime.self) private var radarRuntime
-    @Environment(BLEDeviceBridge.self) private var bleBridge
 
     var body: some View {
         MangaPanel("iPhone 定位桥接") {

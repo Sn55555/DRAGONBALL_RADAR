@@ -15,20 +15,26 @@ targets:
     sources:
       - DragonRadarMVP/Sources
       - DragonRadarMVP/Assets.xcassets
+      - path: DragonRadarMVP/PrivacyInfo.xcprivacy
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sn5.DragonRadarMVP
+        TARGETED_DEVICE_FAMILY: 1
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
       configs:
         Debug:
           INFOPLIST_FILE: DragonRadarMVP/Info-Debug.plist
-          CODE_SIGN_ENTITLEMENTS: ""
+          CODE_SIGN_ENTITLEMENTS: DragonRadarMVP/DragonRadarMVP.entitlements
           APS_ENVIRONMENT: development
           DRAGON_RADAR_ENVIRONMENT: Debug
           DRAGON_RADAR_HTTP_API_BASE_URL: http://139.224.41.192:8788
           DRAGON_RADAR_RELAY_BASE_URL: ws://139.224.41.192:8787
+          DRAGON_RADAR_PRIVACY_POLICY_URL: ""
+          DRAGON_RADAR_TERMS_OF_SERVICE_URL: ""
+          DRAGON_RADAR_SUPPORT_URL: ""
         Release:
           INFOPLIST_FILE: DragonRadarMVP/Info.plist
           CODE_SIGN_ENTITLEMENTS: DragonRadarMVP/DragonRadarMVP.entitlements
@@ -36,6 +42,9 @@ targets:
           DRAGON_RADAR_ENVIRONMENT: Production
           DRAGON_RADAR_HTTP_API_BASE_URL: https://relay.dragon-radar.example
           DRAGON_RADAR_RELAY_BASE_URL: wss://relay.dragon-radar.example
+          DRAGON_RADAR_PRIVACY_POLICY_URL: ""
+          DRAGON_RADAR_TERMS_OF_SERVICE_URL: ""
+          DRAGON_RADAR_SUPPORT_URL: ""
   DragonRadarMVPTests:
     type: bundle.unit-test
     platform: iOS
@@ -46,6 +55,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sn5.DragonRadarMVPTests
+        GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/DragonRadarMVP.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/DragonRadarMVP"
         BUNDLE_LOADER: "$(TEST_HOST)"
   DragonRadarMVPUITests:
@@ -58,6 +68,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sn5.DragonRadarMVPUITests
+        GENERATE_INFOPLIST_FILE: YES
         TEST_TARGET_NAME: DragonRadarMVP
 schemes:
   DragonRadarMVP:
@@ -70,3 +81,11 @@ schemes:
       targets:
         - DragonRadarMVPTests
         - DragonRadarMVPUITests
+  DragonRadarMVPUnitTests:
+    build:
+      targets:
+        DragonRadarMVP: all
+        DragonRadarMVPTests: [test]
+    test:
+      targets:
+        - DragonRadarMVPTests

@@ -1,6 +1,6 @@
 # DragonRadarMVP
 
-Native SwiftUI MVP for the Dragon Radar companion iOS app.
+Native SwiftUI MVP for the Capsule companion iOS app.
 
 ## Scope
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 URL="${1:-ws://139.224.41.192:8787}"
-ROOM="${2:-KAME-07}"
+ROOM="${2:-CAPS-07}"
 LOCAL_GROUP="${3:-A17C}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIM="${ROOT}/tools/simulate_mac_room_member.py"

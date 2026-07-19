@@ -10,6 +10,9 @@ struct AppEnvironment: Hashable {
     var name: Name
     var httpAPIBaseURL: String
     var relayBaseURL: String
+    var privacyPolicyURL: URL?
+    var termsOfServiceURL: URL?
+    var supportURL: URL?
 
     static let current = AppEnvironment(bundle: .main)
 
@@ -22,6 +25,9 @@ struct AppEnvironment: Hashable {
         let fallback = Self.defaults(for: parsedName)
         let http = Self.stringValue(info["DragonRadarHTTPBaseURL"])
         let relay = Self.stringValue(info["DragonRadarRelayBaseURL"])
+        privacyPolicyURL = Self.publicHTTPSURL(info["DragonRadarPrivacyPolicyURL"])
+        termsOfServiceURL = Self.publicHTTPSURL(info["DragonRadarTermsOfServiceURL"])
+        supportURL = Self.publicHTTPSURL(info["DragonRadarSupportURL"])
 
         if parsedName == .production {
             httpAPIBaseURL = Self.secureURL(http, allowedScheme: "https") ?? fallback.http
@@ -32,10 +38,20 @@ struct AppEnvironment: Hashable {
         }
     }
 
-    init(name: Name, httpAPIBaseURL: String, relayBaseURL: String) {
+    init(
+        name: Name,
+        httpAPIBaseURL: String,
+        relayBaseURL: String,
+        privacyPolicyURL: URL? = nil,
+        termsOfServiceURL: URL? = nil,
+        supportURL: URL? = nil
+    ) {
         self.name = name
         self.httpAPIBaseURL = httpAPIBaseURL
         self.relayBaseURL = relayBaseURL
+        self.privacyPolicyURL = privacyPolicyURL
+        self.termsOfServiceURL = termsOfServiceURL
+        self.supportURL = supportURL
     }
 
     var isProduction: Bool {
@@ -70,6 +86,19 @@ struct AppEnvironment: Hashable {
             return nil
         }
         return value
+    }
+
+    private static func publicHTTPSURL(_ value: Any?) -> URL? {
+        let rawValue = stringValue(value)
+        guard
+            let components = URLComponents(string: rawValue),
+            components.scheme == "https",
+            components.host?.isEmpty == false,
+            let url = components.url
+        else {
+            return nil
+        }
+        return url
     }
 
     private static func stringValue(_ value: Any?) -> String {

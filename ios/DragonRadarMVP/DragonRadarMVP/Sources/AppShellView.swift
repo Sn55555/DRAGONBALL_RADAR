@@ -3,6 +3,8 @@ import SwiftUI
 
 struct AppShellView: View {
     @Environment(AppState.self) private var appState
+    @Environment(NotificationPermissionCenter.self) private var notificationCenter
+    @State private var routingReminderID = ""
 
     var body: some View {
         Group {
@@ -17,6 +19,33 @@ struct AppShellView: View {
         .tint(MangaTheme.ink)
         .preferredColorScheme(.light)
         .animation(.easeInOut(duration: 0.22), value: appState.isSignedIn)
+        .overlay(alignment: .top) {
+            if appState.isSignedIn, let reminder = notificationCenter.latestRadarReminder {
+                RadarReminderBanner(
+                    reminder: reminder,
+                    openAction: { openRadar(reminder) },
+                    dismissAction: { notificationCenter.dismissRadarReminder(eventID: reminder.eventID) }
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: notificationCenter.latestRadarReminder?.eventID)
+        .onAppear {
+            routeNotificationIfNeeded()
+        }
+        .onChange(of: notificationCenter.radarNavigationRequestID) { _, _ in
+            routeNotificationIfNeeded()
+        }
+        .onChange(of: appState.isSignedIn) { _, isSignedIn in
+            if isSignedIn {
+                routeNotificationIfNeeded()
+            }
+        }
+        .onChange(of: appState.sessionRestorationCompleted) { _, completed in
+            if completed {
+                routeNotificationIfNeeded()
+            }
+        }
     }
 
     private var signedInShell: some View {
@@ -42,17 +71,91 @@ struct AppShellView: View {
             RadarOverviewView()
         case .rooms:
             RoomsView()
+        #if !APP_ONLY
         case .devices:
             DevicesView()
+        #endif
         case .account:
             AccountView()
         }
+    }
+
+    private func openRadar(_ reminder: RadarReminderEvent) {
+        guard routingReminderID != reminder.eventID else { return }
+        routingReminderID = reminder.eventID
+        Task {
+            let result = await appState.openRadarReminder(roomCode: reminder.roomCode)
+            if result != .retryable {
+                notificationCenter.consumeRadarNavigationRequest(eventID: reminder.eventID)
+                notificationCenter.dismissRadarReminder(eventID: reminder.eventID)
+            }
+            routingReminderID = ""
+        }
+    }
+
+    private func routeNotificationIfNeeded() {
+        guard
+            appState.isSignedIn,
+            appState.sessionRestorationCompleted,
+            let reminder = notificationCenter.latestRadarReminder,
+            notificationCenter.radarNavigationRequestID == reminder.eventID
+        else { return }
+        openRadar(reminder)
+    }
+}
+
+private struct RadarReminderBanner: View {
+    var reminder: RadarReminderEvent
+    var openAction: () -> Void
+    var dismissAction: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "bell.badge.fill")
+                .font(.title3.weight(.black))
+                .frame(width: 38, height: 38)
+                .background(MangaTheme.ink, in: Circle())
+                .foregroundStyle(MangaTheme.paper)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(reminder.message)
+                    .font(.headline.weight(.black))
+                if !reminder.roomCode.isEmpty {
+                    Text("房间 \(reminder.roomCode)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(MangaTheme.subtle)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Button("查看雷达", action: openAction)
+                .font(.caption.weight(.black))
+                .buttonStyle(.borderedProminent)
+                .tint(MangaTheme.ink)
+                .accessibilityIdentifier("radar.reminder.open")
+
+            Button(action: dismissAction) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.black))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭提醒")
+        }
+        .padding(12)
+        .background(MangaTheme.panelLight, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(MangaTheme.ink, lineWidth: 2))
+        .shadow(color: .black.opacity(0.18), radius: 0, x: 3, y: 3)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .accessibilityIdentifier("radar.reminder.banner")
     }
 }
 
 private struct LoginGateView: View {
     @Environment(AppState.self) private var appState
     @State private var authPhase: AppOperationPhase = .idle
+    @State private var appleSignInNonce = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -87,6 +190,14 @@ private struct LoginGateView: View {
 
                     SignInWithAppleButton(.signIn) { request in
                         request.requestedScopes = [.fullName]
+                        do {
+                            let nonce = try AppleSignInNonce.make()
+                            appleSignInNonce = nonce
+                            request.nonce = AppleSignInNonce.sha256(nonce)
+                        } catch {
+                            appleSignInNonce = ""
+                            authPhase = .failed("无法启动安全的 Apple 登录，请重试。")
+                        }
                     } onCompletion: { result in
                         handleAppleSignIn(result)
                     }
@@ -97,6 +208,8 @@ private struct LoginGateView: View {
                     .disabled(authPhase.isLoading)
                     .opacity(authPhase.isLoading ? 0.55 : 1)
                     .accessibilityIdentifier("login.gate.apple.signin")
+
+                    LegalSupportLinksView(includeSupport: false)
 
                     #if DEBUG
                     Button {
@@ -120,22 +233,31 @@ private struct LoginGateView: View {
     }
 
     private func handleAppleSignIn(_ result: Result<ASAuthorization, Error>) {
+        let rawNonce = appleSignInNonce
+        appleSignInNonce = ""
         switch result {
         case .success(let authorization):
             guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
                 authPhase = .failed("Apple 登录凭证无效。请重试。")
                 return
             }
-            Task { await signInWithApple(credential: credential) }
+            guard !rawNonce.isEmpty else {
+                authPhase = .failed("Apple 登录安全校验失败，请重试。")
+                return
+            }
+            Task { await signInWithApple(credential: credential, rawNonce: rawNonce) }
         case .failure(let error):
             authPhase = .failed("Apple 登录取消或失败 · \(AppError.userFacingMessage(for: error))")
         }
     }
 
     @MainActor
-    private func signInWithApple(credential: ASAuthorizationAppleIDCredential) async {
+    private func signInWithApple(
+        credential: ASAuthorizationAppleIDCredential,
+        rawNonce: String
+    ) async {
         authPhase = .loading
-        let result = await appState.signInWithAppleAndWait(credential: credential)
+        let result = await appState.signInWithAppleAndWait(credential: credential, rawNonce: rawNonce)
         authPhase = result.succeeded ? .success(result.message) : .failed(result.message)
     }
 
@@ -147,9 +269,48 @@ private struct LoginGateView: View {
     }
 }
 
+struct LegalSupportLinksView: View {
+    var includeSupport: Bool
+    private let environment = AppEnvironment.current
+
+    var body: some View {
+        Group {
+            if hasAnyLink {
+                HStack(spacing: 14) {
+                    if let url = environment.privacyPolicyURL {
+                        Link("隐私政策", destination: url)
+                            .accessibilityIdentifier("legal.privacy")
+                    }
+                    if let url = environment.termsOfServiceURL {
+                        Link("服务条款", destination: url)
+                            .accessibilityIdentifier("legal.terms")
+                    }
+                    if includeSupport, let url = environment.supportURL {
+                        Link("联系支持", destination: url)
+                            .accessibilityIdentifier("legal.support")
+                    }
+                }
+            } else {
+                Text("政策与支持链接待配置")
+                    .foregroundStyle(MangaTheme.warning)
+                    .accessibilityIdentifier("legal.links.missing")
+            }
+        }
+        .font(.caption.weight(.bold))
+        .foregroundStyle(MangaTheme.subtle)
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private var hasAnyLink: Bool {
+        environment.privacyPolicyURL != nil
+            || environment.termsOfServiceURL != nil
+            || (includeSupport && environment.supportURL != nil)
+    }
+}
+
 private struct LoginMangaTitle: View {
-    private let title = "DragonBall Radar"
-    private let titleFont = Font.custom("Futura-CondensedExtraBold", size: 56, relativeTo: .largeTitle)
+    private let title = "CAPSULE"
+    private let titleFont = Font.custom("Futura-CondensedExtraBold", size: 62, relativeTo: .largeTitle)
 
     var body: some View {
         ZStack {
@@ -167,8 +328,8 @@ private struct LoginMangaTitle: View {
                 .foregroundStyle(MangaTheme.ink)
         }
         .frame(maxWidth: .infinity)
+        .frame(height: 76)
         .padding(.horizontal, 2)
-        .scaleEffect(x: 0.94, y: 1.34, anchor: .center)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
         .accessibilityIdentifier("login.gate.title")
@@ -178,7 +339,9 @@ private struct LoginMangaTitle: View {
         Text(title)
             .font(titleFont)
             .lineLimit(1)
-            .minimumScaleFactor(0.78)
+            .minimumScaleFactor(0.62)
+            .allowsTightening(true)
+            .scaleEffect(x: 0.92, y: 1.16, anchor: .center)
     }
 
     private var titleOffsets: [CGSize] {

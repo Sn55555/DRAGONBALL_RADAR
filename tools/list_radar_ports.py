@@ -34,7 +34,7 @@ class PortInfo:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="List serial ports and identify likely Dragon Radar ESP32-S3 ports.")
+    parser = argparse.ArgumentParser(description="List serial ports and identify likely Capsule ESP32-S3 ports.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--shell", action="store_true", help="Print an export command when one likely port is found.")
     parser.add_argument("--require", action="store_true", help="Exit nonzero unless exactly one likely port is found.")
@@ -102,7 +102,7 @@ def collect_ports(samples: list[str]) -> list[PortInfo]:
 
 
 def print_text(ports: list[PortInfo]) -> None:
-    print("Dragon Radar Serial Ports")
+    print("Capsule Serial Ports")
     if not ports:
         print("No serial ports found.")
         print("Connect the ESP32-S3 board, then rerun: tools/list_radar_ports.py")

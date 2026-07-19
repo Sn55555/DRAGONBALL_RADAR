@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 
@@ -9,11 +10,24 @@ enum RuntimePhase: String {
     case failed = "失败"
 }
 
+private enum RelayConnectionError: LocalizedError {
+    case rejected(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .rejected(let detail):
+            return detail
+        }
+    }
+}
+
 enum RoomSwitchState: String {
     case idle = "未切房"
     case appSwitching = "App 切房中"
+    #if !APP_ONLY
     case notifyingESP = "通知雷达"
     case waitingESPJoin = "等待雷达"
+    #endif
     case synced = "已同步"
     case failed = "同步失败"
 }
@@ -21,9 +35,13 @@ enum RoomSwitchState: String {
 enum DragonRadarProtocol {
     static let appProtocolVersion = 2
     static let minRelayProtocolVersion = 2
+    #if !APP_ONLY
     static let minDeviceProtocolVersion = 2
+    #endif
     static let locationFrameVersion = 1
+    #if !APP_ONLY
     static let voiceProtocolVersion = 1
+    #endif
 
     static var appVersionText: String {
         let bundle = Bundle.main
@@ -38,7 +56,9 @@ struct LocationSnapshot: Hashable {
     var lonE7: Int32
     var horizontalAccuracyCM: UInt16
     var speedCMS: UInt16
-    var courseDeg100: UInt16
+    var courseDeg100: UInt16?
+    var phoneHeading: PhoneHeadingSnapshot?
+    var isReducedAccuracy: Bool
     var timestamp: Date
 
     var coordinateText: String {
@@ -50,21 +70,29 @@ struct LocationSnapshot: Hashable {
     }
 
     var frameSummary: String {
-        "v1 lat_e7=\(latE7) lon_e7=\(lonE7) h_acc_cm=\(horizontalAccuracyCM)"
+        let phoneHeadingSummary = phoneHeading.map {
+            "\($0.reference.rawValue)/\($0.quality().rawValue)"
+        } ?? "unavailable"
+        return "v1 lat_e7=\(latE7) lon_e7=\(lonE7) h_acc_cm=\(horizontalAccuracyCM) "
+            + "course_valid=\(courseDeg100 != nil) phone_heading=\(phoneHeadingSummary) radar_heading_valid=false"
     }
 
     var locationFrameData: Data {
         var data = Data()
         data.appendUInt8(1)
-        data.appendUInt8(0b0000_0001)
+        // LocationFrame v1 bit 2 means the heading belongs to the radar itself.
+        // An iPhone carried in a pocket has no verified yaw relationship to the
+        // separate radar, so phone compass data must never set that bit.
+        let flags: UInt8 = 0b0000_0001 | (isReducedAccuracy ? 0b0000_0010 : 0)
+        data.appendUInt8(flags)
         data.appendInt32(latE7)
         data.appendInt32(lonE7)
         data.appendInt32(Int32.min)
         data.appendUInt16(horizontalAccuracyCM)
         data.appendUInt16(0)
         data.appendUInt16(speedCMS)
-        data.appendUInt16(courseDeg100)
-        data.appendUInt16(courseDeg100)
+        data.appendUInt16(courseDeg100 ?? 0)
+        data.appendUInt16(0)
         data.appendUInt32(UInt32(timestamp.timeIntervalSince1970))
         return data
     }
@@ -74,14 +102,18 @@ struct RelayRoomStateSnapshot: Decodable, Hashable {
     var room: String
     var serverTime: Int
     var maxMembers: Int
+    #if !APP_ONLY
     var voiceFloor: RelayVoiceFloorSnapshot?
+    #endif
     var members: [RelayRoomMemberSnapshot]
 
     enum CodingKeys: String, CodingKey {
         case room
         case serverTime = "server_time"
         case maxMembers = "max_members"
+        #if !APP_ONLY
         case voiceFloor = "voice_floor"
+        #endif
         case members
     }
 }
@@ -96,15 +128,20 @@ struct RelayRoomMemberSnapshot: Decodable, Hashable {
     var lastSeenMS: Int
     var lastType: String
     var protocolVersion: Int?
+    #if !APP_ONLY
     var firmware: String?
     var deviceStatus: RelayDeviceStatusSnapshot?
     var voiceStatus: RelayVoiceStatusSnapshot?
+    #endif
     var location: RelayLocationSnapshot?
     var locationPaused: Bool?
     var locationStale: Bool? = nil
     var locationAgeMS: Int? = nil
     var appOnline: Bool?
+    #if !APP_ONLY
     var deviceOnline: Bool?
+    #endif
+    var moderationRef: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case role
@@ -116,18 +153,24 @@ struct RelayRoomMemberSnapshot: Decodable, Hashable {
         case lastSeenMS = "last_seen_ms"
         case lastType = "last_type"
         case protocolVersion = "protocol_version"
+        #if !APP_ONLY
         case firmware
         case deviceStatus = "device_status"
         case voiceStatus = "voice_status"
+        #endif
         case location
         case locationPaused = "location_paused"
         case locationStale = "location_stale"
         case locationAgeMS = "location_age_ms"
         case appOnline = "app_online"
+        #if !APP_ONLY
         case deviceOnline = "device_online"
+        #endif
+        case moderationRef = "moderation_ref"
     }
 }
 
+#if !APP_ONLY
 struct DeviceBatterySnapshot: Decodable, Hashable {
     var present: Bool?
     var percent: Int?
@@ -262,6 +305,7 @@ struct RelayVoiceFloorSnapshot: Decodable, Hashable {
         case expiresInMS = "expires_in_ms"
     }
 }
+#endif
 
 struct RelayLocationSnapshot: Decodable, Hashable {
     var latE7: Int?
@@ -313,41 +357,55 @@ final class RadarRuntime {
     @ObservationIgnored private var relayConnectedAt: Date?
     @ObservationIgnored private var nextLocationSequence = 1
     @ObservationIgnored private var currentRelayRoomCode = ""
+    @ObservationIgnored private var relayConnectionID = UUID()
+    @ObservationIgnored private var localDisplayName = "Capsule Radar 用户"
 
     var relayPhase: RuntimePhase = .idle
+    #if !APP_ONLY
     var espPhase: RuntimePhase = .idle
     var voicePhase: RuntimePhase = .idle
+    #endif
     var lastRelayEvent = "尚未连接房间"
+    #if !APP_ONLY
     var lastESPEvent = "尚未同步雷达"
     var lastVoiceEvent = "等待雷达语音状态"
+    #endif
     var lastLocationFrame = "尚未生成 LocationFrame"
-    var provisionedServiceUUID = "7d540100-f82d-4b2f-91c6-4f0f88aa5a11"
     var appSocketPath = "/v1/radar/app/ws"
+    #if !APP_ONLY
+    var provisionedServiceUUID = "7d540100-f82d-4b2f-91c6-4f0f88aa5a11"
     var deviceSocketPath = "/v1/radar/device/ws"
+    #endif
     var relayBaseURL = AppEnvironment.current.relayBaseURL
     var relayRoomState = "尚未收到房间状态"
     var roomStateSnapshot: RelayRoomStateSnapshot?
     var localAppPeerID = "app-local"
+    #if !APP_ONLY
     var pendingServerConfig = false
     var pendingLocationWrite = false
+    #endif
     var relayLatencyMS = 0
     var lastLocationSequenceSent = 0
     var lastLocationSequenceAcked = 0
     var lastLocationAckText = "尚未确认定位上传"
     var lastLocationSentAt: Date?
     var lastLocationAckedAt: Date?
+    #if !APP_ONLY
     var localDeviceToken = ""
+    #endif
     var relayProtocolText = "未确认"
     var compatibilityText = "等待房间"
     var appAccessToken = ""
     var roomSwitchState: RoomSwitchState = .idle
     var roomSwitchDetail = "尚未切换房间"
     var relayEventHistory: [String] = []
+    #if !APP_ONLY
     var espEventHistory: [String] = []
     var voiceEventHistory: [String] = []
     private var pendingRoomSwitchRequestID = ""
     private var pendingRoomSwitchRoom = ""
     private var pendingRoomSwitchGroupID = ""
+    #endif
 
     var lastLocationSentText: String {
         guard let lastLocationSentAt else { return "尚未上传" }
@@ -359,6 +417,14 @@ final class RadarRuntime {
         return Self.relativeText(since: lastLocationAckedAt)
     }
 
+    func configureUserDisplayName(_ value: String) {
+        let cleanName = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        localDisplayName = cleanName.isEmpty || cleanName == "未登录"
+            ? "Capsule Radar 用户"
+            : cleanName
+    }
+
+    #if !APP_ONLY
     var localDeviceMember: RelayRoomMemberSnapshot? {
         guard let snapshot = roomStateSnapshot else { return nil }
         let ids = localDeviceLookupIDs
@@ -380,14 +446,18 @@ final class RadarRuntime {
         var ids = Set<String>()
         let appGroupID = localAppPeerID.hasPrefix("app-") ? String(localAppPeerID.dropFirst(4)) : localAppPeerID
         if !appGroupID.isEmpty { ids.insert(appGroupID) }
-        if !localDeviceToken.isEmpty { ids.insert(localDeviceToken) }
         return ids
     }
+    #endif
 
     func connectRelay(roomCode: String, deviceToken: String, appAccessToken: String) async {
         disconnectRelay()
+        let connectionID = UUID()
+        relayConnectionID = connectionID
         self.appAccessToken = appAccessToken
+        #if !APP_ONLY
         localDeviceToken = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        #endif
         localAppPeerID = Self.appPeerID(deviceToken: deviceToken, appAccessToken: appAccessToken)
         currentRelayRoomCode = roomCode.trimmingCharacters(in: .whitespacesAndNewlines)
         roomStateSnapshot = nil
@@ -396,42 +466,82 @@ final class RadarRuntime {
         noteRelayEvent("正在建立 App WS · \(appSocketPath) · room \(roomCode) · \(localAppPeerID)")
         print("DragonRadar Relay connect start base=\(relayBaseURL) room=\(roomCode) appPeer=\(localAppPeerID)")
 
-        guard let url = appSocketURL(roomCode: roomCode) else {
+        let webSocketTicket: String
+        do {
+            webSocketTicket = try await requestWebSocketTicket(accessToken: appAccessToken)
+        } catch {
+            guard relayConnectionID == connectionID else { return }
+            relayPhase = .failed
+            noteRelayEvent("房间认证失败：\(error.localizedDescription)")
+            print("DragonRadar Relay ticket failed error=\(error.localizedDescription)")
+            return
+        }
+
+        guard relayConnectionID == connectionID else { return }
+        guard let url = appSocketURL(roomCode: roomCode, webSocketTicket: webSocketTicket) else {
             relayPhase = .failed
             noteRelayEvent("房间服务地址无效")
             print("DragonRadar Relay connect failed invalid URL base=\(relayBaseURL)")
             return
         }
 
-        let socket = URLSession.shared.webSocketTask(with: url)
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(appAccessToken)", forHTTPHeaderField: "Authorization")
+        let socket = URLSession.shared.webSocketTask(with: request)
         relaySocket = socket
-        relayConnectedAt = Date()
         socket.resume()
 
         do {
+            #if APP_ONLY
+            let capabilities = ["location", "room_admin"]
+            #else
+            let capabilities = ["location", "device_config", "room_admin"]
+            #endif
             try await sendRelayJSON([
                 "type": "hello",
                 "app": "DragonRadarMVP",
                 "app_version": DragonRadarProtocol.appVersionText,
                 "protocol_version": DragonRadarProtocol.appProtocolVersion,
                 "min_relay_protocol_version": DragonRadarProtocol.minRelayProtocolVersion,
-                "name": "隼人 iPhone",
+                "name": localDisplayName,
                 "room": roomCode,
-                "capabilities": ["location", "device_config", "room_admin"]
-            ])
-            relayReceiveTask = Task { [weak self] in
-                await self?.receiveRelayLoop()
+                "capabilities": capabilities
+            ], over: socket)
+            guard relayConnectionID == connectionID, relaySocket === socket else {
+                socket.cancel(with: .goingAway, reason: nil)
+                return
             }
-            startRoomStateRefresh(roomCode: roomCode)
+            let firstMessage = try await socket.receive()
+            guard relayConnectionID == connectionID, relaySocket === socket else {
+                socket.cancel(with: .goingAway, reason: nil)
+                return
+            }
+            handleRelayMessage(firstMessage)
+            guard relayPhase != .failed else {
+                throw RelayConnectionError.rejected(lastRelayEvent)
+            }
+            relayConnectedAt = Date()
+            relayReceiveTask = Task { [weak self] in
+                await self?.receiveRelayLoop(socket: socket, connectionID: connectionID)
+            }
+            startRoomStateRefresh(
+                roomCode: roomCode,
+                socket: socket,
+                connectionID: connectionID
+            )
             relayPhase = .ready
             relayLatencyMS = 0
             noteRelayEvent("房间已连接")
-            print("DragonRadar Relay connected url=\(url.absoluteString)")
+            print("DragonRadar Relay connected path=\(appSocketPath) room=\(roomCode)")
         } catch {
+            guard relayConnectionID == connectionID, relaySocket === socket else {
+                socket.cancel(with: .goingAway, reason: nil)
+                return
+            }
+            tearDownRelayConnection()
             relayPhase = .failed
             noteRelayEvent("房间连接失败：\(error.localizedDescription)")
             print("DragonRadar Relay connect failed error=\(error.localizedDescription)")
-            disconnectRelay()
         }
     }
 
@@ -441,34 +551,48 @@ final class RadarRuntime {
             noteRelayEvent("定位无效，未上传")
             return
         }
+        guard relayPhase == .ready, relaySocket != nil else {
+            noteRelayEvent("房间连接未就绪，定位等待上传")
+            print("DragonRadar location send deferred relay=\(relayPhase.rawValue)")
+            return
+        }
 
-        relayPhase = relayPhase == .idle ? .connecting : relayPhase
         lastLocationFrame = snapshot.frameSummary
-        noteRelayEvent("上传定位中 · \(snapshot.coordinateText)")
+        noteRelayEvent("上传定位中 · \(snapshot.accuracyText)")
         let sequence = nextLocationSequence
         nextLocationSequence += 1
         lastLocationSequenceSent = sequence
         lastLocationSentAt = Date()
+        var locationPayload: [String: Any] = [
+            "lat_e7": Int(snapshot.latE7),
+            "lon_e7": Int(snapshot.lonE7),
+            "h_acc_cm": Int(snapshot.horizontalAccuracyCM),
+            "speed_cms": Int(snapshot.speedCMS),
+            "unix_time": Int(snapshot.timestamp.timeIntervalSince1970),
+            "sequence": sequence
+        ]
+        if let courseDeg100 = snapshot.courseDeg100 {
+            locationPayload["course_deg100"] = Int(courseDeg100)
+        }
         do {
             try await sendRelayJSON([
                 "type": "app_location",
                 "sequence": sequence,
-                "location": [
-                    "lat_e7": Int(snapshot.latE7),
-                    "lon_e7": Int(snapshot.lonE7),
-                    "h_acc_cm": Int(snapshot.horizontalAccuracyCM),
-                    "speed_cms": Int(snapshot.speedCMS),
-                    "course_deg100": Int(snapshot.courseDeg100),
-                    "unix_time": Int(snapshot.timestamp.timeIntervalSince1970),
-                    "sequence": sequence
-                ]
+                "location": locationPayload
             ])
             relayPhase = .ready
             relayLatencyMS = relayConnectedAt.map { max(1, Int(Date().timeIntervalSince($0) * 1000)) } ?? relayLatencyMS
             noteRelayEvent("定位已上传 · seq \(sequence) · \(snapshot.accuracyText)")
+            print("DragonRadar location sent sequence=\(sequence)")
         } catch {
             relayPhase = .failed
             noteRelayEvent("定位上传失败：\(error.localizedDescription)")
+            let nsError = error as NSError
+            print(
+                "DragonRadar location send failed "
+                    + "domain=\(nsError.domain) "
+                    + "code=\(nsError.code)"
+            )
         }
     }
 
@@ -485,6 +609,7 @@ final class RadarRuntime {
         }
     }
 
+    #if !APP_ONLY
     func sendRoomSwitchToESP(roomCode: String, deviceToken: String) async -> Bool {
         guard !deviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             roomSwitchState = .waitingESPJoin
@@ -502,8 +627,7 @@ final class RadarRuntime {
                 "type": "room_switch",
                 "request_id": requestID,
                 "relay_url": relayBaseURL,
-                "room_token": roomCode,
-                "device_token": deviceToken
+                "room_token": roomCode
             ])
             noteRelayEvent("已通知雷达切换房间 · \(roomCode)")
             return true
@@ -524,7 +648,7 @@ final class RadarRuntime {
 
         pendingLocationWrite = true
         espPhase = .connecting
-        noteESPEvent("定位已写入雷达 · \(snapshot.coordinateText)")
+        noteESPEvent("定位已写入雷达 · \(snapshot.accuracyText)")
         try? await Task.sleep(for: .milliseconds(260))
         pendingLocationWrite = false
         espPhase = .ready
@@ -560,8 +684,19 @@ final class RadarRuntime {
         voicePhase = .idle
         noteVoiceEvent("已停止观察语音状态")
     }
+    #endif
 
     func disconnectRelay() {
+        let shouldReportDisconnect = relayPhase != .idle
+        relayConnectionID = UUID()
+        tearDownRelayConnection()
+        if shouldReportDisconnect {
+            relayPhase = .idle
+            noteRelayEvent("房间已断开")
+        }
+    }
+
+    private func tearDownRelayConnection() {
         relayReceiveTask?.cancel()
         relayReceiveTask = nil
         roomStateRefreshTask?.cancel()
@@ -570,92 +705,147 @@ final class RadarRuntime {
         relaySocket = nil
         relayConnectedAt = nil
         currentRelayRoomCode = ""
-        if relayPhase != .idle {
-            relayPhase = .idle
-            noteRelayEvent("房间已断开")
-        }
     }
 
-    private func appSocketURL(roomCode: String) -> URL? {
+    private func appSocketURL(roomCode: String, webSocketTicket: String) -> URL? {
         var components = URLComponents(string: relayBaseURL + appSocketPath)
         components?.queryItems = [
             URLQueryItem(name: "room", value: roomCode),
             URLQueryItem(name: "app_id", value: localAppPeerID),
-            URLQueryItem(name: "token", value: appAccessToken)
+            URLQueryItem(name: "ticket", value: webSocketTicket),
         ]
         return components?.url
+    }
+
+    private func requestWebSocketTicket(accessToken: String) async throws -> String {
+        guard
+            !accessToken.isEmpty,
+            let url = URL(string: AppEnvironment.current.httpAPIBaseURL + "/v1/auth/ws-ticket")
+        else {
+            throw RelayConnectionError.rejected("登录会话无效")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = Data("{}".utf8)
+        request.timeoutInterval = 10
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let code = (
+                (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+            ) ?? "HTTP \(httpResponse.statusCode)"
+            throw RelayConnectionError.rejected(code)
+        }
+        guard
+            let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let ticket = envelope["ticket"] as? String,
+            !ticket.isEmpty
+        else {
+            throw URLError(.cannotParseResponse)
+        }
+        return ticket
     }
 
     private static func appPeerID(deviceToken: String, appAccessToken: String) -> String {
         let trimmed = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
-            return "app-\(trimmed)"
+            return "app-\(stableIdentifier(for: trimmed, fallback: "local"))"
         }
         return "app-\(stableIdentifier(for: appAccessToken, fallback: "local"))"
     }
 
+    #if !APP_ONLY
     private static func groupID(for deviceToken: String) -> String {
         let trimmed = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "app-only" : trimmed
+        return stableIdentifier(for: trimmed, fallback: "app-only")
     }
+    #endif
 
     private static func stableIdentifier(for token: String, fallback: String) -> String {
         let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanToken.isEmpty else { return fallback }
-        var hash: UInt64 = 0xcbf29ce484222325
-        for byte in cleanToken.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 0x100000001b3
-        }
-        return String(hash, radix: 16)
+        let digest = SHA256.hash(data: Data(cleanToken.utf8))
+        return digest.prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 
     private func sendRelayJSON(_ payload: [String: Any]) async throws {
         guard let relaySocket else {
             throw URLError(.notConnectedToInternet)
         }
+        try await sendRelayJSON(payload, over: relaySocket)
+    }
+
+    private func sendRelayJSON(
+        _ payload: [String: Any],
+        over socket: URLSessionWebSocketTask
+    ) async throws {
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         guard let text = String(data: data, encoding: .utf8) else {
             throw URLError(.cannotParseResponse)
         }
-        try await relaySocket.send(.string(text))
+        try await socket.send(.string(text))
     }
 
-    private func startRoomStateRefresh(roomCode: String) {
+    private func startRoomStateRefresh(
+        roomCode: String,
+        socket: URLSessionWebSocketTask,
+        connectionID: UUID
+    ) {
         roomStateRefreshTask?.cancel()
         roomStateRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3))
                 guard !Task.isCancelled else { return }
-                await self?.requestRoomStateRefresh(roomCode: roomCode)
+                await self?.requestRoomStateRefresh(
+                    roomCode: roomCode,
+                    socket: socket,
+                    connectionID: connectionID
+                )
             }
         }
     }
 
-    private func requestRoomStateRefresh(roomCode: String) async {
-        guard relaySocket != nil else { return }
+    private func requestRoomStateRefresh(
+        roomCode: String,
+        socket: URLSessionWebSocketTask,
+        connectionID: UUID
+    ) async {
+        guard relayConnectionID == connectionID, relaySocket === socket else { return }
         do {
             try await sendRelayJSON([
                 "type": "heartbeat",
                 "app": "DragonRadarMVP",
-                "name": "隼人 iPhone",
+                "name": localDisplayName,
                 "room": roomCode,
                 "wants": ["room_state"]
-            ])
+            ], over: socket)
         } catch {
+            guard relayConnectionID == connectionID, relaySocket === socket else { return }
             relayPhase = .failed
             noteRelayEvent("房间状态刷新失败：\(error.localizedDescription)")
         }
     }
 
-    private func receiveRelayLoop() async {
+    private func receiveRelayLoop(
+        socket: URLSessionWebSocketTask,
+        connectionID: UUID
+    ) async {
         while !Task.isCancelled {
-            guard let relaySocket else { return }
+            guard relayConnectionID == connectionID, relaySocket === socket else { return }
             do {
-                let message = try await relaySocket.receive()
+                let message = try await socket.receive()
+                guard relayConnectionID == connectionID, relaySocket === socket else { return }
                 handleRelayMessage(message)
             } catch {
-                if !Task.isCancelled {
+                if !Task.isCancelled,
+                   relayConnectionID == connectionID,
+                   relaySocket === socket
+                {
                     relayPhase = .failed
                     noteRelayEvent("房间接收失败：\(error.localizedDescription)")
                     print("DragonRadar Relay receive failed error=\(error.localizedDescription)")
@@ -694,10 +884,20 @@ final class RadarRuntime {
             lastLocationAckedAt = Date()
             lastLocationAckText = sequence > 0 ? "服务端已确认定位 · seq \(sequence)" : "服务端已确认定位"
             noteRelayEvent(lastLocationAckText)
+        #if !APP_ONLY
         case "room_switch_ack":
             handleRoomSwitchAck(object)
         case "voice_busy":
             handleVoiceBusy(object)
+        #endif
+        case "radar_reminder":
+            NotificationCenter.default.post(
+                name: .dragonRadarReminderReceived,
+                object: object,
+                userInfo: ["source": "websocket"]
+            )
+            let sender = object["sender_name"] as? String ?? "房间成员"
+            noteRelayEvent("\(sender) 提醒查看雷达")
         case "room_state":
             decodeRoomState(from: data, fallback: object)
         case "relay_event":
@@ -719,6 +919,7 @@ final class RadarRuntime {
         }
     }
 
+    #if !APP_ONLY
     private func handleVoiceBusy(_ object: [String: Any]) {
         voicePhase = .degraded
         let speakerGroupID = object["speaker_group_id"] as? String
@@ -727,9 +928,16 @@ final class RadarRuntime {
         noteVoiceEvent("抢麦失败，\(speaker) 正在说话")
         noteRelayEvent("当前有人正在说话 · \(speaker)")
     }
+    #endif
 
     private func handleRelayHelloAck(_ object: [String: Any]) {
         let peerID = object["peer_id"] as? String ?? "app"
+        if !peerID.isEmpty, peerID != "app" {
+            // The relay may reject a stale device-derived app id and substitute
+            // the access-token identity. Always use its authoritative id when
+            // identifying our own member in subsequent room-state snapshots.
+            localAppPeerID = peerID
+        }
         let relayVersion = relayProtocolVersion(from: object)
         let minAppVersion = intValue(object["min_app_protocol_version"])
             ?? intValue((object["protocol"] as? [String: Any])?["min_app"])
@@ -764,11 +972,23 @@ final class RadarRuntime {
                 noteRelayEvent("忽略旧房间状态 · \(envelope.room)")
                 return
             }
-            roomStateSnapshot = envelope
-            relayRoomState = "room \(envelope.room) · \(envelope.members.count)/\(envelope.maxMembers) online"
-            noteRelayEvent("房间状态已同步 · \(envelope.members.count) 在线")
-            updateRoomSwitchState(from: envelope)
-            updateDeviceProtocolState(from: envelope)
+            #if APP_ONLY
+            let acceptedEnvelope = RelayRoomStateSnapshot(
+                room: envelope.room,
+                serverTime: envelope.serverTime,
+                maxMembers: envelope.maxMembers,
+                members: envelope.members.filter { $0.role == "app" }
+            )
+            #else
+            let acceptedEnvelope = envelope
+            #endif
+            roomStateSnapshot = acceptedEnvelope
+            relayRoomState = "room \(acceptedEnvelope.room) · \(acceptedEnvelope.members.count)/\(acceptedEnvelope.maxMembers) online"
+            noteRelayEvent("房间状态已同步 · \(acceptedEnvelope.members.count) 在线")
+            #if !APP_ONLY
+            updateRoomSwitchState(from: acceptedEnvelope)
+            updateDeviceProtocolState(from: acceptedEnvelope)
+            #endif
         } catch {
             let room = object["room"] as? String ?? "-"
             guard shouldAcceptRoomState(room) else {
@@ -780,8 +1000,10 @@ final class RadarRuntime {
             if let fallback = fallbackRoomStateSnapshot(from: object) {
                 roomStateSnapshot = fallback
                 noteRelayEvent("房间状态已同步 · \(fallback.members.count) 在线")
+                #if !APP_ONLY
                 updateRoomSwitchState(from: fallback)
                 updateDeviceProtocolState(from: fallback)
+                #endif
             } else {
                 noteRelayEvent("房间状态解析失败：\(error.localizedDescription)")
             }
@@ -794,6 +1016,7 @@ final class RadarRuntime {
         return room.trimmingCharacters(in: .whitespacesAndNewlines) == expected
     }
 
+    #if !APP_ONLY
     private func handleRoomSwitchAck(_ object: [String: Any]) {
         let requestID = stringValue(object["request_id"]) ?? ""
         guard requestID.isEmpty || requestID == pendingRoomSwitchRequestID else {
@@ -844,16 +1067,46 @@ final class RadarRuntime {
         compatibilityText = "不兼容 · 雷达版本过低"
         noteRelayEvent("雷达版本过低 · \(outdatedDevice.memberID)")
     }
+    #endif
 
     private func fallbackRoomStateSnapshot(from object: [String: Any]) -> RelayRoomStateSnapshot? {
         guard let rawMembers = object["members"] as? [[String: Any]] else { return nil }
-        let members = rawMembers.map { rawMember in
+        #if APP_ONLY
+        let acceptedRawMembers = rawMembers.filter { stringValue($0["role"]) == "app" }
+        #else
+        let acceptedRawMembers = rawMembers
+        #endif
+        let members = acceptedRawMembers.map { rawMember in
+            #if APP_ONLY
+            let peerID = stringValue(rawMember["peer_id"])
+                ?? stringValue(rawMember["app_peer_id"])
+                ?? stringValue(rawMember["member_id"])
+                ?? UUID().uuidString
+            #else
             let peerID = stringValue(rawMember["peer_id"])
                 ?? stringValue(rawMember["app_peer_id"])
                 ?? stringValue(rawMember["device_peer_id"])
                 ?? stringValue(rawMember["member_id"])
                 ?? UUID().uuidString
+            #endif
             let memberID = stringValue(rawMember["member_id"]) ?? peerID
+            #if APP_ONLY
+            return RelayRoomMemberSnapshot(
+                role: stringValue(rawMember["role"]) ?? "member",
+                memberID: memberID,
+                peerID: peerID,
+                name: stringValue(rawMember["name"]),
+                online: boolValue(rawMember["online"]) ?? true,
+                ageMS: intValue(rawMember["age_ms"]) ?? 0,
+                lastSeenMS: intValue(rawMember["last_seen_ms"]) ?? 0,
+                lastType: stringValue(rawMember["last_type"]) ?? "room_state",
+                protocolVersion: intValue(rawMember["protocol_version"]),
+                location: decodeNested(rawMember["location"], as: RelayLocationSnapshot.self),
+                locationPaused: boolValue(rawMember["location_paused"]),
+                appOnline: boolValue(rawMember["app_online"]),
+                moderationRef: stringValue(rawMember["moderation_ref"])
+            )
+            #else
             return RelayRoomMemberSnapshot(
                 role: stringValue(rawMember["role"]) ?? "member",
                 memberID: memberID,
@@ -870,9 +1123,19 @@ final class RadarRuntime {
                 location: decodeNested(rawMember["location"], as: RelayLocationSnapshot.self),
                 locationPaused: boolValue(rawMember["location_paused"]),
                 appOnline: boolValue(rawMember["app_online"]),
-                deviceOnline: boolValue(rawMember["device_online"])
+                deviceOnline: boolValue(rawMember["device_online"]),
+                moderationRef: stringValue(rawMember["moderation_ref"])
             )
+            #endif
         }
+        #if APP_ONLY
+        return RelayRoomStateSnapshot(
+            room: stringValue(object["room"]) ?? "-",
+            serverTime: intValue(object["server_time"]) ?? Int(Date().timeIntervalSince1970),
+            maxMembers: intValue(object["max_members"]) ?? 7,
+            members: members
+        )
+        #else
         return RelayRoomStateSnapshot(
             room: stringValue(object["room"]) ?? "-",
             serverTime: intValue(object["server_time"]) ?? Int(Date().timeIntervalSince1970),
@@ -880,6 +1143,7 @@ final class RadarRuntime {
             voiceFloor: decodeNested(object["voice_floor"], as: RelayVoiceFloorSnapshot.self),
             members: members
         )
+        #endif
     }
 
     private func decodeNested<T: Decodable>(_ value: Any?, as type: T.Type) -> T? {
@@ -944,6 +1208,7 @@ final class RadarRuntime {
         relayEventHistory = Self.append(value, to: relayEventHistory)
     }
 
+    #if !APP_ONLY
     func noteESPEvent(_ value: String) {
         lastESPEvent = value
         espEventHistory = Self.append(value, to: espEventHistory)
@@ -953,6 +1218,7 @@ final class RadarRuntime {
         lastVoiceEvent = value
         voiceEventHistory = Self.append(value, to: voiceEventHistory)
     }
+    #endif
 
     private static func append(_ value: String, to history: [String]) -> [String] {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

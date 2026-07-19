@@ -8,12 +8,12 @@
   <key>CFBundleExecutable</key>
   <string>DragonRadarMacLocation</string>
   <key>CFBundleName</key>
-  <string>Dragon Radar Mac Location</string>
+  <string>Capsule Mac Location</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-  <string>Use this Mac location to publish a Dragon Radar test room member.</string>
+  <string>Use this Mac location to publish a Capsule test room member.</string>
   <key>NSLocationWhenInUseUsageDescription</key>
-  <string>Use this Mac location to publish a Dragon Radar test room member.</string>
+  <string>Use this Mac location to publish a Capsule test room member.</string>
 </dict>
 </plist>
