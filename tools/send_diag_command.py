@@ -24,7 +24,7 @@ COMMANDS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Send a single hidden DIAG command to Dragon Radar over USB serial."
+        description="Send a single hidden DIAG command to Capsule hardware over USB serial."
     )
     parser.add_argument(
         "command",

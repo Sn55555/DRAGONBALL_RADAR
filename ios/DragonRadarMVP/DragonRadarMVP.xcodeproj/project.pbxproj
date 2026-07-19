@@ -7,18 +7,32 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		06BEA9120974AB47B52EDF8D /* FirmwareUpdateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC1DDD4071C4DD91DA86F79 /* FirmwareUpdateTests.swift */; };
 		0CC51FB93DBFFB6A82E2FCB1 /* BLEDeviceBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 342D31BE9AEC27CAF1C7B3CE /* BLEDeviceBridge.swift */; };
 		145F8311EC5770AC2221CBA8 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AB7011D9E9D23863C43307D5 /* Assets.xcassets */; };
+		19F9C1F7C74C552E82B065AB /* FirmwareReconnectPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40CBFE74F3BB32A152FB2555 /* FirmwareReconnectPolicyTests.swift */; };
 		1AC63525B9E856BB20793B80 /* RadarOverviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56D38544F3AF0726E54E368E /* RadarOverviewView.swift */; };
+		1E51F1B4225889C32A14E584 /* BLEOwnerSessionProofTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDC09810444E2F19552E0C87 /* BLEOwnerSessionProofTests.swift */; };
+		38E4C64E5441DF36A95266A4 /* ReviewExperience.swift in Sources */ = {isa = PBXBuildFile; fileRef = D799B78CD0758C94FAAD3CE3 /* ReviewExperience.swift */; };
 		3C8506259C6CEF288E4AB46A /* NotificationPermissionCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A05B7D967E27B4026888805C /* NotificationPermissionCenter.swift */; };
 		3CD5DAB43454574F12FF08BE /* SetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0286B8BD2DCAEDC3CE03F0A8 /* SetupView.swift */; };
 		507EEED8CF3EAB934641F3CE /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 367834B261568BEE5E1E7C97 /* Models.swift */; };
+		58E3690BD35666BEBE2F6F0E /* RadarBrandMark.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65CE3EEF0D56A2D2F1CDBB3F /* RadarBrandMark.swift */; };
+		5A32E986781C37B8203BF5E9 /* FirmwareUpdate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3494DC27FDAA3415695E73B7 /* FirmwareUpdate.swift */; };
+		5E9A33DEB23BB1661A69A33B /* Moderation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FC624EB93F9C675AD007DC6 /* Moderation.swift */; };
+		631D1FDEDAC411B1618919D4 /* PhysicalOTAAcceptanceCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A09275DF1EDC50D3B8DC14DD /* PhysicalOTAAcceptanceCoordinator.swift */; };
 		632B60476CBFC702F8F19F93 /* LocationBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E646D07D07A906827782D3C /* LocationBridge.swift */; };
+		7BB337C4B23E2C1717A1387F /* AuthSecurityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD7AEBFC4C17771D4DE49CE4 /* AuthSecurityTests.swift */; };
+		7C823141E22D5C30A0292AD8 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 2BA1D989073A811620CB826C /* PrivacyInfo.xcprivacy */; };
+		7D81AAAF084530399D991F08 /* ModerationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 850BBF77D05788F92213A3D7 /* ModerationTests.swift */; };
 		81A0A3BD0EFF9103CF3FE05D /* RelayModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1BF90E5E2748C4C5934B9CA /* RelayModelTests.swift */; };
+		824557054B8083058E0CB68A /* FirmwareReconnectPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD9E552083CEE1D2516F40BE /* FirmwareReconnectPolicy.swift */; };
+		A58F8FE25D526F8C19BEEACC /* FirmwareUpdateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC5934E90B3100F67C978A1 /* FirmwareUpdateView.swift */; };
 		A6A4A32B24EDE81A46C511B5 /* AccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D7D1482ACF84EAFA84D4E73 /* AccountView.swift */; };
 		B20672C71164EE357DDFA135 /* RadarRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE079D625E87D18A597ADEC6 /* RadarRuntime.swift */; };
 		B2B06C73EAA4EC0AFB77F6AF /* AuthSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD213461F3FF9918FC1702D9 /* AuthSupport.swift */; };
 		B6C9BA94182E4C240119CD2D /* AppEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = E098498F867F899163A4D538 /* AppEnvironment.swift */; };
+		C05E5E317BB5348D68CCBC84 /* HeadingLocationFrameTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 948290C61E54F3C27AD20256 /* HeadingLocationFrameTests.swift */; };
 		CB8AA1F03472E8FB4B1A0916 /* DiagnosticPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87E3D3F571EEC89125EB1A28 /* DiagnosticPackage.swift */; };
 		D1596CDDCA0DF516CD5929F2 /* RoomsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AA78ED7C9551162F80D2E72 /* RoomsView.swift */; };
 		D887C64DD0415F5C6A40DE44 /* MangaGlassStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = C41894D43439FC476B2636AA /* MangaGlassStyle.swift */; };
@@ -27,6 +41,7 @@
 		F2AEDC3CCCAF2A56C7950DCF /* AppShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A693465936377C2997E29C6 /* AppShellView.swift */; };
 		F3D5CB57074129C67DB1A786 /* AppRuntimeHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A99BB676BFCE0745D9F297E2 /* AppRuntimeHost.swift */; };
 		F77C21DE5300519702ECDC4D /* LaunchReadinessUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65F3F55F6E7EF6F2505A518E /* LaunchReadinessUITests.swift */; };
+		FDE29370BCC6615119BF113D /* BrandAssetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0ADCC350A4ADC62A2547268 /* BrandAssetTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -50,26 +65,41 @@
 		0286B8BD2DCAEDC3CE03F0A8 /* SetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupView.swift; sourceTree = "<group>"; };
 		0C572A6332E2D7F9CB9B8C91 /* DevicesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DevicesView.swift; sourceTree = "<group>"; };
 		1A693465936377C2997E29C6 /* AppShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppShellView.swift; sourceTree = "<group>"; };
+		2BA1D989073A811620CB826C /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		2CC5934E90B3100F67C978A1 /* FirmwareUpdateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirmwareUpdateView.swift; sourceTree = "<group>"; };
 		342D31BE9AEC27CAF1C7B3CE /* BLEDeviceBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEDeviceBridge.swift; sourceTree = "<group>"; };
+		3494DC27FDAA3415695E73B7 /* FirmwareUpdate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirmwareUpdate.swift; sourceTree = "<group>"; };
 		367834B261568BEE5E1E7C97 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		40CBFE74F3BB32A152FB2555 /* FirmwareReconnectPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirmwareReconnectPolicyTests.swift; sourceTree = "<group>"; };
+		4CC1DDD4071C4DD91DA86F79 /* FirmwareUpdateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirmwareUpdateTests.swift; sourceTree = "<group>"; };
 		56D38544F3AF0726E54E368E /* RadarOverviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarOverviewView.swift; sourceTree = "<group>"; };
+		65CE3EEF0D56A2D2F1CDBB3F /* RadarBrandMark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarBrandMark.swift; sourceTree = "<group>"; };
 		65F3F55F6E7EF6F2505A518E /* LaunchReadinessUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchReadinessUITests.swift; sourceTree = "<group>"; };
 		6E646D07D07A906827782D3C /* LocationBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationBridge.swift; sourceTree = "<group>"; };
 		7AA78ED7C9551162F80D2E72 /* RoomsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoomsView.swift; sourceTree = "<group>"; };
+		850BBF77D05788F92213A3D7 /* ModerationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModerationTests.swift; sourceTree = "<group>"; };
 		87E3D3F571EEC89125EB1A28 /* DiagnosticPackage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticPackage.swift; sourceTree = "<group>"; };
 		8D7D1482ACF84EAFA84D4E73 /* AccountView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountView.swift; sourceTree = "<group>"; };
+		8FC624EB93F9C675AD007DC6 /* Moderation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Moderation.swift; sourceTree = "<group>"; };
+		948290C61E54F3C27AD20256 /* HeadingLocationFrameTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeadingLocationFrameTests.swift; sourceTree = "<group>"; };
 		A05B7D967E27B4026888805C /* NotificationPermissionCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationPermissionCenter.swift; sourceTree = "<group>"; };
+		A09275DF1EDC50D3B8DC14DD /* PhysicalOTAAcceptanceCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalOTAAcceptanceCoordinator.swift; sourceTree = "<group>"; };
 		A99BB676BFCE0745D9F297E2 /* AppRuntimeHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntimeHost.swift; sourceTree = "<group>"; };
 		AB7011D9E9D23863C43307D5 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		AD7AEBFC4C17771D4DE49CE4 /* AuthSecurityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthSecurityTests.swift; sourceTree = "<group>"; };
 		B211786CC0D04B5FDED5B6D1 /* DragonRadarMVP.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DragonRadarMVP.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B5099DDC601AC4FA5E5C8395 /* DragonRadarMVPUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = DragonRadarMVPUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		BD9E552083CEE1D2516F40BE /* FirmwareReconnectPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirmwareReconnectPolicy.swift; sourceTree = "<group>"; };
+		BDC09810444E2F19552E0C87 /* BLEOwnerSessionProofTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEOwnerSessionProofTests.swift; sourceTree = "<group>"; };
 		C41894D43439FC476B2636AA /* MangaGlassStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MangaGlassStyle.swift; sourceTree = "<group>"; };
 		C63CC9149183E95D83AFA791 /* DragonRadarMVPTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = DragonRadarMVPTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		D1BF90E5E2748C4C5934B9CA /* RelayModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayModelTests.swift; sourceTree = "<group>"; };
+		D799B78CD0758C94FAAD3CE3 /* ReviewExperience.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewExperience.swift; sourceTree = "<group>"; };
 		DD213461F3FF9918FC1702D9 /* AuthSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthSupport.swift; sourceTree = "<group>"; };
 		DE079D625E87D18A597ADEC6 /* RadarRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarRuntime.swift; sourceTree = "<group>"; };
 		E098498F867F899163A4D538 /* AppEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironment.swift; sourceTree = "<group>"; };
 		E9AEA647B0F32BBAFEC2F28A /* DragonRadarMVPApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragonRadarMVPApp.swift; sourceTree = "<group>"; };
+		F0ADCC350A4ADC62A2547268 /* BrandAssetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrandAssetTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -104,12 +134,19 @@
 				0C572A6332E2D7F9CB9B8C91 /* DevicesView.swift */,
 				87E3D3F571EEC89125EB1A28 /* DiagnosticPackage.swift */,
 				E9AEA647B0F32BBAFEC2F28A /* DragonRadarMVPApp.swift */,
+				BD9E552083CEE1D2516F40BE /* FirmwareReconnectPolicy.swift */,
+				3494DC27FDAA3415695E73B7 /* FirmwareUpdate.swift */,
+				2CC5934E90B3100F67C978A1 /* FirmwareUpdateView.swift */,
 				6E646D07D07A906827782D3C /* LocationBridge.swift */,
 				C41894D43439FC476B2636AA /* MangaGlassStyle.swift */,
 				367834B261568BEE5E1E7C97 /* Models.swift */,
+				8FC624EB93F9C675AD007DC6 /* Moderation.swift */,
 				A05B7D967E27B4026888805C /* NotificationPermissionCenter.swift */,
+				A09275DF1EDC50D3B8DC14DD /* PhysicalOTAAcceptanceCoordinator.swift */,
+				65CE3EEF0D56A2D2F1CDBB3F /* RadarBrandMark.swift */,
 				56D38544F3AF0726E54E368E /* RadarOverviewView.swift */,
 				DE079D625E87D18A597ADEC6 /* RadarRuntime.swift */,
+				D799B78CD0758C94FAAD3CE3 /* ReviewExperience.swift */,
 				7AA78ED7C9551162F80D2E72 /* RoomsView.swift */,
 				0286B8BD2DCAEDC3CE03F0A8 /* SetupView.swift */,
 			);
@@ -120,6 +157,13 @@
 		283D6F5B158B59D5C692BAED /* DragonRadarMVPTests */ = {
 			isa = PBXGroup;
 			children = (
+				AD7AEBFC4C17771D4DE49CE4 /* AuthSecurityTests.swift */,
+				BDC09810444E2F19552E0C87 /* BLEOwnerSessionProofTests.swift */,
+				F0ADCC350A4ADC62A2547268 /* BrandAssetTests.swift */,
+				40CBFE74F3BB32A152FB2555 /* FirmwareReconnectPolicyTests.swift */,
+				4CC1DDD4071C4DD91DA86F79 /* FirmwareUpdateTests.swift */,
+				948290C61E54F3C27AD20256 /* HeadingLocationFrameTests.swift */,
+				850BBF77D05788F92213A3D7 /* ModerationTests.swift */,
 				D1BF90E5E2748C4C5934B9CA /* RelayModelTests.swift */,
 			);
 			path = DragonRadarMVPTests;
@@ -139,6 +183,7 @@
 			isa = PBXGroup;
 			children = (
 				AB7011D9E9D23863C43307D5 /* Assets.xcassets */,
+				2BA1D989073A811620CB826C /* PrivacyInfo.xcprivacy */,
 			);
 			path = DragonRadarMVP;
 			sourceTree = "<group>";
@@ -210,16 +255,16 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					116A70B5839EA43CA8F9E18C = {
-						DevelopmentTeam = "";
+						DevelopmentTeam = Y77G89XGJ7;
 						ProvisioningStyle = Automatic;
 					};
 					671FE2341511C76FAB25D09F = {
-						DevelopmentTeam = "";
+						DevelopmentTeam = Y77G89XGJ7;
 						ProvisioningStyle = Automatic;
 						TestTargetID = 116A70B5839EA43CA8F9E18C;
 					};
 					AEF2DF72934481EE4BAF7DE3 = {
-						DevelopmentTeam = "";
+						DevelopmentTeam = Y77G89XGJ7;
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -251,6 +296,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				145F8311EC5770AC2221CBA8 /* Assets.xcassets in Resources */,
+				7C823141E22D5C30A0292AD8 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -270,12 +316,19 @@
 				E5582C722676FDE1465D44D8 /* DevicesView.swift in Sources */,
 				CB8AA1F03472E8FB4B1A0916 /* DiagnosticPackage.swift in Sources */,
 				E066F3DC03AD69A886491995 /* DragonRadarMVPApp.swift in Sources */,
+				824557054B8083058E0CB68A /* FirmwareReconnectPolicy.swift in Sources */,
+				5A32E986781C37B8203BF5E9 /* FirmwareUpdate.swift in Sources */,
+				A58F8FE25D526F8C19BEEACC /* FirmwareUpdateView.swift in Sources */,
 				632B60476CBFC702F8F19F93 /* LocationBridge.swift in Sources */,
 				D887C64DD0415F5C6A40DE44 /* MangaGlassStyle.swift in Sources */,
 				507EEED8CF3EAB934641F3CE /* Models.swift in Sources */,
+				5E9A33DEB23BB1661A69A33B /* Moderation.swift in Sources */,
 				3C8506259C6CEF288E4AB46A /* NotificationPermissionCenter.swift in Sources */,
+				631D1FDEDAC411B1618919D4 /* PhysicalOTAAcceptanceCoordinator.swift in Sources */,
+				58E3690BD35666BEBE2F6F0E /* RadarBrandMark.swift in Sources */,
 				1AC63525B9E856BB20793B80 /* RadarOverviewView.swift in Sources */,
 				B20672C71164EE357DDFA135 /* RadarRuntime.swift in Sources */,
+				38E4C64E5441DF36A95266A4 /* ReviewExperience.swift in Sources */,
 				D1596CDDCA0DF516CD5929F2 /* RoomsView.swift in Sources */,
 				3CD5DAB43454574F12FF08BE /* SetupView.swift in Sources */,
 			);
@@ -293,6 +346,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				7BB337C4B23E2C1717A1387F /* AuthSecurityTests.swift in Sources */,
+				1E51F1B4225889C32A14E584 /* BLEOwnerSessionProofTests.swift in Sources */,
+				FDE29370BCC6615119BF113D /* BrandAssetTests.swift in Sources */,
+				19F9C1F7C74C552E82B065AB /* FirmwareReconnectPolicyTests.swift in Sources */,
+				06BEA9120974AB47B52EDF8D /* FirmwareUpdateTests.swift in Sources */,
+				C05E5E317BB5348D68CCBC84 /* HeadingLocationFrameTests.swift in Sources */,
+				7D81AAAF084530399D991F08 /* ModerationTests.swift in Sources */,
 				81A0A3BD0EFF9103CF3FE05D /* RelayModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -323,7 +383,10 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				DRAGON_RADAR_ENVIRONMENT = Production;
 				DRAGON_RADAR_HTTP_API_BASE_URL = "https://relay.dragon-radar.example";
+				DRAGON_RADAR_PRIVACY_POLICY_URL = "";
 				DRAGON_RADAR_RELAY_BASE_URL = "wss://relay.dragon-radar.example";
+				DRAGON_RADAR_SUPPORT_URL = "";
+				DRAGON_RADAR_TERMS_OF_SERVICE_URL = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = DragonRadarMVP/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -332,7 +395,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.sn5.DragonRadarMVP;
 				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -340,6 +403,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -356,6 +420,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -374,11 +439,14 @@
 				APS_ENVIRONMENT = development;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
-				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_ENTITLEMENTS = DragonRadarMVP/DragonRadarMVP.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				DRAGON_RADAR_ENVIRONMENT = Debug;
 				DRAGON_RADAR_HTTP_API_BASE_URL = "http://139.224.41.192:8788";
+				DRAGON_RADAR_PRIVACY_POLICY_URL = "";
 				DRAGON_RADAR_RELAY_BASE_URL = "ws://139.224.41.192:8787";
+				DRAGON_RADAR_SUPPORT_URL = "";
+				DRAGON_RADAR_TERMS_OF_SERVICE_URL = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "DragonRadarMVP/Info-Debug.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -387,7 +455,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.sn5.DragonRadarMVP;
 				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -395,6 +463,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -534,6 +603,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

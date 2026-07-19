@@ -42,7 +42,7 @@ enum DiagnosticPackageFactory {
                 "room_code": appState.inviteCode,
                 "online_members": appState.onlineMembers,
                 "capacity": appState.roomCapacity,
-                "voice_quality": appState.voiceQuality
+                "voice_quality": appState.roomStatus
             ],
             "relay": [
                 "phase": radarRuntime.relayPhase.rawValue,
@@ -54,7 +54,7 @@ enum DiagnosticPackageFactory {
                 "last_location_ack": radarRuntime.lastLocationAckText,
                 "last_location_sent_age": radarRuntime.lastLocationSentText,
                 "last_location_acked_age": radarRuntime.lastLocationAckedText,
-                "recent_events": Array(radarRuntime.relayEventHistory.prefix(20))
+                "recent_events": redactedLocationEvents(radarRuntime.relayEventHistory)
             ],
             "location": [
                 "permission": locationBridge.permissionText,
@@ -64,6 +64,12 @@ enum DiagnosticPackageFactory {
                 "sharing": locationBridge.sharingText,
                 "accuracy": locationBridge.accuracyText,
                 "age": locationBridge.locationAgeText,
+                "course": locationBridge.courseText,
+                "phone_heading_reference": locationBridge.phoneHeadingReferenceText,
+                "phone_heading_quality": locationBridge.phoneHeadingQuality.rawValue,
+                "phone_heading_accuracy": locationBridge.phoneHeadingAccuracyText,
+                "phone_heading_age": locationBridge.phoneHeadingAgeText,
+                "phone_heading_forwarded_as_radar_heading": false,
                 "last_update": locationBridge.lastUpdateText,
                 "last_error": locationBridge.lastError ?? "",
                 "coordinate": "omitted"
@@ -76,13 +82,14 @@ enum DiagnosticPackageFactory {
                 "last_event": bleBridge.lastEvent,
                 "last_write": bleBridge.lastWriteEvent,
                 "available_characteristics": bleBridge.availableCharacteristicNames,
-                "recent_events": Array(bleBridge.bleEventHistory.prefix(20))
+                "recent_events": redactedLocationEvents(bleBridge.bleEventHistory)
             ],
             "esp": espStatus(bleBridge.deviceStatus),
+            "ota": otaStatus(bleBridge: bleBridge),
             "voice": [
                 "phase": radarRuntime.voicePhase.rawValue,
                 "last_event": radarRuntime.lastVoiceEvent,
-                "recent_events": Array(radarRuntime.voiceEventHistory.prefix(20)),
+                "recent_events": redactedLocationEvents(radarRuntime.voiceEventHistory),
                 "active_speakers": appState.activeSpeakers.map { $0.name }
             ],
             "room_state": roomStateSummary(radarRuntime.roomStateSnapshot),
@@ -135,7 +142,41 @@ enum DiagnosticPackageFactory {
             "loc": status.loc,
             "rssi": status.rssi,
             "ip": status.ip,
-            "last": status.last
+            "last": status.last,
+            "firmware_version": status.firmwareVersion ?? "",
+            "firmware_build": status.firmwareBuild ?? 0,
+            "hardware": status.hardware ?? "",
+            "security_counter": status.securityCounter ?? -1,
+            "ota_origin": status.otaOrigin ?? 0,
+            "ota_capable": status.supportsOTA
+        ]
+    }
+
+    @MainActor
+    private static func otaStatus(bleBridge: BLEDeviceBridge) -> [String: Any] {
+        guard let status = bleBridge.firmwareStatus else {
+            return [
+                "available": false,
+                "control_characteristic": bleBridge.hasCharacteristic(.firmwareControl),
+                "status_characteristic": bleBridge.hasCharacteristic(.firmwareStatus),
+                "supported": bleBridge.supportsFirmwareOTA,
+                "raw_status": bleBridge.firmwareStatusText
+            ]
+        }
+        return [
+            "available": true,
+            "supported": bleBridge.supportsFirmwareOTA,
+            "firmware_version": status.firmwareVersion ?? "",
+            "build": status.build ?? 0,
+            "hardware": status.hardware ?? "",
+            "stage": status.stage,
+            "progress": status.progress,
+            "received_bytes": status.receivedBytes ?? 0,
+            "total_bytes": status.totalBytes ?? 0,
+            "target_version": status.targetVersion ?? "",
+            "target_build": status.targetBuild ?? 0,
+            "error": status.errorCode ?? "",
+            "raw_status": bleBridge.firmwareStatusText
         ]
     }
 
@@ -164,6 +205,21 @@ enum DiagnosticPackageFactory {
                 ] as [String: Any]
             }
         ]
+    }
+
+    private static func redactedLocationEvents(_ events: [String]) -> [String] {
+        let coordinatePattern = #"[-+]?\d{1,3}\.\d{4,}\s*,\s*[-+]?\d{1,3}\.\d{4,}"#
+        guard let regex = try? NSRegularExpression(pattern: coordinatePattern) else {
+            return Array(events.prefix(20))
+        }
+        return events.prefix(20).map { event in
+            let range = NSRange(event.startIndex..<event.endIndex, in: event)
+            return regex.stringByReplacingMatches(
+                in: event,
+                range: range,
+                withTemplate: "<location omitted>"
+            )
+        }
     }
 
     private static func voiceStatusSummary(_ status: RelayVoiceStatusSnapshot?) -> [String: Any] {
@@ -201,6 +257,7 @@ enum DiagnosticPackageFactory {
             "network": radarRuntime.relayPhase == .failed ? radarRuntime.lastRelayEvent : "ok",
             "server": radarRuntime.lastLocationSequenceSent > radarRuntime.lastLocationSequenceAcked ? "定位上传未确认" : "ok",
             "device": bleBridge.isRegistrationComplete ? "ok" : bleBridge.registrationText,
+            "ota": bleBridge.firmwareStatus?.stage == "error" ? (bleBridge.firmwareStatus?.errorCode ?? "firmware_update_error") : "ok",
             "room": appState.inviteCode.isEmpty ? "未进入房间" : "ok",
             "voice": (radarRuntime.voicePhase == .failed || radarRuntime.voicePhase == .degraded) ? radarRuntime.lastVoiceEvent : "ok"
         ]

@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>Dragon Radar</string>
+	<string>Capsule Radar</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -18,12 +18,20 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>DragonRadarEnvironment</key>
 	<string>$(DRAGON_RADAR_ENVIRONMENT)</string>
 	<key>DragonRadarHTTPBaseURL</key>
 	<string>$(DRAGON_RADAR_HTTP_API_BASE_URL)</string>
 	<key>DragonRadarRelayBaseURL</key>
 	<string>$(DRAGON_RADAR_RELAY_BASE_URL)</string>
+	<key>DragonRadarPrivacyPolicyURL</key>
+	<string>$(DRAGON_RADAR_PRIVACY_POLICY_URL)</string>
+	<key>DragonRadarTermsOfServiceURL</key>
+	<string>$(DRAGON_RADAR_TERMS_OF_SERVICE_URL)</string>
+	<key>DragonRadarSupportURL</key>
+	<string>$(DRAGON_RADAR_SUPPORT_URL)</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSExceptionDomains</key>

@@ -29,7 +29,7 @@ def default_output_dir(mode: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run or preview the one-board simulated Dragon Radar hardware test."
+        description="Run or preview the one-board simulated Capsule hardware test."
     )
     parser.add_argument(
         "mode",
@@ -111,7 +111,7 @@ def load_ports(sample_ports: list[str]) -> tuple[list[dict[str, Any]], str | Non
 
 
 def print_ports(ports: list[dict[str, Any]], error: str | None = None) -> list[str]:
-    print("Dragon Radar board simulation port check")
+    print("Capsule board simulation port check")
     if error:
         print(f"Port helper error: {error}")
         return []

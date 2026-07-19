@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct RadarOverviewView: View {
@@ -6,30 +7,28 @@ struct RadarOverviewView: View {
 
     var body: some View {
         @Bindable var state = appState
-        let members = appState.members
-        let activeSpeakers = appState.activeSpeakers
-        let remoteMembers = Array(members.dropFirst()).filter(\.isOnline)
+        let members = appState.members.filter { $0.role == "app" || $0.isLocal }
+        let remoteMembers = members.filter { !$0.isCurrentUser && !$0.isLocal && $0.isOnline }
+        let blips = RadarBlipViewModel.make(from: remoteMembers)
         let targetSnapshot = RadarTargetSnapshot(
-            remoteTargetCount: remoteMembers.count,
+            remoteTargetCount: blips.count,
             roomLatency: appState.roomLatency,
-            activeSpeakerCount: activeSpeakers.count,
-            voiceQuality: appState.voiceQuality,
-            blips: RadarBlipViewModel.make(from: remoteMembers)
+            rangeText: RadarBlipViewModel.rangeText(for: blips),
+            blips: blips
         )
-        let voiceSnapshot = VoicePanelSnapshot(
-            voiceQuality: appState.voiceQuality,
-            activeSpeakers: activeSpeakers
-        )
-        let deviceSnapshot = DeviceStripSnapshot(device: appState.activeDevice)
 
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
-                RadarTargetPanel(snapshot: targetSnapshot)
-                    .overlay(alignment: .topTrailing) {
-                        BulmaPeekDecoration()
+                if appState.isReviewExperienceActive {
+                    ReviewExperienceBanner {
+                        appState.stopReviewExperience()
                     }
+                    ReviewExperienceTargetPicker(members: remoteMembers) { member in
+                        state.selectedMember = member
+                    }
+                }
 
-                ActiveVoicePanel(snapshot: voiceSnapshot)
+                RadarTargetPanel(snapshot: targetSnapshot)
 
                 LazyVStack(spacing: 12) {
                     ForEach(members) { member in
@@ -39,11 +38,10 @@ struct RadarOverviewView: View {
                             MemberRow(member: member)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("radar.member.\(member.id.uuidString)")
                     }
                 }
                 .mangaCard("实时目标")
-
-                DeviceStrip(snapshot: deviceSnapshot)
             }
             .padding(18)
             .padding(.bottom, 18)
@@ -56,123 +54,19 @@ struct RadarOverviewView: View {
     }
 }
 
-private struct BulmaPeekDecoration: View {
-    var body: some View {
-        Image("BulmaPeekCutout")
-            .resizable()
-            .scaledToFit()
-            .frame(width: 132)
-            .offset(x: -46, y: -118)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-    }
-}
-
-struct VoicePanelSnapshot: Hashable {
-    var voiceQuality: String
-    var activeSpeakers: [RoomMember]
-}
-
-struct ActiveVoicePanel: View {
-    var snapshot: VoicePanelSnapshot
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label("雷达语音状态", systemImage: "waveform")
-                    .font(.headline.weight(.black))
-                Spacer()
-                StatusChip(text: snapshot.voiceQuality, filled: true)
-            }
-
-            HStack(spacing: 10) {
-                if snapshot.activeSpeakers.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("等待雷达麦克风")
-                            .font(.headline.weight(.black))
-                        Text("iOS 只查看语音状态，不采集或播放语音。")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(MangaTheme.subtle)
-                    }
-                } else {
-                    ForEach(snapshot.activeSpeakers.prefix(3)) { member in
-                        VStack(spacing: 7) {
-                            Text(String(member.name.prefix(1)))
-                                .font(.title3.weight(.black))
-                                .frame(width: 44, height: 44)
-                                .background(MangaTheme.chip, in: Circle())
-                                .foregroundStyle(MangaTheme.ink)
-                                .overlay(Circle().stroke(MangaTheme.ink, lineWidth: 2))
-                            Text(member.name)
-                                .font(.caption.weight(.bold))
-                            if !member.voiceCountdownText.isEmpty {
-                                Text(member.voiceCountdownText)
-                                    .font(.caption2.monospacedDigit().weight(.black))
-                            }
-                        }
-                    }
-                    if snapshot.activeSpeakers.count > 3 {
-                        StatusChip(text: "+\(snapshot.activeSpeakers.count - 3)")
-                    }
-                }
-
-                Spacer()
-                StatusChip(text: "\(snapshot.activeSpeakers.count) 路", filled: snapshot.activeSpeakers.count > 0)
-            }
-        }
-        .mangaCard("雷达语音")
-    }
-}
-
-struct DeviceStripSnapshot: Hashable {
-    var deviceName: String
-    var networkText: String
-    var stateText: String
-
-    init(device: RadarDevice?) {
-        deviceName = device?.name ?? "未绑定雷达"
-        networkText = "\(device?.wifiName ?? "无网络") · \(device?.relayLatency ?? 0)ms"
-        stateText = device?.state.rawValue ?? "离线"
-    }
-}
-
-struct DeviceStrip: View {
-    var snapshot: DeviceStripSnapshot
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "dot.radiowaves.left.and.right")
-                .font(.title2.weight(.black))
-                .frame(width: 44, height: 44)
-                .background(MangaTheme.chip, in: RoundedRectangle(cornerRadius: 14))
-                .foregroundStyle(MangaTheme.ink)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(snapshot.deviceName)
-                    .font(.headline.weight(.black))
-                Text(snapshot.networkText)
-                    .font(.caption)
-                    .foregroundStyle(MangaTheme.subtle)
-            }
-
-            Spacer()
-            StatusChip(text: snapshot.stateText, filled: true)
-        }
-        .mangaCard("本机雷达")
-    }
-}
-
 struct RadarTargetSnapshot: Hashable {
     var remoteTargetCount: Int
     var roomLatency: Int
-    var activeSpeakerCount: Int
-    var voiceQuality: String
+    var rangeText: String
     var blips: [RadarBlipViewModel]
 }
 
 struct RadarBlipViewModel: Identifiable, Hashable {
     let id: RoomMember.ID
     var member: RoomMember
+    var distanceMeters: Double
+    var bearingDegrees: Double
+    var rangeMeters: Double
     private var offsetX: CGFloat
     private var offsetY: CGFloat
 
@@ -185,34 +79,63 @@ struct RadarBlipViewModel: Identifiable, Hashable {
     }
 
     static func make(from members: [RoomMember]) -> [RadarBlipViewModel] {
-        members.prefix(layouts.count).enumerated().map { index, member in
-            let layout = layouts[index]
+        let locatedMembers = members.prefix(6).compactMap { member -> (RoomMember, Double, Double)? in
+            guard
+                let distance = distanceMeters(from: member.distance),
+                let bearing = bearingDegrees(from: member.bearing)
+            else { return nil }
+            return (member, distance, bearing)
+        }
+        let range = radarRange(for: locatedMembers.map { $0.1 })
+        return locatedMembers.map { member, distance, bearing in
+            let radians = bearing * .pi / 180
+            let normalizedRadius = min(1, max(0.08, distance / range)) * 0.42
             return RadarBlipViewModel(
                 id: member.id,
                 member: member,
-                offsetX: layout.offsetX,
-                offsetY: layout.offsetY
+                distanceMeters: distance,
+                bearingDegrees: bearing,
+                rangeMeters: range,
+                offsetX: CGFloat(sin(radians) * normalizedRadius),
+                offsetY: CGFloat(-cos(radians) * normalizedRadius)
             )
         }
     }
 
-    private struct Layout {
-        var offsetX: CGFloat
-        var offsetY: CGFloat
+    static func rangeText(for blips: [RadarBlipViewModel]) -> String {
+        guard let range = blips.first?.rangeMeters else { return "等待定位" }
+        if range >= 1_000 {
+            return range.truncatingRemainder(dividingBy: 1_000) == 0
+                ? "\(Int(range / 1_000))km"
+                : String(format: "%.1fkm", range / 1_000)
+        }
+        return "\(Int(range))m"
     }
 
-    private static let layouts: [Layout] = {
-        let angles: [Double] = [-52, 34, 126, 205, 278, 82]
-        let multipliers: [CGFloat] = [0.58, 0.76, 0.92, 0.68, 0.84, 0.48]
-        return zip(angles, multipliers).map { angle, multiplier in
-            let radians = angle * .pi / 180
-            let radius = 0.34 * multiplier
-            return Layout(
-                offsetX: cos(radians) * radius,
-                offsetY: sin(radians) * radius
-            )
+    private static func distanceMeters(from text: String) -> Double? {
+        let value = text.lowercased().replacingOccurrences(of: " ", with: "")
+        if value.hasSuffix("km"), let number = Double(value.dropLast(2)) {
+            return max(0, number * 1_000)
         }
-    }()
+        if value.hasSuffix("m"), let number = Double(value.dropLast()) {
+            return max(0, number)
+        }
+        return nil
+    }
+
+    private static func bearingDegrees(from text: String) -> Double? {
+        guard let prefix = text.split(separator: "°", maxSplits: 1).first else { return nil }
+        guard let token = prefix.split(whereSeparator: \.isWhitespace).last,
+              let value = Double(token) else { return nil }
+        let normalized = value.truncatingRemainder(dividingBy: 360)
+        return normalized >= 0 ? normalized : normalized + 360
+    }
+
+    private static func radarRange(for distances: [Double]) -> Double {
+        let maximum = distances.max() ?? 0
+        let ranges: [Double] = [25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000]
+        return ranges.first(where: { $0 >= maximum }) ?? max(100_000, ceil(maximum / 100_000) * 100_000)
+    }
 }
 
 struct RadarTargetPanel: View {
@@ -225,21 +148,21 @@ struct RadarTargetPanel: View {
                     Text("雷达监视中")
                         .font(.largeTitle.weight(.black))
                         .foregroundStyle(MangaTheme.ink)
-                    Text("目标距离 · 方位同步 · 多人语音")
+                    Text("成员方向 · 距离同步 · 私人房间")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(MangaTheme.subtle)
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 6) {
                     StatusChip(text: "\(snapshot.remoteTargetCount) 个目标", filled: snapshot.remoteTargetCount > 0)
-                    StatusChip(text: snapshot.voiceQuality)
+                    StatusChip(text: "量程 \(snapshot.rangeText)")
                 }
             }
 
             HStack(spacing: 10) {
                 MetricTile(title: "目标", value: "\(snapshot.remoteTargetCount)", symbol: "scope")
                 MetricTile(title: "延迟", value: "\(snapshot.roomLatency)ms", symbol: "bolt.horizontal")
-                MetricTile(title: "说话", value: "\(snapshot.activeSpeakerCount)", symbol: "waveform")
+                MetricTile(title: "量程", value: snapshot.rangeText, symbol: "ruler")
             }
 
             ZStack {
@@ -269,7 +192,7 @@ struct RadarTargetPanel: View {
             .overlay(RoundedRectangle(cornerRadius: 18).stroke(MangaTheme.ink, lineWidth: 2))
             .accessibilityIdentifier("radar.live.manga.screen")
 
-            Text("这里展示成员相对我的实时方向、距离和说话状态；邀请、创建和成员槽位放到房间页。")
+            Text("0° 朝上；目标按成员相对方位与距离绘制。结果受 GPS 精度和网络时延影响，不用于安全导航。")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(MangaTheme.subtle)
         }
@@ -304,15 +227,23 @@ struct RadarBlip: View {
             Text(String(member.name.prefix(1)))
                 .font(.caption.weight(.black))
                 .frame(width: 28, height: 28)
-                .background(member.isSpeaking ? MangaTheme.chip : MangaTheme.panelLight, in: Circle())
+                .background(blipFill, in: Circle())
                 .overlay(Circle().stroke(MangaTheme.ink, lineWidth: 2))
             Text(member.distance)
                 .font(.caption2.monospacedDigit().weight(.black))
                 .padding(.horizontal, 5)
                 .padding(.vertical, 2)
-                .background(MangaTheme.panelLight, in: Capsule())
-                .overlay(Capsule().stroke(MangaTheme.ink.opacity(0.65), lineWidth: 1))
+                .background(MangaTheme.panelLight, in: RoundedRectangle(cornerRadius: 5))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(MangaTheme.ink.opacity(0.65), lineWidth: 1))
         }
+    }
+
+    private var blipFill: Color {
+        #if APP_ONLY
+        MangaTheme.panelLight
+        #else
+        member.isSpeaking ? MangaTheme.chip : MangaTheme.panelLight
+        #endif
     }
 }
 
@@ -371,35 +302,24 @@ struct MemberRow: View {
                     .frame(width: 42, height: 42)
                     .background(member.isOnline ? MangaTheme.panelLight : MangaTheme.chip, in: Circle())
                     .overlay(Circle().stroke(MangaTheme.ink, lineWidth: 2))
-                if member.isSpeaking {
-                    Image(systemName: "waveform")
-                        .font(.caption2.weight(.black))
-                        .padding(4)
-                        .background(MangaTheme.chip, in: Circle())
-                        .foregroundStyle(MangaTheme.ink)
-                }
             }
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
                     Text(member.name)
                         .font(.headline.weight(.black))
-                    if member.isMuted {
-                        Image(systemName: "mic.slash.fill")
-                            .font(.caption)
-                    }
                 }
                 Text("\(member.distance) · \(member.bearing) · \(member.accuracy)")
                     .font(.caption)
                     .foregroundStyle(MangaTheme.subtle)
-                Text(member.voiceStatusText)
+                Text(member.locationPaused ? "位置共享已暂停" : member.lastUpdate)
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(MangaTheme.subtle)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 5) {
                 StatusChip(text: member.isOnline ? "在线" : "离线", filled: member.isOnline)
-                Text(member.voiceCountdownText.isEmpty ? member.lastUpdate : member.voiceCountdownText)
+                Text(member.accuracy)
                     .font(.caption2)
                     .foregroundStyle(MangaTheme.subtle)
             }
@@ -434,17 +354,16 @@ struct MemberDetailView: View {
                 }
 
                 VStack(spacing: 10) {
-                    InfoRow(label: "雷达电量", value: member.deviceBattery >= 0 ? "\(member.deviceBattery)%" : "未知")
-                    InfoRow(label: "Wi-Fi RSSI", value: member.wifiRSSI > -200 ? "\(member.wifiRSSI) dBm" : "未知")
-                    InfoRow(label: "固件版本", value: member.firmware)
-                    InfoRow(label: "语音", value: member.voiceStatusText)
-                    InfoRow(label: "发言权", value: member.voiceCountdownText.isEmpty ? "未占用" : member.voiceCountdownText)
-                    InfoRow(label: "音频健康", value: member.voiceHealthText)
-                    InfoRow(label: "静音", value: member.isMuted ? "是" : "否")
+                    InfoRow(label: "距离", value: member.distance)
+                    InfoRow(label: "方位", value: member.bearing)
+                    InfoRow(label: "定位精度", value: member.accuracy)
+                    InfoRow(label: "位置共享", value: member.locationPaused ? "已暂停" : "开启")
+                    InfoRow(label: "在线状态", value: member.isOnline ? "在线" : "离线")
+                    InfoRow(label: "最近更新", value: member.lastUpdate)
                 }
                 .mangaCard("成员状态")
 
-                Text("语音由雷达处理，iOS 只显示当前状态。")
+                Text("距离和方位来自房间成员授权共享的 iPhone 位置，仅用于成员协同与娱乐体验。")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(MangaTheme.subtle)
             }

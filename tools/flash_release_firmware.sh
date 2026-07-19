@@ -5,9 +5,10 @@ usage() {
   cat <<'USAGE'
 Usage: tools/flash_release_firmware.sh [field|fielddiag|near|diag|sim|path/to/factory.bin]
 
-Flashes a packaged Dragon Radar factory binary without rebuilding firmware.
-Use this when `output/release-current/firmware/*.bin` already exists and you
-want a fast board swap between real play, diagnostics, and simulated bench.
+Flashes a packaged Capsule factory binary without rebuilding firmware.
+Factory images overwrite the NVS partition, including the device owner and
+Wi-Fi configuration. For routine firmware updates that preserve pairing, use
+`tools/build_radar.sh <mode> upload` instead.
 
 Environment:
   RELEASE_DIR      Release folder, default: output/release-current when run
@@ -21,10 +22,12 @@ Environment:
   FLASH_SIZE       esptool flash size, default: 32MB.
   ESPTOOL_BIN      esptool executable. Auto-detects PlatformIO's esptool.
   FLASH_ERASE      1 to erase flash before writing, default: 0.
+  FLASH_FACTORY_RESET
+                   Must be 1 to acknowledge that factory flashing clears NVS.
   FLASH_DRY_RUN    1 to print commands without flashing, default: 0.
 
 Examples:
-  RADAR_PORT=/dev/cu.usbmodem101 tools/flash_release_firmware.sh field
+  FLASH_FACTORY_RESET=1 RADAR_PORT=/dev/cu.usbmodem101 tools/flash_release_firmware.sh field
   RADAR_PORT=/dev/cu.usbmodem101 tools/flash_release_firmware.sh near
   RADAR_PORT=/dev/cu.usbmodem101 tools/flash_release_firmware.sh sim
   FLASH_DRY_RUN=1 RADAR_PORT=/dev/cu.test tools/flash_release_firmware.sh diag
@@ -55,15 +58,23 @@ FLASH_MODE="${FLASH_MODE:-dio}"
 FLASH_FREQ="${FLASH_FREQ:-80m}"
 FLASH_SIZE="${FLASH_SIZE:-32MB}"
 FLASH_ERASE="${FLASH_ERASE:-0}"
+FLASH_FACTORY_RESET="${FLASH_FACTORY_RESET:-0}"
 FLASH_DRY_RUN="${FLASH_DRY_RUN:-0}"
 
-for flag in FLASH_ERASE FLASH_DRY_RUN; do
+for flag in FLASH_ERASE FLASH_FACTORY_RESET FLASH_DRY_RUN; do
   value="${!flag}"
   if [[ "$value" != "0" && "$value" != "1" ]]; then
     echo "$flag must be 0 or 1, got: $value" >&2
     exit 2
   fi
 done
+
+if [[ "$FLASH_FACTORY_RESET" != "1" ]]; then
+  echo "Refusing factory flash because it overwrites owner and Wi-Fi configuration in NVS." >&2
+  echo "For a pairing-preserving update, use: RADAR_PORT=<port> tools/build_radar.sh field upload" >&2
+  echo "For an intentional factory reset, rerun with FLASH_FACTORY_RESET=1." >&2
+  exit 2
+fi
 
 if ! [[ "$RADAR_BAUD" =~ ^[0-9]+$ ]]; then
   echo "RADAR_BAUD must be a positive integer, got: $RADAR_BAUD" >&2
@@ -135,7 +146,7 @@ if [[ -n "${RADAR_PORT:-}" ]]; then
   BASE_CMD+=(--port "$RADAR_PORT")
 fi
 
-echo "Flashing Dragon Radar factory image: $FACTORY_BIN"
+echo "Flashing Capsule factory image: $FACTORY_BIN"
 if [[ -z "${RADAR_PORT:-}" ]]; then
   echo "RADAR_PORT not set; esptool will try to auto-detect a serial port."
 fi

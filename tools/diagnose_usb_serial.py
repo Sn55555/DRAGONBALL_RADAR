@@ -36,7 +36,7 @@ USB_POSITIVE_HINTS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Diagnose Dragon Radar USB serial readiness and write a Chinese report."
+        description="Diagnose Capsule USB serial readiness and write a Chinese report."
     )
     parser.add_argument("--json-output", default="output/usb-serial-diagnosis.json", help="JSON report path.")
     parser.add_argument("--md-output", default="output/usb-serial-diagnosis.zh.md", help="Chinese Markdown report path.")
@@ -189,7 +189,7 @@ def classify(ports: list[PortInfo]) -> tuple[str, str, list[str]]:
             "multiple-candidates",
             f"发现多个可能的 ESP32-S3 串口：{joined}",
             [
-                "先只保留龙珠雷达主板连接，拔掉其他 ESP32/USB 串口设备。",
+                "先只保留胶囊主板连接，拔掉其他 ESP32/USB 串口设备。",
                 "或者显式指定端口：`RADAR_PORT=/dev/cu.usbmodem101 tools/first_run_zh.py auto`。",
                 "重新运行 `tools/diagnose_usb_serial.py` 确认可用候选只剩一个。",
             ],
@@ -277,7 +277,7 @@ def build_report(ports: list[PortInfo], usb_devices: list[dict[str, Any]], usb_e
 def render_markdown(report: dict[str, Any]) -> str:
     selected = report.get("selectedPort") or "未选择"
     lines = [
-        "# 龙珠雷达 USB 串口诊断",
+        "# 胶囊 USB 串口诊断",
         "",
         f"- 生成时间: {report['generated']}",
         f"- 状态: `{report['status']}`",
