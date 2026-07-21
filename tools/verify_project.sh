@@ -128,8 +128,8 @@ grep -Fq 'bleSecure = "ble_secure"' ios/DragonRadarMVP/DragonRadarMVP/Sources/BL
   echo "iOS does not decode the authenticated BLE-link state." >&2
   exit 1
 }
-grep -Fq '雷达圆屏上临时显示的 6 位数字' ios/DragonRadarMVP/DragonRadarMVP/Sources/DevicesView.swift || {
-  echo "iOS pairing UI does not explain the system passkey prompt." >&2
+grep -Fq '首次连接成功后，以后会自动连接。' ios/DragonRadarMVP/DragonRadarMVP/Sources/DevicesView.swift || {
+  echo "iOS pairing UI does not explain first-time scan and automatic reconnection." >&2
   exit 1
 }
 echo "ble-transport-security-contract-ok"
