@@ -163,7 +163,6 @@ constexpr int16_t kEdgeGestureActivationPx = 10;
 constexpr uint32_t kSystemMenuTimeoutMs = 8000;
 constexpr uint32_t kSystemMenuControlFeedbackMs = 220;
 constexpr uint32_t kSystemMenuPageTransitionMs = 180;
-constexpr uint32_t kStandbyTouchWakeMs = 600;
 constexpr uint32_t kPowerConfirmHoldMs = 1500;
 constexpr uint32_t kFactoryResetConfirmHoldMs = 4000;
 constexpr int16_t kSystemMenuSwipeThresholdPx = 52;
@@ -3973,29 +3972,17 @@ void pollTouch() {
     return;
   }
 
-  if (radarUiMode == RadarUiMode::ScreenOff) {
+  if (radarUiMode == RadarUiMode::ScreenOff ||
+      radarUiMode == RadarUiMode::Standby) {
+    // Sleep wake sources are intentionally limited to a physical button and
+    // an authenticated room voice request delivered by the paired phone.
+    // Consume any touch until release so a finger already on the glass cannot
+    // become an active-screen gesture after another source wakes the radar.
     if (count > 0) {
-      wakeRadarDisplay();
       ignoreTouchUntilRelease = true;
     }
-    return;
-  }
-
-  if (radarUiMode == RadarUiMode::Standby) {
-    if (count > 0) {
-      touchLastX = x[0];
-      touchLastY = y[0];
-      if (!touchWasPressed) {
-        touchWasPressed = true;
-        touchPressedAtMs = now;
-      } else if (touchPressedAtMs > 0 && now - touchPressedAtMs >= kStandbyTouchWakeMs) {
-        wakeRadarDisplay();
-        ignoreTouchUntilRelease = true;
-      }
-    } else {
-      touchWasPressed = false;
-      touchPressedAtMs = 0;
-    }
+    touchWasPressed = false;
+    touchPressedAtMs = 0;
     return;
   }
 
@@ -5545,15 +5532,15 @@ void handleVoiceControlWrite(BLECharacteristic *characteristic) {
     bleVoiceGateway.ready = false;
     bleVoiceGateway.remoteTalkActive = false;
     provisioning.lastWrite = "voice_gateway_unavailable";
-  } else if (command == "remote_begin" || command == "wake") {
+  } else if (command == "remote_begin") {
     bleVoiceGateway.ready = true;
-    bleVoiceGateway.remoteTalkActive = command == "remote_begin";
+    bleVoiceGateway.remoteTalkActive = true;
     if (radarUiMode == RadarUiMode::ScreenOff || radarUiMode == RadarUiMode::Standby) {
       wakeRadarDisplay();
     }
     lastUserInputMs = millis();
-    provisioning.lastWrite = command == "remote_begin" ? "remote_voice_begin" : "remote_wake";
-    notifyVoiceControl(command == "remote_begin" ? "remote_ready" : "wake_ack");
+    provisioning.lastWrite = "remote_voice_begin";
+    notifyVoiceControl("remote_ready");
   } else if (command == "remote_end") {
     bleVoiceGateway.remoteTalkActive = false;
     provisioning.lastWrite = "remote_voice_end";
@@ -5942,8 +5929,8 @@ void provisioningTick() {
     const int8_t result = bleSecurityEventResult;
     if (result == 0) {
       provisioning.lastWrite = "ble_pairing_code_displayed";
-      if (displayOnline && !radarUiDisplayActive()) {
-        wakeRadarDisplay();
+      if (radarUiDisplayActive()) {
+        lastUserInputMs = now;
       }
       Serial.println("BLE secure pairing code displayed on radar");
     } else if (result > 0) {
