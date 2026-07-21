@@ -1262,6 +1262,7 @@ struct WifiConfigSheet: View {
     @State private var ssid = ""
     @State private var password = ""
     @State private var writePhase: AppOperationPhase = .idle
+    var onConfigurationWritten: (() -> Void)? = nil
 
     private var canSave: Bool {
         !ssid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !writePhase.isLoading
@@ -1349,6 +1350,28 @@ struct WifiConfigSheet: View {
             return
         }
         appState.applyWifiConfig(ssid: cleanSSID)
+
+        if let onConfigurationWritten {
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard bleBridge.isBLEConnected else {
+                    writePhase = .failed("雷达连接已断开，请靠近后重试")
+                    return
+                }
+                if bleBridge.lastWriteEvent == "雷达写入已确认" {
+                    writePhase = .success("网络已保存，正在继续更新")
+                    onConfigurationWritten()
+                    dismiss()
+                    return
+                }
+                if bleBridge.lastWriteEvent.contains("失败") {
+                    writePhase = .failed(userFacingWriteFailure(defaultMessage: "Wi-Fi 写入失败"))
+                    return
+                }
+            }
+            writePhase = .failed("雷达未确认网络配置，请保持靠近后重试")
+            return
+        }
 
         let roomCode = appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let deviceToken = appState.activeDeviceToken.trimmingCharacters(in: .whitespacesAndNewlines)

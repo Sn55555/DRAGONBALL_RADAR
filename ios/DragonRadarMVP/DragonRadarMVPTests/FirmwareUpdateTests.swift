@@ -369,6 +369,66 @@ final class FirmwareUpdateTests: XCTestCase {
     }
 
     @MainActor
+    func testPreviousReleaseSuccessDoesNotFailNewAvailableUpdate() throws {
+        let coordinator = makeCoordinator()
+        let manifest = makeManifest(signature: "AA==")
+        coordinator.availableRelease = VerifiedFirmwareManifest(
+            manifest: manifest,
+            artifactURL: try XCTUnwrap(URL(string: "https://relay.example/v1/firmware/artifacts/radar.bin"))
+        )
+        coordinator.phase = .available
+        coordinator.detail = "发现版本 \(manifest.version)"
+
+        coordinator.synchronize(
+            status: RadarBLEFirmwareStatus(
+                firmwareVersion: "1.0.13",
+                build: 15,
+                stage: "success",
+                progress: 100,
+                targetVersion: "1.0.13",
+                targetBuild: 15
+            ),
+            deviceStatus: nil
+        )
+
+        XCTAssertEqual(coordinator.phase, .available)
+        XCTAssertEqual(coordinator.progress, 0)
+        XCTAssertEqual(coordinator.detail, "发现版本 \(manifest.version)")
+    }
+
+    @MainActor
+    func testWaitingForOTAWifiAcknowledgesControlWithoutUsingPreviousSuccess() throws {
+        let coordinator = makeCoordinator()
+        let manifest = makeManifest(signature: "AA==")
+        coordinator.availableRelease = VerifiedFirmwareManifest(
+            manifest: manifest,
+            artifactURL: try XCTUnwrap(URL(string: "https://relay.example/v1/firmware/artifacts/radar.bin"))
+        )
+        coordinator.phase = .sending
+
+        coordinator.synchronize(
+            status: RadarBLEFirmwareStatus(
+                firmwareVersion: "1.0.13",
+                build: 15,
+                stage: "success",
+                progress: 100,
+                targetVersion: "1.0.13",
+                targetBuild: 15
+            ),
+            deviceStatus: try decodeDeviceStatus(
+                percent: 50,
+                charging: true,
+                wifi: "connecting",
+                last: "ota_waiting_wifi"
+            )
+        )
+
+        XCTAssertEqual(coordinator.phase, .sending)
+        XCTAssertEqual(coordinator.progress, 0)
+        XCTAssertTrue(coordinator.detail.contains("正在连接"))
+    }
+
+    @MainActor
     func testSendingFailsOnWriteErrorOrMissing108Acknowledgement() async throws {
         let coordinator = FirmwareUpdateCoordinator(
             defaults: try XCTUnwrap(UserDefaults(suiteName: "FirmwareUpdateTests.\(UUID().uuidString)")),
@@ -444,12 +504,14 @@ final class FirmwareUpdateTests: XCTestCase {
         build: Int = 1,
         version: String = "1.0.0",
         securityCounter: Int? = nil,
-        otaOrigin: Int? = 1
+        otaOrigin: Int? = 1,
+        wifi: String = "connected",
+        last: String = "ready"
     ) throws -> RadarBLEDeviceStatus {
         let securityField = securityCounter.map { ",\"security_counter\":\($0)" } ?? ""
         let originField = otaOrigin.map { ",\"ota_origin\":\($0)" } ?? ""
         let json = """
-        {"v":1,"name":"Radar","ble":1,"paired":\(paired),"wifi":"connected","rssi":-40,"ip":"192.0.2.2","server":\(server),"relay":"ready","loc":1,"battery":{"present":true,"percent":\(percent),"voltage_mv":3900,"charging":\(charging),"discharging":false,"low":false},"last":"ready","fw":"\(version)","build":\(build),"hw":"esp32-s3-touch-amoled-1.75c","ota":1\(originField)\(securityField)}
+        {"v":1,"name":"Radar","ble":1,"paired":\(paired),"wifi":"\(wifi)","rssi":-40,"ip":"192.0.2.2","server":\(server),"relay":"ready","loc":1,"battery":{"present":true,"percent":\(percent),"voltage_mv":3900,"charging":\(charging),"discharging":false,"low":false},"last":"\(last)","fw":"\(version)","build":\(build),"hw":"esp32-s3-touch-amoled-1.75c","ota":1\(originField)\(securityField)}
         """
         return try JSONDecoder().decode(RadarBLEDeviceStatus.self, from: Data(json.utf8))
     }

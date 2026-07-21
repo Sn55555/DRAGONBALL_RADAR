@@ -297,10 +297,22 @@ struct RadarBLEDeviceStatus: Decodable, Hashable {
         return "\(percent)%"
     }
     var wifiText: String {
-        if wifi == "connected" {
-            return ip.isEmpty ? "connected" : "\(ip) · \(rssi)dBm"
+        switch wifi {
+        case "connected":
+            return ip.isEmpty ? "已连接" : "已连接 · \(ip) · \(rssi)dBm"
+        case "connecting":
+            return "正在连接"
+        case "missing":
+            return "找不到网络"
+        case "failed":
+            return "连接失败"
+        case "lost":
+            return "连接已中断"
+        case "disconnected":
+            return "未连接"
+        default:
+            return "状态未知"
         }
-        return wifi
     }
 
     var firmwareText: String {

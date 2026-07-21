@@ -6,6 +6,7 @@ struct FirmwareUpdateView: View {
     @Environment(RadarRuntime.self) private var radarRuntime
     @Environment(FirmwareUpdateCoordinator.self) private var firmwareUpdate
     @State private var showingConfirmation = false
+    @State private var showingWifiConfiguration = false
     @State private var ownerSessionRecoveryInFlight = false
     @State private var ownerSessionRecoveryDetail = ""
 
@@ -37,6 +38,11 @@ struct FirmwareUpdateView: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text(confirmationText)
+        }
+        .sheet(isPresented: $showingWifiConfiguration) {
+            WifiConfigSheet {
+                firmwareUpdate.startUpdate(bleBridge: bleBridge)
+            }
         }
         .accessibilityIdentifier("devices.firmware.update")
     }
@@ -138,9 +144,16 @@ struct FirmwareUpdateView: View {
 
         if firmwareUpdate.phase == .available {
             Button {
-                showingConfirmation = true
+                if needsInitialOTANetworkConfiguration {
+                    showingWifiConfiguration = true
+                } else {
+                    showingConfirmation = true
+                }
             } label: {
-                Label("安装已验证更新", systemImage: "arrow.down.circle.fill")
+                Label(
+                    needsInitialOTANetworkConfiguration ? "设置 OTA 网络并继续" : "安装已验证更新",
+                    systemImage: needsInitialOTANetworkConfiguration ? "wifi" : "arrow.down.circle.fill"
+                )
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(InkButtonStyle())
@@ -174,6 +187,17 @@ struct FirmwareUpdateView: View {
             .disabled(firmwareUpdate.phase == .canceling)
         }
 
+        if firmwareUpdate.phase == .sending, bleBridge.deviceStatus?.wifi != "connected" {
+            Button {
+                showingWifiConfiguration = true
+            } label: {
+                Label("更换 OTA 网络并自动重试", systemImage: "wifi.exclamationmark")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(InkButtonStyle(filled: false))
+            .accessibilityIdentifier("devices.firmware.network.retry")
+        }
+
         Button {
             Task {
                 await refreshOTAState()
@@ -202,7 +226,7 @@ struct FirmwareUpdateView: View {
             FirmwareGateRow(title: "所有者会话", detail: ownerSessionGateDetail, passed: ownerSessionGatePassed)
             FirmwareGateRow(title: "更新源", detail: originGateDetail, passed: bleBridge.deviceStatus?.isOTAOriginConfirmed == true)
             FirmwareGateRow(title: "硬件型号", detail: hardwareGateDetail, passed: hardwareGatePassed)
-            FirmwareGateRow(title: "Wi-Fi", detail: bleBridge.deviceStatus?.wifiText ?? "状态未上报", passed: bleBridge.deviceStatus?.wifi == "connected")
+            FirmwareGateRow(title: "更新网络", detail: otaNetworkGateDetail, passed: otaNetworkGatePassed)
             FirmwareGateRow(title: "电量", detail: batteryGateDetail, passed: batteryGatePassed)
             FirmwareGateRow(title: "升级基线", detail: baselineGateDetail, passed: baselineGatePassed)
             FirmwareGateRow(title: "防降级", detail: releaseGateDetail, passed: releaseGatePassed)
@@ -380,7 +404,6 @@ struct FirmwareUpdateView: View {
             && ownerSessionGatePassed
             && bleBridge.deviceStatus?.isOTAOriginConfirmed == true
             && hardwareGatePassed
-            && bleBridge.deviceStatus?.wifi == "connected"
             && batteryGatePassed
             && baselineGatePassed
             && releaseGatePassed
@@ -434,7 +457,38 @@ struct FirmwareUpdateView: View {
 
     private var confirmationText: String {
         guard let release = firmwareUpdate.availableRelease else { return "将开始无线更新。" }
-        return "将安装 \(release.manifest.version)（\(release.manifest.formattedSize)）。清单签名已验证。更新时保持雷达供电、联网并靠近手机。"
+        let network = recordedOTANetworkName.map { "雷达会临时连接“\($0)”下载固件。" } ?? "雷达会临时连接 OTA 网络下载固件。"
+        return "将安装 \(release.manifest.version)（\(release.manifest.formattedSize)）。清单签名已验证。\(network)更新时保持雷达供电并靠近手机。"
+    }
+
+    private var recordedOTANetworkName: String? {
+        guard let name = appState.activeDevice?.wifiName.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return nil
+        }
+        guard !name.isEmpty, name != "未同步", name != "未配置" else { return nil }
+        return name
+    }
+
+    private var needsInitialOTANetworkConfiguration: Bool {
+        bleBridge.deviceStatus?.wifi != "connected" && recordedOTANetworkName == nil
+    }
+
+    private var otaNetworkGatePassed: Bool {
+        bleBridge.deviceStatus?.wifi == "connected" || recordedOTANetworkName != nil
+    }
+
+    private var otaNetworkGateDetail: String {
+        if let status = bleBridge.deviceStatus, status.wifi == "connected" {
+            return status.wifiText
+        }
+        if firmwareUpdate.phase == .sending {
+            let network = recordedOTANetworkName.map { "“\($0)”" } ?? "已保存的网络"
+            return "正在连接 \(network)；请保持热点或 Wi-Fi 开启"
+        }
+        if let network = recordedOTANetworkName {
+            return "已保存“\(network)”；开始更新后雷达会临时联网"
+        }
+        return "尚未保存；安装前设置一次 Wi-Fi 或个人热点"
     }
 
     private func synchronizeOTAOriginIfNeeded() {

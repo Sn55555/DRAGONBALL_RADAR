@@ -543,10 +543,6 @@ final class FirmwareUpdateCoordinator {
             persist()
             return
         }
-        guard bleBridge.deviceStatus?.wifi == "connected" else {
-            fail("雷达尚未连接 Wi-Fi")
-            return
-        }
         guard bleBridge.deviceStatus?.isOTAPowerReady == true else {
             fail("雷达需处于充电中，或电量达到 30% 后才能更新")
             return
@@ -586,7 +582,9 @@ final class FirmwareUpdateCoordinator {
         }
         phase = .sending
         progress = 0
-        detail = "已发送签名清单，等待雷达开始下载"
+        detail = bleBridge.deviceStatus?.wifi == "connected"
+            ? "已发送签名清单，等待雷达开始下载"
+            : "已发送更新，雷达正在临时连接 OTA 网络"
         lastError = nil
         beginSendingAcknowledgementTimeout()
         persist()
@@ -620,10 +618,41 @@ final class FirmwareUpdateCoordinator {
     }
 
     func synchronize(status: RadarBLEFirmwareStatus?, deviceStatus: RadarBLEDeviceStatus?) {
+        if phase == .sending, let deviceStatus {
+            switch deviceStatus.last {
+            case "ota_waiting_wifi":
+                cancelSendingTimeout()
+                detail = "雷达正在连接用于更新的网络，请保持热点或 Wi-Fi 开启"
+            case "ota_rejected_wifi_unconfigured":
+                fail("尚未配置 OTA 网络，请设置 Wi-Fi 或个人热点后继续")
+                return
+            default:
+                break
+            }
+        }
+
         if let status {
             firmwareStatus = status
-            progress = status.progress
             let stage = status.stage.lowercased()
+            let terminalStages = ["success", "error", "rollback", "cancelled", "canceled"]
+            let expectedVersion = targetVersion
+            let expectedBuild = availableRelease?.manifest.build ?? status.targetBuild
+            let terminalMatchesTarget = expectedVersion != nil
+                && status.targetVersion == expectedVersion
+                && status.targetBuild == expectedBuild
+            let historicalTerminal = terminalStages.contains(stage)
+                && (status.targetVersion != nil || status.targetBuild != nil)
+                && !terminalMatchesTarget
+                && ![.canceling, .installing, .rebooting].contains(phase)
+
+            // 108 keeps the last terminal result until a new OTA actually starts. Do not
+            // mistake the previous release's success/error for the newly checked release.
+            if historicalTerminal {
+                persist()
+                return
+            }
+
+            progress = status.progress
             if stage != "idle" && phase != .canceling {
                 cancelSendingTimeout()
             }
@@ -646,8 +675,8 @@ final class FirmwareUpdateCoordinator {
             case "success":
                 cancelSendingTimeout()
                 if
-                    let expectedVersion = targetVersion,
-                    let expectedBuild = availableRelease?.manifest.build ?? status.targetBuild,
+                    let expectedVersion,
+                    let expectedBuild,
                     status.firmwareVersion == expectedVersion,
                     status.build == expectedBuild,
                     status.targetVersion == expectedVersion,
