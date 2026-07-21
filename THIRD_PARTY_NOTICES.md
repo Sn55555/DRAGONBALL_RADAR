@@ -39,6 +39,7 @@ locked deployment environment.
 | --- | --- | --- | --- | --- |
 | GFX Library for Arduino (Arduino_GFX) | 1.6.4 | Display driver and classic bitmap font; vendored under `lib/` | BSD two-clause text at `lib/GFX_Library_for_Arduino/license.txt` | <https://github.com/moononournation/Arduino_GFX/tree/v1.6.4> |
 | SensorLib | 0.3.3 | QMI8658 IMU and CST touch drivers; vendored under `lib/` | MIT text at `lib/SensorLib/LICENSE` and `library.json` metadata | <https://github.com/lewisxhe/SensorsLib/tree/v0.3.3> |
+| Fusion | 1.3.1 | Six-axis AHRS gravity estimate for tilt-compensated relative heading; vendored minimal AHRS subset under `lib/` | MIT text at `lib/Fusion/LICENSE.md` and retained source headers | <https://github.com/xioTechnologies/Fusion/tree/v1.3.1> |
 | Arduino-ESP32 core | 3.3.8 | Arduino runtime plus Networking, Wi-Fi, TLS, HTTP, Update, Preferences, SPI, Wire, I2S, and BLE libraries | Installed package metadata declares `LGPL-2.1-or-later`; individual source files also carry LGPL-2.1-or-later, Apache-2.0, MIT, or BSD notices | <https://github.com/espressif/arduino-esp32/tree/3.3.8> |
 | Arduino-ESP32 precompiled libraries | 5.5.4+sha.735507283d | ESP-IDF and chip-support archives linked by Arduino-ESP32 | Installed package metadata declares `LGPL-2.1-or-later`; this is package-level metadata and is not a verified replacement for all component/blob notices | <https://github.com/espressif/esp32-arduino-lib-builder> |
 | Arduino ESP32 BLE Library | bundled with Arduino-ESP32 3.3.8 | BLE provisioning and binding | Apache-2.0 plus upstream NOTICE, copied to `lib/PLATFORMIO-RUNTIME-LICENSES/` | <https://github.com/espressif/arduino-esp32/tree/3.3.8/libraries/BLE> |
@@ -147,6 +148,7 @@ clearly identified from the product documentation:
 - `lib/GFX_Library_for_Arduino/FONT-LICENSES.md` and the font license files if
   the vendored source tree is distributed, or if those fonts are ever linked;
 - `lib/SensorLib/LICENSE`;
+- `lib/Fusion/LICENSE.md`;
 - `lib/PLATFORMIO-RUNTIME-LICENSES/LGPL-2.1.txt`;
 - `lib/PLATFORMIO-RUNTIME-LICENSES/Apache-2.0.txt`;
 - `lib/PLATFORMIO-RUNTIME-LICENSES/ARDUINO-ESP32-BLE-NOTICE.txt`;

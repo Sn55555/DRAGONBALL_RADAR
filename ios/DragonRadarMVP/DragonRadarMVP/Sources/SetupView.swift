@@ -19,7 +19,7 @@ struct SetupView: View {
                             .foregroundStyle(MangaTheme.subtle)
                         SetupReadinessStrip(
                             locationReady: locationReady,
-                            espReady: bleBridge.isRegistrationComplete,
+                            espReady: bindingReady,
                             roomReady: roomReady,
                             relayReady: radarRuntime.relayPhase == .ready
                         )
@@ -41,8 +41,8 @@ struct SetupView: View {
                         index: 2,
                         title: "雷达一次性绑定",
                         detail: espRegistrationDetail,
-                        isReady: bleBridge.isRegistrationComplete,
-                        primaryTitle: bleBridge.isRegistrationComplete ? "查看雷达" : "绑定雷达",
+                        isReady: bindingReady,
+                        primaryTitle: bindingReady ? "查看雷达" : "绑定雷达",
                         primarySymbol: "link",
                         primaryAction: openPairing
                     )
@@ -120,6 +120,10 @@ struct SetupView: View {
         locationBridge.isSharing && locationBridge.snapshot != nil
     }
 
+    private var bindingReady: Bool {
+        !appState.devices.isEmpty && bleBridge.isRegistrationComplete
+    }
+
     private var roomReady: Bool {
         !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -129,8 +133,11 @@ struct SetupView: View {
     }
 
     private var espRegistrationDetail: String {
-        if bleBridge.isRegistrationComplete {
+        if bindingReady {
             return bleBridge.registrationText
+        }
+        if appState.devices.isEmpty, bleBridge.hasSavedRegistration {
+            return "雷达保留旧配置 · 当前账户未绑定"
         }
         if bleBridge.isBLEConnected {
             return "雷达已连接 · 等待完成绑定"
@@ -169,7 +176,10 @@ struct SetupView: View {
     }
 
     private var radarConnectionDetail: String {
-        if bleBridge.isRegistrationComplete { return "雷达已绑定" }
+        if bindingReady { return "雷达已绑定" }
+        if appState.devices.isEmpty, bleBridge.hasSavedRegistration {
+            return "雷达有旧配置 · 当前账户未绑定"
+        }
         if bleBridge.isBLEConnected { return "雷达已连接" }
         return "未连接雷达"
     }
@@ -186,7 +196,6 @@ struct SetupView: View {
     private func openPairing() {
         appState.selectedTab = .devices
         appState.showPairingSheet = true
-        bleBridge.startScan()
     }
 
     private func openWifiConfig() {

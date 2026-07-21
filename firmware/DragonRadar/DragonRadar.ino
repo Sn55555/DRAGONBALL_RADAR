@@ -19,11 +19,16 @@
 #include <string.h>
 #include <time.h>
 
+extern "C" {
+#include <FusionAhrs.h>
+}
+
 #include "SensorQMI8658.hpp"
 #include "TouchDrvCSTXXX.hpp"
 #include "DisplayOrientation.h"
 #include "FirmwareVersion.h"
 #include "HeadingAlignment.h"
+#include "HeadingStability.h"
 #include "OtaManager.h"
 #include "bulma_boot_badge.h"
 #include "boot_audio_pcm.h"
@@ -78,7 +83,7 @@
 #endif
 
 #ifndef DRAGON_RADAR_FRAME_MS
-#define DRAGON_RADAR_FRAME_MS 25
+#define DRAGON_RADAR_FRAME_MS 33
 #endif
 
 #ifndef DRAGON_RADAR_DISPLAY_BUS_HZ
@@ -167,6 +172,7 @@ constexpr int16_t kSystemMenuActionRadius = 70;
 constexpr uint8_t kAxp2101Address = 0x34;
 constexpr uint8_t kAxpStatus1Reg = 0x00;
 constexpr uint8_t kAxpStatus2Reg = 0x01;
+constexpr uint8_t kAxpCommonConfigReg = 0x10;
 constexpr uint8_t kAxpChargerFuelGaugeReg = 0x18;
 constexpr uint8_t kAxpIrqEnable1Reg = 0x41;
 constexpr uint8_t kAxpIrqStatus1Reg = 0x49;
@@ -177,6 +183,7 @@ constexpr uint8_t kAxpGaugeEnableBit = 0x08;
 constexpr uint8_t kAxpBatteryPresentBit = 0x08;
 constexpr uint8_t kAxpPowerKeyLongPressBit = 0x04;
 constexpr uint8_t kAxpPowerKeyShortPressBit = 0x08;
+constexpr uint8_t kAxpSoftwareShutdownBit = 0x01;
 constexpr int kAudioSampleRate = 16000;
 constexpr int kBootAudioSampleRate = 44100;
 constexpr uint8_t kBootAudioChannels = 2;
@@ -254,10 +261,15 @@ constexpr const char *kServerConfigUuid = "7d540106-f82d-4b2f-91c6-4f0f88aa5a11"
 constexpr const char *kFirmwareControlUuid = "7d540107-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kFirmwareStatusUuid = "7d540108-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr uint32_t kDeviceStatusNotifyMs = 2000;
+constexpr uint32_t kScreenOffDeviceStatusNotifyMs = 10000;
+constexpr uint32_t kStandbyDeviceStatusNotifyMs = 30000;
 constexpr uint32_t kFirmwareStatusNotifyMs = 500;
 constexpr uint32_t kRelayReconnectMs = 5000;
 constexpr uint32_t kRelayHeartbeatMs = 15000;
+constexpr uint32_t kScreenOffRelayHeartbeatMs = 30000;
+constexpr uint32_t kStandbyRelayHeartbeatMs = 60000;
 constexpr uint32_t kRelayStatusMs = 5000;
+constexpr uint32_t kStandbyRelayStatusMs = 30000;
 constexpr uint32_t kRelayTimeSyncTimeoutMs = 10000;
 constexpr uint32_t kRelayTimeSyncRetryMs = 30000;
 constexpr time_t kMinimumRelayTlsEpoch = 1704067200;  // 2024-01-01 UTC
@@ -273,6 +285,7 @@ constexpr uint32_t kHeadingAlignmentMaxClockSkewS = 5;
 constexpr uint32_t kRemoteSpeakingHoldMs = 1300;
 constexpr uint8_t kDistanceLabelTextSize = 2;
 constexpr uint32_t kVoiceSampleTickMs = 20;
+constexpr uint32_t kAudioIdleSuspendMs = 3000;
 constexpr uint32_t kVoiceFrameTickMs = 20;
 constexpr uint16_t kVoiceFrameDurationMs = 20;
 constexpr uint16_t kVoiceVadRmsThreshold = 650;
@@ -307,17 +320,24 @@ constexpr uint16_t kGyroStationaryMinSamples = 24;
 // the variance gate decide whether the board is actually being held still.
 constexpr float kGyroStationaryBootstrapDps = 8.0f;
 constexpr float kGyroStationaryWarmStartDps = 1.5f;
-constexpr float kGyroStationaryCorrectedDps = 0.35f;
+// Full-vector noise on the second board reaches about 0.8 dps at the runtime
+// sampling cadence even while its gravity-axis rate stays near zero. Use the
+// vector gate to reject handling motion and the tighter vertical gate below to
+// protect yaw from intentional turns.
+constexpr float kGyroStationaryCorrectedDps = 1.0f;
+constexpr float kGyroStationaryVerticalDps = 0.35f;
 constexpr float kGyroStationaryStdDevDps = 0.18f;
 constexpr float kGyroBiasBackgroundBlend = 0.12f;
 // Board-to-board accelerometer scale error is also visible at rest (the second
 // board reports about 1.073 g). Keep the gate tight enough to reject handling
 // motion while allowing stationary sensors with normal production tolerance.
 constexpr float kStationaryAccelToleranceG = 0.10f;
-constexpr float kGravityUpdateToleranceG = 0.18f;
 constexpr float kGravityReliableToleranceG = 0.12f;
-constexpr float kGravityAccelCorrectionTimeConstantS = 1.5f;
 constexpr uint32_t kGravityReliableHoldMs = 300;
+constexpr float kFusionNominalSampleRateHz = 15.0f;
+constexpr float kFusionGain = 0.5f;
+constexpr float kFusionAccelerationRejectionDeg = 10.0f;
+constexpr float kFusionRecoveryPeriodS = 5.0f;
 constexpr uint32_t kImuSampleFreshMs = 250;
 constexpr uint32_t kImuTemperaturePollMs = 30000;
 constexpr uint32_t kImuTemperatureRetryMs = 500;
@@ -414,7 +434,10 @@ struct HeadingEstimatorState {
   bool biasDirty = false;
   bool forceBiasPersistAfterStrictVerification = false;
   bool gravityValid = false;
+  bool fusionReady = false;
+  bool fusionAccelerometerIgnored = false;
   bool stationary = false;
+  bool yawLocked = false;
   bool relativeYawValid = false;
   bool sessionStationaryVerified = false;
   bool sessionTrustFromStoredBias = false;
@@ -430,10 +453,12 @@ struct HeadingEstimatorState {
   float gravityX = 0.0f;
   float gravityY = 0.0f;
   float gravityZ = 1.0f;
+  float rawVerticalRateDps = 0.0f;
   float verticalRateDps = 0.0f;
   float accelMagnitudeG = 0.0f;
   float correctedGyroMagnitudeDps = 0.0f;
   float stationaryGyroLimitDps = 0.0f;
+  float stationaryVerticalLimitDps = 0.0f;
   float lastStationaryMaxStdDevDps = NAN;
   bool stationaryCandidate = false;
   uint32_t lastSampleMs = 0;
@@ -571,6 +596,15 @@ struct BatteryStatus {
   uint32_t lastReadMs = 0;
 };
 
+struct PowerResourceState {
+  bool displaySleeping = false;
+  bool audioSuspended = false;
+  bool imuSuspended = false;
+  bool wifiPowerSave = false;
+  bool pmicShutdownRequested = false;
+  uint32_t lastAudioActivityMs = 0;
+};
+
 struct BootAudioCue {
   float phase = 0.0f;
   float frequency = 0.0f;
@@ -601,6 +635,7 @@ TouchDrvCST92xx touch;
 SensorQMI8658 qmi;
 IMUdata acc;
 IMUdata gyr;
+FusionAhrs fusionAhrs;
 HeadingEstimatorState headingEstimator;
 ImuDiagnosticsState imuDiagnostics;
 HeadingAlignmentState headingAlignment;
@@ -625,6 +660,7 @@ DragonRadarOta::Manager otaManager;
 AudioTone tone;
 VoiceCaptureState voiceCapture;
 BatteryStatus batteryStatus;
+PowerResourceState powerResources;
 RemoteProvisioningState provisioning;
 RemoteLocationFrame selfLocationFrame;
 RemoteLocationFrame remoteAppLocationFrame;
@@ -786,12 +822,24 @@ void serialDiagnosticsTick();
 int circleChordHalf(int offset, int radius = kRadarRadius);
 void resetEdgeGesture();
 void runBootAnimation();
+void setupAudio();
 void setupImu();
 void readImu();
+void resetFusionAhrs();
 void invalidateRelativeHeading(bool clearSessionTrust = true);
 bool imuTemperaturePlausible(float value);
 bool gyroBiasTemperatureCompatible();
 void setRadarUiMode(RadarUiMode mode);
+void applyPowerResourcesForUiMode(RadarUiMode previousMode, RadarUiMode nextMode);
+void suspendDisplayPower();
+void resumeDisplayPower();
+void suspendRuntimeAudio(const char *reason);
+bool ensureRuntimeAudio(bool requireInput, const char *reason);
+void audioPowerTick();
+void suspendImuPower();
+void resumeImuPower();
+void configureWifiPowerSave();
+bool requestAxp2101Shutdown();
 void toggleSystemMenu();
 void wakeRadarDisplay();
 void systemUiTick();
@@ -1009,6 +1057,9 @@ uint32_t noteImuGap(uint32_t nowMs, ImuGapCause cause) {
 
   if (DragonRadarHeadingAlignment::imuGapRequiresIntegrationReset(
           gapMs, kImuMaxIntegrationGapMs)) {
+    if (!imuDiagnostics.integrationAnchorReset) {
+      resetFusionAhrs();
+    }
     lastImuMicros = 0;
     imuDiagnostics.integrationAnchorReset = true;
   }
@@ -1580,9 +1631,9 @@ void setRadarUiMode(RadarUiMode mode) {
   }
   settingsFlashUntilMs = 0;
   resetUiInputState();
+  applyPowerResourcesForUiMode(previousMode, mode);
 
   if (!radarUiDisplayActive()) {
-    panel->setBrightness(0);
     notifyDeviceStatus(true);
     if (provisioning.relayConnected) {
       sendRelayDeviceStatus();
@@ -1596,7 +1647,6 @@ void setRadarUiMode(RadarUiMode mode) {
     return;
   }
 
-  panel->setBrightness(currentBrightness());
   mainFadeStartedMs = 0;
   drawCurrentModeFrame();
   notifyDeviceStatus(true);
@@ -1619,7 +1669,6 @@ void wakeRadarDisplay() {
     invalidateRelativeHeading(false);
   }
   setRadarUiMode(RadarUiMode::Main);
-  panel->setBrightness(currentBrightness());
 }
 
 void toggleSystemMenu() {
@@ -1669,8 +1718,25 @@ void beginShutdownFallback() {
   sendRelayDeviceStatus();
   notifyDeviceStatus(true);
   relaySocket.disconnect();
-  delay(180);
-  panel->setBrightness(0);
+  provisioning.relaySocketConfigured = false;
+  provisioning.relayConnected = false;
+  delay(260);
+
+  suspendRuntimeAudio("shutdown");
+  suspendImuPower();
+  suspendDisplayPower();
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  BLEDevice::deinit(false);
+
+  Serial.println("AXP2101 software shutdown requested.");
+  Serial.flush();
+  if (requestAxp2101Shutdown()) {
+    delay(800);
+  } else {
+    Serial.println("AXP2101 shutdown write failed; entering peripheral-clean deep sleep fallback.");
+    Serial.flush();
+  }
 #if BUTTON_BOOT >= 0
   esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(BUTTON_BOOT), 0);
 #endif
@@ -2040,6 +2106,16 @@ bool axpWrite(uint8_t reg, uint8_t value) {
   return Wire.endTransmission() == 0;
 }
 
+bool requestAxp2101Shutdown() {
+  uint8_t commonConfig = 0;
+  if (!axpRead(kAxpCommonConfigReg, commonConfig)) {
+    return false;
+  }
+  powerResources.pmicShutdownRequested =
+      axpWrite(kAxpCommonConfigReg, commonConfig | kAxpSoftwareShutdownBit);
+  return powerResources.pmicShutdownRequested;
+}
+
 bool axpReadAdc14(uint8_t highReg, uint8_t lowReg, uint16_t &value) {
   uint8_t high = 0;
   uint8_t low = 0;
@@ -2196,10 +2272,12 @@ void setSpeakerMutedForCapture(bool muted) {
     tone.remainingSamples = 0;
     bootAudioPlaying = false;
   }
+  const bool outputNeeded = !muted &&
+                            (voiceCapture.playbackActive || tone.active || bootAudioPlaying);
   if (audioOnline) {
-    setCodecOutputMuted(muted);
+    setCodecOutputMuted(!outputNeeded);
   }
-  digitalWrite(PA, muted ? LOW : HIGH);
+  digitalWrite(PA, outputNeeded ? HIGH : LOW);
 }
 
 bool beginI2sBus(uint32_t sampleRate) {
@@ -2384,7 +2462,7 @@ void startAlertTone(float frequency, uint16_t durationMs, int16_t level, bool fo
     tone.remainingSamples = 0;
     return;
   }
-  if (!audioOnline) {
+  if (!ensureRuntimeAudio(false, "alert")) {
     return;
   }
   if (audioPreset == 0) {
@@ -2404,6 +2482,7 @@ void startAlertTone(float frequency, uint16_t durationMs, int16_t level, bool fo
   tone.totalSamples = (kAudioSampleRate * durationMs) / 1000;
   tone.remainingSamples = tone.totalSamples;
   tone.level = scaledAlertAudioLevel(level);
+  powerResources.lastAudioActivityMs = millis();
 }
 
 void startBootTone(float frequency, uint16_t durationMs, int16_t level) {
@@ -2551,6 +2630,9 @@ void audioTick() {
   tone.remainingSamples -= count;
   if (tone.remainingSamples <= 0) {
     tone.active = false;
+    setCodecOutputMuted(true);
+    digitalWrite(PA, LOW);
+    powerResources.lastAudioActivityMs = millis();
   }
 }
 
@@ -2608,6 +2690,7 @@ void setupAudio() {
     audioOnline = false;
     voiceInputOnline = false;
     voiceCapture.captureOnline = false;
+    powerResources.audioSuspended = true;
     Serial.println("I2S audio offline.");
     return;
   }
@@ -2618,9 +2701,11 @@ void setupAudio() {
   configureAudioTx(kAudioSampleRate);
   if (audioOnline) {
     applyCodecOutputVolume();
-    setCodecOutputMuted(false);
-    digitalWrite(PA, HIGH);
+    setCodecOutputMuted(true);
+    digitalWrite(PA, LOW);
   }
+  powerResources.audioSuspended = !audioOnline;
+  powerResources.lastAudioActivityMs = millis();
   Serial.println(audioOnline ? "ES8311 audio online." : "ES8311 codec offline.");
   Serial.println(voiceInputOnline ? "ES7210 mic online." : "ES7210 mic offline.");
 }
@@ -2727,6 +2812,26 @@ const char *headingQualityText(HeadingQuality quality) {
     case HeadingQuality::RelativeStable: return "relative_stable";
     default: return "unknown";
   }
+}
+
+void resetFusionAhrs() {
+  if (!headingEstimator.fusionReady) {
+    FusionAhrsInitialise(&fusionAhrs);
+    FusionAhrsSettings settings = fusionAhrsDefaultSettings;
+    settings.sampleRate = kFusionNominalSampleRateHz;
+    settings.convention = FusionConventionNwu;
+    settings.gain = kFusionGain;
+    settings.gyroscopeRange = 512.0f;
+    settings.accelerationRejection = kFusionAccelerationRejectionDeg;
+    settings.magneticRejection = 0.0f;
+    settings.recoveryTriggerPeriod = kFusionRecoveryPeriodS;
+    FusionAhrsSetSettings(&fusionAhrs, &settings);
+    headingEstimator.fusionReady = true;
+  } else {
+    FusionAhrsRestart(&fusionAhrs);
+  }
+  headingEstimator.fusionAccelerometerIgnored = false;
+  headingEstimator.gravityValid = false;
 }
 
 bool gyroBiasPlausible(float x, float y, float z) {
@@ -2924,14 +3029,20 @@ bool applyGyroBiasEstimate(float x, float y, float z, uint32_t nowMs) {
   }
 
   const bool firstEstimate = !headingEstimator.biasValid;
-  if (firstEstimate) {
+  const bool replaceStoredWarmStart = headingEstimator.sessionTrustFromStoredBias;
+  if (firstEstimate || replaceStoredWarmStart) {
     headingEstimator.biasX = x;
     headingEstimator.biasY = y;
     headingEstimator.biasZ = z;
     headingEstimator.biasValid = true;
-    headingEstimator.relativeYawValid = false;
-    headingDeg = 0.0f;
-    Serial.print("QMI8658 gyro bias learned x=");
+    if (firstEstimate) {
+      headingEstimator.relativeYawValid = false;
+      headingDeg = 0.0f;
+      resetFusionAhrs();
+    }
+    Serial.print(replaceStoredWarmStart
+                     ? "QMI8658 stored gyro bias revalidated x="
+                     : "QMI8658 gyro bias learned x=");
     Serial.print(x, 4);
     Serial.print(" y=");
     Serial.print(y, 4);
@@ -2955,19 +3066,38 @@ void updateGyroBiasEstimator(float accelMagnitudeG, uint32_t nowMs) {
   const float correctedZ = gyr.z - (headingEstimator.biasValid ? headingEstimator.biasZ : 0.0f);
   const float correctedMagnitude =
       sqrtf(correctedX * correctedX + correctedY * correctedY + correctedZ * correctedZ);
-  const bool biasVerifiedForTemperature =
-      headingEstimator.sessionStationaryVerified && gyroBiasTemperatureCompatible();
+  const float correctedVerticalRate =
+      headingEstimator.gravityValid
+          ? correctedX * headingEstimator.gravityX +
+                correctedY * headingEstimator.gravityY +
+                correctedZ * headingEstimator.gravityZ
+          : 0.0f;
+  const bool strictlyVerifiedForTemperature =
+      headingEstimator.sessionStationaryVerified &&
+      !headingEstimator.sessionTrustFromStoredBias &&
+      gyroBiasTemperatureCompatible();
   const float gyroLimit = !headingEstimator.biasValid
                               ? kGyroStationaryBootstrapDps
-                              : (biasVerifiedForTemperature
+                              : (strictlyVerifiedForTemperature
                                      ? kGyroStationaryCorrectedDps
                                      : kGyroStationaryWarmStartDps);
+  const float verticalLimit = !headingEstimator.biasValid
+                                  ? kGyroStationaryBootstrapDps
+                                  : (strictlyVerifiedForTemperature
+                                         ? kGyroStationaryVerticalDps
+                                         : kGyroStationaryWarmStartDps);
   headingEstimator.correctedGyroMagnitudeDps = correctedMagnitude;
   headingEstimator.stationaryGyroLimitDps = gyroLimit;
+  headingEstimator.stationaryVerticalLimitDps = verticalLimit;
   const bool stationaryCandidate =
-      isfinite(accelMagnitudeG) && isfinite(correctedMagnitude) &&
-      fabsf(accelMagnitudeG - 1.0f) <= kStationaryAccelToleranceG &&
-      correctedMagnitude <= gyroLimit;
+      DragonRadarHeadingStability::stationarySampleCandidate(
+          accelMagnitudeG,
+          correctedMagnitude,
+          correctedVerticalRate,
+          headingEstimator.gravityValid,
+          kStationaryAccelToleranceG,
+          gyroLimit,
+          verticalLimit);
   headingEstimator.stationaryCandidate = stationaryCandidate;
   if (!stationaryCandidate) {
     resetGyroStationaryWindow(true);
@@ -3005,6 +3135,7 @@ void updateGyroBiasEstimator(float accelMagnitudeG, uint32_t nowMs) {
   headingEstimator.stationary = maxStdDev <= kGyroStationaryStdDevDps;
   if (headingEstimator.stationary) {
     const bool firstSessionVerification = !headingEstimator.sessionStationaryVerified;
+    const bool revalidatingStoredWarmStart = headingEstimator.sessionTrustFromStoredBias;
     // Capture this before applyGyroBiasEstimate updates biasTemperatureC. A
     // loaded bias rejected for temperature must persist its first strict
     // replacement immediately; later background refinements keep the normal
@@ -3016,7 +3147,8 @@ void updateGyroBiasEstimator(float accelMagnitudeG, uint32_t nowMs) {
     if (headingEstimator.stationary) {
       headingEstimator.forceBiasPersistAfterStrictVerification =
           headingEstimator.forceBiasPersistAfterStrictVerification ||
-          persistTemperatureRevalidatedBiasImmediately;
+          persistTemperatureRevalidatedBiasImmediately ||
+          revalidatingStoredWarmStart;
       headingEstimator.sessionStationaryVerified = true;
       headingEstimator.sessionTrustFromStoredBias = false;
       if (firstSessionVerification) {
@@ -3048,48 +3180,40 @@ bool updateGravityEstimate(float dtS, uint32_t nowMs) {
   const float accelMagnitude = sqrtf(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
   headingEstimator.accelMagnitudeG = accelMagnitude;
   const bool accelFinite = isfinite(accelMagnitude) && accelMagnitude >= 0.25f;
-  const bool suitableForGravity = accelFinite &&
-                                  fabsf(accelMagnitude - 1.0f) <= kGravityUpdateToleranceG;
 
-  // Propagate the world-gravity direction in body coordinates using
-  // g_dot = g x omega. This follows fast tilt without accelerometer lag.
-  if (headingEstimator.gravityValid && headingEstimator.biasValid &&
-      dtS > 0.0f && dtS <= kImuMaxIntegrationDtS) {
-    const float omegaX = degToRad(gyr.x - headingEstimator.biasX);
-    const float omegaY = degToRad(gyr.y - headingEstimator.biasY);
-    const float omegaZ = degToRad(gyr.z - headingEstimator.biasZ);
-    const float oldX = headingEstimator.gravityX;
-    const float oldY = headingEstimator.gravityY;
-    const float oldZ = headingEstimator.gravityZ;
-    headingEstimator.gravityX += (oldY * omegaZ - oldZ * omegaY) * dtS;
-    headingEstimator.gravityY += (oldZ * omegaX - oldX * omegaZ) * dtS;
-    headingEstimator.gravityZ += (oldX * omegaY - oldY * omegaX) * dtS;
+  if (!headingEstimator.fusionReady) {
+    resetFusionAhrs();
+  }
+  if (accelFinite && dtS > 0.0f && dtS <= kImuMaxIntegrationDtS) {
+    FusionVector gyroscope;
+    gyroscope.axis.x =
+        headingEstimator.biasValid ? gyr.x - headingEstimator.biasX : 0.0f;
+    gyroscope.axis.y =
+        headingEstimator.biasValid ? gyr.y - headingEstimator.biasY : 0.0f;
+    gyroscope.axis.z =
+        headingEstimator.biasValid ? gyr.z - headingEstimator.biasZ : 0.0f;
+    FusionVector accelerometer;
+    accelerometer.axis.x = acc.x;
+    accelerometer.axis.y = acc.y;
+    accelerometer.axis.z = acc.z;
+
+    // Fusion accepts a measured sample period, which is important here because
+    // display rendering makes the actual QMI8658 read cadence non-uniform.
+    FusionAhrsSetSamplePeriod(&fusionAhrs, dtS);
+    FusionAhrsUpdateNoMagnetometer(&fusionAhrs, gyroscope, accelerometer);
+
+    const FusionVector gravity = FusionAhrsGetGravity(&fusionAhrs);
+    headingEstimator.gravityX = gravity.axis.x;
+    headingEstimator.gravityY = gravity.axis.y;
+    headingEstimator.gravityZ = gravity.axis.z;
     normalizeGravityEstimate();
+    headingEstimator.fusionAccelerometerIgnored =
+        FusionAhrsGetInternalStates(&fusionAhrs).accelerometerIgnored;
   }
 
-  // Accelerometer only supplies a low-gain correction when its magnitude is
-  // gravity-like, so linear acceleration cannot immediately rotate the estimate.
-  if (suitableForGravity) {
-    const float measuredX = acc.x / accelMagnitude;
-    const float measuredY = acc.y / accelMagnitude;
-    const float measuredZ = acc.z / accelMagnitude;
-    if (!headingEstimator.gravityValid) {
-      headingEstimator.gravityX = measuredX;
-      headingEstimator.gravityY = measuredY;
-      headingEstimator.gravityZ = measuredZ;
-      headingEstimator.gravityValid = true;
-    } else {
-      const float safeDt = dtS > 0.0f && dtS <= kImuMaxIntegrationDtS ? dtS : 0.018f;
-      const float alpha = clampf(
-          safeDt / (kGravityAccelCorrectionTimeConstantS + safeDt), 0.002f, 0.05f);
-      headingEstimator.gravityX = lerpf(headingEstimator.gravityX, measuredX, alpha);
-      headingEstimator.gravityY = lerpf(headingEstimator.gravityY, measuredY, alpha);
-      headingEstimator.gravityZ = lerpf(headingEstimator.gravityZ, measuredZ, alpha);
-      normalizeGravityEstimate();
-    }
-  }
-
-  if (accelFinite && fabsf(accelMagnitude - 1.0f) <= kGravityReliableToleranceG) {
+  if (headingEstimator.gravityValid &&
+      !headingEstimator.fusionAccelerometerIgnored &&
+      fabsf(accelMagnitude - 1.0f) <= kGravityReliableToleranceG) {
     headingEstimator.lastGravityReliableMs = nowMs;
   }
   return headingEstimator.gravityValid &&
@@ -3125,7 +3249,12 @@ void invalidateRelativeHeading(bool clearSessionTrust) {
     headingEstimator.sessionTrustFromStoredBias = false;
   }
   headingEstimator.gravityValid = false;
+  if (headingEstimator.fusionReady) {
+    resetFusionAhrs();
+  }
+  headingEstimator.rawVerticalRateDps = 0.0f;
   headingEstimator.verticalRateDps = 0.0f;
+  headingEstimator.yawLocked = false;
   headingEstimator.lastSampleMs = 0;
   headingEstimator.lastGravityReliableMs = 0;
   resetGyroStationaryWindow(true);
@@ -3148,6 +3277,8 @@ void setupImu() {
                       SensorQMI8658::LPF_MODE_0);
   qmi.enableAccelerometer();
   qmi.enableGyroscope();
+  powerResources.imuSuspended = false;
+  resetFusionAhrs();
   updateImuTemperature(millis(), true);
   loadGyroBias();
   imuDiagnostics.gapStartedMs = millis();
@@ -3204,10 +3335,13 @@ void readImu() {
   const float motionEnergy = fabsf(acc.x) + fabsf(acc.y) + fabsf(acc.z - 1.0f);
   tiltEnergy = clampf(lerpf(tiltEnergy, motionEnergy, 0.12f), 0.0f, 3.0f);
 
+  const float accelMagnitude = sqrtf(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
+  headingEstimator.accelMagnitudeG = accelMagnitude;
+  updateGyroBiasEstimator(accelMagnitude, nowMs);
   const bool gravityReliable = updateGravityEstimate(dtS, nowMs);
-  updateGyroBiasEstimator(headingEstimator.accelMagnitudeG, nowMs);
 
   bool integrated = false;
+  headingEstimator.yawLocked = false;
   if (headingEstimator.biasValid && headingEstimator.gravityValid && integrationDtValid) {
     const float correctedX = gyr.x - headingEstimator.biasX;
     const float correctedY = gyr.y - headingEstimator.biasY;
@@ -3215,11 +3349,19 @@ void readImu() {
     float verticalRate = correctedX * headingEstimator.gravityX +
                          correctedY * headingEstimator.gravityY +
                          correctedZ * headingEstimator.gravityZ;
-    if (fabsf(verticalRate) < kRelativeYawRateDeadbandDps) {
-      verticalRate = 0.0f;
-    }
-    headingEstimator.verticalRateDps = verticalRate;
-    headingDeg = wrap360(headingDeg + verticalRate * dtS);
+    headingEstimator.rawVerticalRateDps = verticalRate;
+    const auto yawDecision =
+        DragonRadarHeadingStability::stabilizedYawRate(
+            verticalRate,
+            fabsf(verticalRate),
+            headingEstimator.stationary,
+            headingEstimator.stationaryCandidate,
+            kGyroStationaryVerticalDps,
+            kRelativeYawRateDeadbandDps);
+    headingEstimator.verticalRateDps = yawDecision.rateDps;
+    headingEstimator.yawLocked = yawDecision.locked;
+    headingDeg = DragonRadarHeadingStability::integrateRelativeYaw(
+        headingDeg, yawDecision.rateDps, dtS);
     headingEstimator.relativeYawValid = true;
     integrated = true;
   }
@@ -3227,6 +3369,148 @@ void readImu() {
   refreshHeadingQuality(nowMs, integrated && gravityReliable);
   updateImuTemperature(nowMs, false);
   persistGyroBiasIfDue(nowMs);
+}
+
+void suspendDisplayPower() {
+  if (!displayOnline || powerResources.displaySleeping) {
+    return;
+  }
+  panel->setBrightness(0);
+  panel->displayOff();
+  powerResources.displaySleeping = true;
+  if (kSerialDiagnostics) {
+    Serial.println("DIAG power display=sleep");
+  }
+}
+
+void resumeDisplayPower() {
+  if (!displayOnline) {
+    return;
+  }
+  if (powerResources.displaySleeping) {
+    panel->displayOn();
+    powerResources.displaySleeping = false;
+  }
+  panel->setBrightness(currentBrightness());
+  if (kSerialDiagnostics) {
+    Serial.println("DIAG power display=active");
+  }
+}
+
+void suspendRuntimeAudio(const char *reason) {
+  if (voiceCapture.pttActive) {
+    return;
+  }
+  tone.active = false;
+  tone.remainingSamples = 0;
+  bootAudioPlaying = false;
+  voiceCapture.playbackActive = false;
+  voiceCapture.vadActive = false;
+  voiceCapture.rms = 0;
+  voiceCapture.peak = 0;
+  voiceCapture.captureOnline = false;
+  if (audioOnline) {
+    setCodecOutputMuted(true);
+  }
+  digitalWrite(PA, LOW);
+  i2s.end();
+  audioTxConfigured = false;
+  audioRxConfigured = false;
+  audioTxSampleRate = 0;
+  audioOnline = false;
+  voiceInputOnline = false;
+  powerResources.audioSuspended = true;
+  if (kSerialDiagnostics) {
+    Serial.print("DIAG power audio=sleep reason=");
+    Serial.println(reason ? reason : "idle");
+  }
+}
+
+bool ensureRuntimeAudio(bool requireInput, const char *reason) {
+  if (audioOnline && (!requireInput || voiceInputOnline)) {
+    powerResources.lastAudioActivityMs = millis();
+    return true;
+  }
+  setupAudio();
+  const bool ready = audioOnline && (!requireInput || voiceInputOnline);
+  if (kSerialDiagnostics) {
+    Serial.print("DIAG power audio=");
+    Serial.print(ready ? "active" : "failed");
+    Serial.print(" reason=");
+    Serial.println(reason ? reason : "request");
+  }
+  return ready;
+}
+
+void audioPowerTick() {
+  if (!audioOnline || voiceCapture.pttActive || voiceCapture.playbackActive ||
+      tone.active || bootAudioPlaying || speakerMutedForCapture) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - powerResources.lastAudioActivityMs >= kAudioIdleSuspendMs) {
+    suspendRuntimeAudio("idle_timeout");
+  }
+}
+
+void suspendImuPower() {
+  if (!imuOnline || powerResources.imuSuspended) {
+    return;
+  }
+  qmi.powerDown();
+  imuOnline = false;
+  powerResources.imuSuspended = true;
+  if (kSerialDiagnostics) {
+    Serial.println("DIAG power imu=sleep");
+  }
+}
+
+void resumeImuPower() {
+  if (!powerResources.imuSuspended) {
+    return;
+  }
+  setupImu();
+  powerResources.imuSuspended = !imuOnline;
+  if (kSerialDiagnostics) {
+    Serial.println(imuOnline ? "DIAG power imu=active" : "DIAG power imu=failed");
+  }
+}
+
+void configureWifiPowerSave() {
+  if (WiFi.status() != WL_CONNECTED) {
+    powerResources.wifiPowerSave = false;
+    return;
+  }
+  if (!powerResources.wifiPowerSave) {
+    WiFi.setSleep(true);
+    powerResources.wifiPowerSave = true;
+    if (kSerialDiagnostics) {
+      Serial.println("DIAG power wifi=min_modem");
+    }
+  }
+}
+
+void applyPowerResourcesForUiMode(RadarUiMode previousMode, RadarUiMode nextMode) {
+  if (nextMode == RadarUiMode::ShutdownPending) {
+    return;
+  }
+  if (nextMode == RadarUiMode::Standby) {
+    suspendRuntimeAudio("standby");
+    suspendImuPower();
+    suspendDisplayPower();
+    configureWifiPowerSave();
+    return;
+  }
+  if (nextMode == RadarUiMode::ScreenOff) {
+    suspendDisplayPower();
+    configureWifiPowerSave();
+    return;
+  }
+  if (previousMode == RadarUiMode::Standby) {
+    resumeImuPower();
+  }
+  resumeDisplayPower();
+  configureWifiPowerSave();
 }
 
 void printTouchDiagnostic(int16_t x, int16_t y, const char *action) {
@@ -4730,7 +5014,12 @@ void notifyDeviceStatus(bool force) {
     return;
   }
   const uint32_t now = millis();
-  if (!force && now - provisioning.lastStatusNotifyMs < kDeviceStatusNotifyMs) {
+  const uint32_t intervalMs = radarUiMode == RadarUiMode::Standby
+                                  ? kStandbyDeviceStatusNotifyMs
+                              : radarUiMode == RadarUiMode::ScreenOff
+                                  ? kScreenOffDeviceStatusNotifyMs
+                                  : kDeviceStatusNotifyMs;
+  if (!force && now - provisioning.lastStatusNotifyMs < intervalMs) {
     return;
   }
   provisioning.lastStatusNotifyMs = now;
@@ -4799,8 +5088,12 @@ void firmwareOtaTick() {
     }
     radarUiMode = RadarUiMode::Main;
     if (displayOnline) {
-      panel->setBrightness(currentBrightness());
+      resumeDisplayPower();
     }
+    lastFrameMs = 0;
+  } else if (!blocking && previouslyBlocking) {
+    resumeImuPower();
+    resumeDisplayPower();
     lastFrameMs = 0;
   }
   previouslyBlocking = blocking;
@@ -5467,6 +5760,7 @@ void provisioningTick() {
   const wl_status_t wifiStatus = WiFi.status();
   if (wifiStatus == WL_CONNECTED && provisioning.wifiConnectInFlight) {
     provisioning.wifiConnectInFlight = false;
+    configureWifiPowerSave();
     Serial.print("Wi-Fi connected ip=");
     Serial.print(WiFi.localIP());
     Serial.print(" rssi=");
@@ -5686,12 +5980,15 @@ bool relayTlsClockReady() {
 }
 
 void playRemoteVoicePcm(const uint8_t *pcmBytes, size_t byteLen) {
-  if (!audioOnline || byteLen < sizeof(int16_t)) {
+  if (byteLen < sizeof(int16_t)) {
     return;
   }
   if (radarUiMode == RadarUiMode::Standby ||
       radarUiMode == RadarUiMode::ShutdownPending) {
     voiceCapture.playbackActive = false;
+    return;
+  }
+  if (!ensureRuntimeAudio(false, "remote_voice")) {
     return;
   }
   if (voiceCapture.pttActive || speakerMutedForCapture) {
@@ -5718,6 +6015,7 @@ void playRemoteVoicePcm(const uint8_t *pcmBytes, size_t byteLen) {
   i2s.write(reinterpret_cast<uint8_t *>(stereo), monoSamples * 2 * sizeof(int16_t));
   voiceCapture.playbackActive = true;
   voiceCapture.lastPlaybackMs = millis();
+  powerResources.lastAudioActivityMs = voiceCapture.lastPlaybackMs;
 }
 
 bool handleRelayVoiceFrame(const String &json) {
@@ -6062,6 +6360,7 @@ void cloudRelayTick() {
     }
     return;
   }
+  configureWifiPowerSave();
 
   if (!provisioning.relaySocketConfigured && now - lastRelayAttemptMs > kRelayReconnectMs) {
     lastRelayAttemptMs = now;
@@ -6072,13 +6371,21 @@ void cloudRelayTick() {
     relaySocket.loop();
   }
 
-  if (provisioning.relayConnected && now - lastRelayHeartbeatMs > kRelayHeartbeatMs) {
+  const uint32_t heartbeatMs = radarUiMode == RadarUiMode::Standby
+                                   ? kStandbyRelayHeartbeatMs
+                               : radarUiMode == RadarUiMode::ScreenOff
+                                   ? kScreenOffRelayHeartbeatMs
+                                   : kRelayHeartbeatMs;
+  if (provisioning.relayConnected && now - lastRelayHeartbeatMs > heartbeatMs) {
     lastRelayHeartbeatMs = now;
     sendRelayHeartbeat();
     sendRelayDeviceStatus();
   }
 
-  if (now - lastRelayStatusMs > kRelayStatusMs) {
+  const uint32_t statusMs = radarUiMode == RadarUiMode::Standby
+                                ? kStandbyRelayStatusMs
+                                : kRelayStatusMs;
+  if (now - lastRelayStatusMs > statusMs) {
     lastRelayStatusMs = now;
     notifyDeviceStatus(false);
   }
@@ -6101,6 +6408,11 @@ void beginPushToTalk() {
     }
     return;
   }
+  if (!ensureRuntimeAudio(true, "ptt")) {
+    provisioning.lastWrite = "ptt_audio_unavailable";
+    notifyDeviceStatus(true);
+    return;
+  }
   pttRippleStartedMs = millis();
   pttRippleEndedMs = 0;
   tone.active = false;
@@ -6110,6 +6422,7 @@ void beginPushToTalk() {
   voiceCapture.pttActive = true;
   voiceCapture.vadActive = false;
   voiceCapture.lastFrameMs = 0;
+  powerResources.lastAudioActivityMs = millis();
   setSpeakerMutedForCapture(true);
   provisioning.lastWrite = "ptt_start";
   notifyDeviceStatus(true);
@@ -6127,6 +6440,7 @@ void cancelPushToTalkDueToBusy(const char *reason) {
   voiceCapture.playbackActive = false;
   pttRippleEndedMs = millis();
   setSpeakerMutedForCapture(false);
+  powerResources.lastAudioActivityMs = millis();
   provisioning.lastWrite = reason;
   if (provisioning.relayConnected) {
     ++voiceCapture.sequence;
@@ -6147,6 +6461,7 @@ void endPushToTalk() {
   voiceCapture.vadActive = false;
   pttRippleEndedMs = millis();
   setSpeakerMutedForCapture(false);
+  powerResources.lastAudioActivityMs = millis();
   provisioning.lastWrite = "ptt_stop";
   if (provisioning.relayConnected) {
     ++voiceCapture.sequence;
@@ -6159,15 +6474,24 @@ void endPushToTalk() {
 }
 
 void voiceCaptureTick() {
+  const uint32_t now = millis();
+  if (voiceCapture.playbackActive && now - voiceCapture.lastPlaybackMs > 120) {
+    voiceCapture.playbackActive = false;
+    setCodecOutputMuted(true);
+    digitalWrite(PA, LOW);
+    powerResources.lastAudioActivityMs = now;
+  }
+  if (!voiceCapture.pttActive) {
+    voiceCapture.captureOnline = false;
+    voiceCapture.vadActive = false;
+    voiceCapture.rms = 0;
+    voiceCapture.peak = 0;
+    return;
+  }
   if (!voiceInputOnline) {
     voiceCapture.captureOnline = false;
     voiceCapture.vadActive = false;
     return;
-  }
-
-  const uint32_t now = millis();
-  if (voiceCapture.playbackActive && now - voiceCapture.lastPlaybackMs > 120) {
-    voiceCapture.playbackActive = false;
   }
   if (now - voiceCapture.lastSampleMs < kVoiceSampleTickMs) {
     return;
@@ -6232,8 +6556,7 @@ void voiceCaptureTick() {
   voiceCapture.vadActive = voiceCapture.pttActive && !voiceCapture.muted &&
                            (rms >= kVoiceVadRmsThreshold || peak >= kVoiceVadPeakThreshold);
 
-  const uint32_t voiceFrameIntervalMs = voiceCapture.pttActive ? kVoiceFrameTickMs : 200;
-  if (provisioning.relayConnected && now - voiceCapture.lastFrameMs >= voiceFrameIntervalMs) {
+  if (provisioning.relayConnected && now - voiceCapture.lastFrameMs >= kVoiceFrameTickMs) {
     voiceCapture.lastFrameMs = now;
     ++voiceCapture.sequence;
     sendRelayVoiceFrame(monoPcm, monoSamples, voiceCapture.pttActive);
@@ -7693,6 +8016,16 @@ void printSystemUiDiagnostic() {
   Serial.print(brightnessPreset);
   Serial.print(" audioPreset=");
   Serial.print(audioPreset);
+  Serial.print(" displaySleep=");
+  Serial.print(powerResources.displaySleeping ? "1" : "0");
+  Serial.print(" audioSleep=");
+  Serial.print(powerResources.audioSuspended ? "1" : "0");
+  Serial.print(" imuSleep=");
+  Serial.print(powerResources.imuSuspended ? "1" : "0");
+  Serial.print(" wifiSleep=");
+  Serial.print(powerResources.wifiPowerSave ? "1" : "0");
+  Serial.print(" pmicOffReq=");
+  Serial.print(powerResources.pmicShutdownRequested ? "1" : "0");
   Serial.print(" screenDir=");
   Serial.print(DragonRadarDisplayOrientation::persistedValue(screenDirection));
   Serial.print(" bleStatusBytes=");
@@ -7898,6 +8231,12 @@ void serialDiagnosticsTick() {
   Serial.print(headingQualityText(headingEstimator.quality));
   Serial.print(" yawRate=");
   Serial.print(headingEstimator.verticalRateDps, 2);
+  Serial.print(" rawYawRate=");
+  Serial.print(headingEstimator.rawVerticalRateDps, 2);
+  Serial.print(" yawLocked=");
+  Serial.print(headingEstimator.yawLocked ? "yes" : "no");
+  Serial.print(" fusionAccelIgnored=");
+  Serial.print(headingEstimator.fusionAccelerometerIgnored ? "yes" : "no");
   Serial.print(" gyroBias=");
   Serial.print(headingEstimator.biasX, 3);
   Serial.print("/");
@@ -7937,6 +8276,8 @@ void serialDiagnosticsTick() {
   Serial.print(headingEstimator.correctedGyroMagnitudeDps, 3);
   Serial.print(" gyroLimit=");
   Serial.print(headingEstimator.stationaryGyroLimitDps, 2);
+  Serial.print(" verticalLimit=");
+  Serial.print(headingEstimator.stationaryVerticalLimitDps, 2);
   Serial.print(" stationaryCandidate=");
   Serial.print(headingEstimator.stationaryCandidate ? "yes" : "no");
   Serial.print(" stationarySamples=");
@@ -8544,6 +8885,7 @@ void loop() {
   serialDiagnosticsTick();
   handleAudioEvents();
   audioTick();
+  audioPowerTick();
 
   const uint32_t now = millis();
   if ((radarUiDisplayActive() || otaManager.shouldShowOverlay()) &&

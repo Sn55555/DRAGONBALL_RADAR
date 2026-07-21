@@ -35,10 +35,12 @@
 		C05E5E317BB5348D68CCBC84 /* HeadingLocationFrameTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 948290C61E54F3C27AD20256 /* HeadingLocationFrameTests.swift */; };
 		CB8AA1F03472E8FB4B1A0916 /* DiagnosticPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87E3D3F571EEC89125EB1A28 /* DiagnosticPackage.swift */; };
 		D1596CDDCA0DF516CD5929F2 /* RoomsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AA78ED7C9551162F80D2E72 /* RoomsView.swift */; };
+		D6EEFC2EABD0485A6F58A570 /* CapsuleRadarPairingSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A841313BF961C8AFA5FE770D /* CapsuleRadarPairingSheet.swift */; };
 		D887C64DD0415F5C6A40DE44 /* MangaGlassStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = C41894D43439FC476B2636AA /* MangaGlassStyle.swift */; };
 		E066F3DC03AD69A886491995 /* DragonRadarMVPApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9AEA647B0F32BBAFEC2F28A /* DragonRadarMVPApp.swift */; };
 		E5582C722676FDE1465D44D8 /* DevicesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C572A6332E2D7F9CB9B8C91 /* DevicesView.swift */; };
 		F2AEDC3CCCAF2A56C7950DCF /* AppShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A693465936377C2997E29C6 /* AppShellView.swift */; };
+		F3A18F65200D71B950D5A010 /* CapsuleAccessorySetupCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEFD6B7CF192C50E68D29ED4 /* CapsuleAccessorySetupCoordinator.swift */; };
 		F3D5CB57074129C67DB1A786 /* AppRuntimeHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A99BB676BFCE0745D9F297E2 /* AppRuntimeHost.swift */; };
 		F77C21DE5300519702ECDC4D /* LaunchReadinessUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65F3F55F6E7EF6F2505A518E /* LaunchReadinessUITests.swift */; };
 		FDE29370BCC6615119BF113D /* BrandAssetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0ADCC350A4ADC62A2547268 /* BrandAssetTests.swift */; };
@@ -84,6 +86,7 @@
 		948290C61E54F3C27AD20256 /* HeadingLocationFrameTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeadingLocationFrameTests.swift; sourceTree = "<group>"; };
 		A05B7D967E27B4026888805C /* NotificationPermissionCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationPermissionCenter.swift; sourceTree = "<group>"; };
 		A09275DF1EDC50D3B8DC14DD /* PhysicalOTAAcceptanceCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalOTAAcceptanceCoordinator.swift; sourceTree = "<group>"; };
+		A841313BF961C8AFA5FE770D /* CapsuleRadarPairingSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapsuleRadarPairingSheet.swift; sourceTree = "<group>"; };
 		A99BB676BFCE0745D9F297E2 /* AppRuntimeHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntimeHost.swift; sourceTree = "<group>"; };
 		AB7011D9E9D23863C43307D5 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AD7AEBFC4C17771D4DE49CE4 /* AuthSecurityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthSecurityTests.swift; sourceTree = "<group>"; };
@@ -100,6 +103,7 @@
 		E098498F867F899163A4D538 /* AppEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironment.swift; sourceTree = "<group>"; };
 		E9AEA647B0F32BBAFEC2F28A /* DragonRadarMVPApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragonRadarMVPApp.swift; sourceTree = "<group>"; };
 		F0ADCC350A4ADC62A2547268 /* BrandAssetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrandAssetTests.swift; sourceTree = "<group>"; };
+		FEFD6B7CF192C50E68D29ED4 /* CapsuleAccessorySetupCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapsuleAccessorySetupCoordinator.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -131,6 +135,8 @@
 				1A693465936377C2997E29C6 /* AppShellView.swift */,
 				DD213461F3FF9918FC1702D9 /* AuthSupport.swift */,
 				342D31BE9AEC27CAF1C7B3CE /* BLEDeviceBridge.swift */,
+				FEFD6B7CF192C50E68D29ED4 /* CapsuleAccessorySetupCoordinator.swift */,
+				A841313BF961C8AFA5FE770D /* CapsuleRadarPairingSheet.swift */,
 				0C572A6332E2D7F9CB9B8C91 /* DevicesView.swift */,
 				87E3D3F571EEC89125EB1A28 /* DiagnosticPackage.swift */,
 				E9AEA647B0F32BBAFEC2F28A /* DragonRadarMVPApp.swift */,
@@ -313,6 +319,8 @@
 				F2AEDC3CCCAF2A56C7950DCF /* AppShellView.swift in Sources */,
 				B2B06C73EAA4EC0AFB77F6AF /* AuthSupport.swift in Sources */,
 				0CC51FB93DBFFB6A82E2FCB1 /* BLEDeviceBridge.swift in Sources */,
+				F3A18F65200D71B950D5A010 /* CapsuleAccessorySetupCoordinator.swift in Sources */,
+				D6EEFC2EABD0485A6F58A570 /* CapsuleRadarPairingSheet.swift in Sources */,
 				E5582C722676FDE1465D44D8 /* DevicesView.swift in Sources */,
 				CB8AA1F03472E8FB4B1A0916 /* DiagnosticPackage.swift in Sources */,
 				E066F3DC03AD69A886491995 /* DragonRadarMVPApp.swift in Sources */,

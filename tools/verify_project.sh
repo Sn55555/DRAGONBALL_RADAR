@@ -139,6 +139,22 @@ log_step "Checking heading alignment math"
   "$HEADING_TEST_ROOT/test_heading_alignment"
 )
 
+log_step "Checking stationary heading stability"
+(
+  HEADING_STABILITY_TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dragon-radar-heading-stability-test.XXXXXX")"
+  trap 'rm -rf "$HEADING_STABILITY_TEST_ROOT"' EXIT
+  "${CXX:-c++}" \
+    -std=c++17 \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -pedantic \
+    -Ifirmware/DragonRadar \
+    tools/test_heading_stability.cpp \
+    -o "$HEADING_STABILITY_TEST_ROOT/test_heading_stability"
+  "$HEADING_STABILITY_TEST_ROOT/test_heading_stability"
+)
+
 log_step "Checking display orientation and touch mapping"
 (
   ORIENTATION_TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dragon-radar-orientation-test.XXXXXX")"

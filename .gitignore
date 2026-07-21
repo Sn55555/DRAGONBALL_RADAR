@@ -25,6 +25,16 @@ lib/GFX_Library_for_Arduino/*
 !lib/SensorLib/
 lib/SensorLib/*
 !lib/SensorLib/LICENSE
+!lib/Fusion/
+lib/Fusion/*
+!lib/Fusion/LICENSE.md
+!lib/Fusion/library.json
+!lib/Fusion/src/
+lib/Fusion/src/*
+!lib/Fusion/src/FusionAhrs.c
+!lib/Fusion/src/FusionAhrs.h
+!lib/Fusion/src/FusionConvention.h
+!lib/Fusion/src/FusionMath.h
 !lib/PLATFORMIO-RUNTIME-LICENSES/
 !lib/PLATFORMIO-RUNTIME-LICENSES/*.txt
 .secrets/

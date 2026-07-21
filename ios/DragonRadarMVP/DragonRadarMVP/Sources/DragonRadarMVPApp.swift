@@ -89,6 +89,12 @@ struct DragonRadarMVPApp: App {
     @State private var firmwareUpdate = FirmwareUpdateCoordinator()
     #endif
     @State private var notificationCenter = NotificationPermissionCenter()
+    @State private var accessorySetup = CapsuleAccessorySetupCoordinator()
+    #if !APP_ONLY
+    @State private var showAccessoryConnectionSheet = false
+    @State private var handledAccessorySelectionID: UUID?
+    @State private var pendingAuthorizedConnectionAnimation = false
+    #endif
 
     init() {
         let isUITesting = ProcessInfo.processInfo.arguments.contains("DRAGON_RADAR_UI_TESTING")
@@ -115,6 +121,100 @@ struct DragonRadarMVPApp: App {
                 .environment(firmwareUpdate)
                 #endif
                 .environment(notificationCenter)
+                .environment(accessorySetup)
+                #if !APP_ONLY
+                .sheet(isPresented: $showAccessoryConnectionSheet) {
+                    CapsuleRadarPairingSheet(continueAfterSystemPicker: true)
+                        .environment(appState)
+                        .environment(radarRuntime)
+                        .environment(bleBridge)
+                }
+                .alert(
+                    "无法设置 Capsule Radar",
+                    isPresented: Binding(
+                        get: { accessorySetup.errorMessage != nil },
+                        set: { isPresented in
+                            if !isPresented {
+                                accessorySetup.clearError()
+                            }
+                        }
+                    )
+                ) {
+                    Button("好") {
+                        accessorySetup.clearError()
+                    }
+                } message: {
+                    Text(accessorySetup.errorMessage ?? "请稍后重试")
+                }
+                .onAppear {
+                    handleCurrentAuthorizedAccessory()
+                    presentAccessoryPickerAutomaticallyIfEligible()
+                    handlePairingRequestIfNeeded()
+                }
+                .onChange(of: appState.showPairingSheet) { _, requested in
+                    guard requested else { return }
+                    handlePairingRequestIfNeeded()
+                }
+                .onChange(of: automaticPairingEligibility) { _, isEligible in
+                    guard isEligible else { return }
+                    presentAccessoryPickerAutomaticallyIfEligible()
+                }
+                .onChange(of: accessorySetup.completedSelection?.eventID) { _, _ in
+                    handleCurrentAuthorizedAccessory()
+                }
+                .onChange(of: bleBridge.isBLEConnected) { _, isConnected in
+                    guard isConnected, pendingAuthorizedConnectionAnimation else { return }
+                    pendingAuthorizedConnectionAnimation = false
+                    showAccessoryConnectionSheet = true
+                }
+                #endif
         }
     }
+
+    #if !APP_ONLY
+    private var automaticPairingEligibility: Bool {
+        !appState.isReviewExperienceActive
+            && appState.isSignedIn
+            && !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !bleBridge.hasSavedRegistration
+            && accessorySetup.completedSelection == nil
+    }
+
+    private func presentAccessoryPickerAutomaticallyIfEligible() {
+        guard automaticPairingEligibility else { return }
+        bleBridge.stopScan()
+        accessorySetup.presentPickerAutomatically()
+    }
+
+    private func handlePairingRequestIfNeeded() {
+        guard appState.showPairingSheet else { return }
+        appState.showPairingSheet = false
+        bleBridge.stopScan()
+        if accessorySetup.completedSelection != nil {
+            accessorySetup.reconnectAuthorizedAccessory()
+        } else {
+            accessorySetup.presentPicker()
+        }
+    }
+
+    private func handleCurrentAuthorizedAccessory() {
+        guard let selection = accessorySetup.completedSelection else { return }
+        guard handledAccessorySelectionID != selection.eventID else { return }
+        handledAccessorySelectionID = selection.eventID
+        bleBridge.connectAuthorizedAccessory(
+            identifier: selection.bluetoothIdentifier,
+            name: selection.displayName
+        )
+        if bleBridge.hasSavedRegistration {
+            if bleBridge.isBLEConnected {
+                showAccessoryConnectionSheet = true
+            } else {
+                pendingAuthorizedConnectionAnimation = true
+            }
+        } else {
+            pendingAuthorizedConnectionAnimation = false
+            showAccessoryConnectionSheet = true
+        }
+    }
+    #endif
 }

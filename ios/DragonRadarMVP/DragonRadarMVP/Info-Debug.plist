@@ -47,6 +47,22 @@
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>蓝牙用于绑定和配置雷达。</string>
+	<key>NSAccessorySetupSupports</key>
+	<array>
+		<string>Bluetooth</string>
+	</array>
+	<key>NSAccessorySetupKitSupports</key>
+	<array>
+		<string>Bluetooth</string>
+	</array>
+	<key>NSAccessorySetupBluetoothNames</key>
+	<array>
+		<string>CapsuleRadar</string>
+	</array>
+	<key>NSAccessorySetupBluetoothServices</key>
+	<array>
+		<string>7D540100-F82D-4B2F-91C6-4F0F88AA5A11</string>
+	</array>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>蓝牙用于扫描、绑定和配置雷达。</string>
 	<key>NSLocalNetworkUsageDescription</key>

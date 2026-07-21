@@ -308,6 +308,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     @ObservationIgnored private var ownerDeviceToken = ""
     @ObservationIgnored private var ownerAuthAttemptChallenge: String?
     @ObservationIgnored private var scanRequested = false
+    @ObservationIgnored private var authorizedAccessoryConnection: (identifier: UUID, name: String)?
 
     let radarServiceUUID = CBUUID(string: "7d540100-f82d-4b2f-91c6-4f0f88aa5a11")
 
@@ -632,6 +633,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func startScan() {
+        if authorizedAccessoryConnection != nil {
+            connectAuthorizedAccessoryIfReady()
+            return
+        }
         scanRequested = true
         ensureCentralManager()
         guard let central else { return }
@@ -1017,6 +1022,41 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         central?.connect(peripheral)
     }
 
+    func connectAuthorizedAccessory(identifier: UUID, name: String) {
+        scanRequested = false
+        authorizedAccessoryConnection = (identifier, name)
+        ensureCentralManager()
+        connectAuthorizedAccessoryIfReady()
+    }
+
+    private func connectAuthorizedAccessoryIfReady() {
+        guard
+            let target = authorizedAccessoryConnection,
+            let central,
+            central.state == .poweredOn
+        else { return }
+        guard let peripheral = central.retrievePeripherals(withIdentifiers: [target.identifier]).first else {
+            if !isScanning {
+                resetStateForNewScan()
+                scanStartedAt = Date()
+                isScanning = true
+                lastEvent = "系统已授权雷达，正在等待设备广播"
+                central.scanForPeripherals(withServices: [radarServiceUUID])
+                startScanTimeout()
+            }
+            return
+        }
+
+        authorizedAccessoryConnection = nil
+        peripherals[target.identifier] = peripheral
+        peripheral.delegate = self
+        stopScan()
+        selectedPeripheralID = target.identifier
+        connectedPeripheralName = target.name.isEmpty ? "Capsule Radar" : target.name
+        lastEvent = "正在连接 \(connectedPeripheralName)"
+        central.connect(peripheral)
+    }
+
     func disconnect() {
         suspendFirmwareReconnectForManualDisconnect()
         guard
@@ -1031,6 +1071,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         centralState = central.state
         lastEvent = "蓝牙状态：\(stateText)"
+        if central.state == .poweredOn, authorizedAccessoryConnection != nil {
+            connectAuthorizedAccessoryIfReady()
+            return
+        }
         if central.state == .poweredOn, scanRequested {
             startScan()
             return
@@ -1066,6 +1110,21 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     ) {
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = advertisedName ?? peripheral.name ?? "未命名雷达"
+        if
+            let target = authorizedAccessoryConnection,
+            peripheral.identifier == target.identifier
+        {
+            authorizedAccessoryConnection = nil
+            scanRequested = false
+            stopScan()
+            peripherals[target.identifier] = peripheral
+            peripheral.delegate = self
+            selectedPeripheralID = target.identifier
+            connectedPeripheralName = target.name.isEmpty ? name : target.name
+            lastEvent = "正在连接 \(connectedPeripheralName)"
+            central.connect(peripheral)
+            return
+        }
         let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         let hasRadarService = serviceUUIDs.contains(radarServiceUUID)
         let likelyRadar = name.localizedCaseInsensitiveContains("CapsuleRadar")
@@ -1477,14 +1536,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
                 authorizeOwnerSessionIfPossible()
             }
         }
-        if status.paired == 1 {
-            persistedPaired = true
-            defaults.set(true, forKey: Self.persistedPairedKey)
-        }
-        if status.server == 1 {
-            persistedServerConfigured = true
-            defaults.set(true, forKey: Self.persistedServerConfiguredKey)
-        }
+        persistedPaired = status.paired == 1
+        defaults.set(persistedPaired, forKey: Self.persistedPairedKey)
+        persistedServerConfigured = status.server == 1
+        defaults.set(persistedServerConfigured, forKey: Self.persistedServerConfiguredKey)
         if !status.name.isEmpty {
             persistedDeviceName = status.name
             defaults.set(status.name, forKey: Self.persistedDeviceNameKey)

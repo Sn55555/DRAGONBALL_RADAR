@@ -1,6 +1,6 @@
 # 胶囊版本兼容表
 
-更新时间：2026-07-20
+更新时间：2026-07-21
 
 ## 当前协议基线
 
@@ -33,10 +33,11 @@ OTA 发布版本与 WebSocket 协议版本是两套独立编号，不能互相�
 
 完整字段顺序、HTTP 鉴权、发布和回滚步骤见 `docs/firmware-ota.zh.md`。
 
-当前内部测试发布为 `1.0.11 / build 13 / security_counter 13`。该版本新增
-ESP 圆屏 `6/12` 点握持方向切换、180° 触控映射和 NVS 持久化，并放宽第二块
-实机 QMI8658 的严格静止启动门限；没有改变 Relay、App、LocationFrame 或语音
-协议版本。
+当前内部测试发布为 `1.0.12 / build 14 / security_counter 14`。该版本保留
+`1.0.11` 的圆屏方向和 QMI8658 航向稳定改动，并新增分级电源管理：息屏关闭
+AMOLED、音频空闲自动断开；待机额外关闭 IMU 并降低联网心跳；关机先停用外围
+资源，再请求 AXP2101 software-off，失败时降级深度休眠。没有改变 Relay、App、
+LocationFrame 或语音协议版本。PMIC 真关机效果与各模式电流仍以真机测试为准。
 
 ## 发布规则
 
@@ -50,7 +51,7 @@ ESP 圆屏 `6/12` 点握持方向切换、180° 触控映射和 NVS 持久化，
 8. ESP 不能只信任 App 的 URL 校验；必须以 `server_config.http_api_url` 独立核对 scheme、host、effective port 和固定 artifact path，再附加 device Bearer。
 9. 旧 NVS 没有 `http_api_url` 时 OTA 不兼容，App 必须先重新同步设备配置；ESP 不允许从未签名 URL 自动建立信任 origin。
 10. Relay 默认拒绝 development OTA metadata；`DRAGON_RADAR_ALLOW_DEVELOPMENT_OTA=1` 只允许本地 HTTP 联调，生产禁止设置。
-11. `course_deg100` 始终表示 GPS 行进方向。当前 App 将 `heading_deg100` 写为 `0` 且不设置 bit2，不能用手机 heading 或 course 冒充雷达朝向。ESP 在本机 QMI8658 取得可信零偏后，只在真实开机显示一次提示；可信零偏来自本次严格静止验证，或来自结构有效且当前/保存温差不超过 6°C 的持久零偏。用户把雷达零点/12 点方向对准真北并静止长按屏幕，以 `C = wrap360(-G0)` 建立本机 IMU 会话偏移。该偏移不依赖成员 GPS，不改变 LocationFrame、不设置 bit2、不持久化，旧 App/Relay 无需协议升级；BOOT 短按只关闭尚在显示的提示并切换成员，不能触发或再次显示校准提示。主雷达静止长按 1.2 秒始终可以重校准；切成员、切房和网络重连保留偏移，待机清相对 yaw/北向偏移但保留本次供电会话的可信零偏，重启、IMU 重置或积分断档清除北向偏移，只有真实重启重新显示教学提示。
+11. `course_deg100` 始终表示 GPS 行进方向。当前 App 将 `heading_deg100` 写为 `0` 且不设置 bit2，不能用手机 heading 或 course 冒充雷达朝向。ESP 使用 Fusion 6DOF 估计重力方向，并在本机 QMI8658 取得可信零偏后，只在真实开机显示一次提示；持久零偏只用于温度匹配的快速启动，随后仍由本次严格静止窗口重新验证。严格静止时应用零角速度更新并锁住相对 yaw，不累计不可观测的静止漂移；检测到转动后立即恢复积分。用户把雷达零点/12 点方向对准真北并静止长按屏幕，以 `C = wrap360(-G0)` 建立本机 IMU 会话偏移。该偏移不依赖成员 GPS，不改变 LocationFrame、不设置 bit2、不持久化，旧 App/Relay 无需协议升级；BOOT 短按只关闭尚在显示的提示并切换成员，不能触发或再次显示校准提示。主雷达静止长按 1.2 秒始终可以重校准；切成员、切房和网络重连保留偏移，待机清相对 yaw/北向偏移但保留本次供电会话的可信零偏，重启、IMU 重置或积分断档清除北向偏移，只有真实重启重新显示教学提示。
 12. `screenDir=6/12` 是 ESP 本机 UI 设置，只旋转显示并反转触摸坐标，保存在 `dragonRadar` NVS；它不修改成员真北方位、北向校准会话偏移或任何跨端协议字段，因此旧 App 和 Relay 无需升级。
 
 ## 用户可见状态
