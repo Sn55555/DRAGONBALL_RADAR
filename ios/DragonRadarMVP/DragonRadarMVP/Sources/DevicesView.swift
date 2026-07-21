@@ -451,9 +451,10 @@ private struct RadarBindingRecoveryPanel: View {
                 .foregroundStyle(MangaTheme.subtle)
 
             Button {
-                bleBridge.stopScan()
-                bleBridge.disconnect()
-                accessorySetup.removeAuthorizationAndPresentPicker()
+                Task {
+                    await bleBridge.prepareForAccessorySetup()
+                    accessorySetup.removeAuthorizationAndPresentPicker()
+                }
             } label: {
                 Label("清除旧授权并重新配对", systemImage: "link")
                     .frame(maxWidth: .infinity)

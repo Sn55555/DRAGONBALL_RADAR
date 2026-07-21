@@ -318,6 +318,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     @ObservationIgnored private var ownerAuthAttemptChallenge: String?
     @ObservationIgnored private var scanRequested = false
     @ObservationIgnored private var authorizedAccessoryConnection: (identifier: UUID, name: String)?
+    @ObservationIgnored private var accessorySetupSuspended = false
     @ObservationIgnored private var manualDisconnectRequested = false
     @ObservationIgnored private var gatewayReconnectTask: Task<Void, Never>?
     @ObservationIgnored private var voiceDownlinkQueue: [Data] = []
@@ -747,6 +748,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func startScan() {
+        guard !accessorySetupSuspended else { return }
         if authorizedAccessoryConnection != nil {
             connectAuthorizedAccessoryIfReady()
             return
@@ -779,6 +781,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     /// from CoreBluetooth's saved peripheral record without showing scanning
     /// or service-discovery steps to the user.
     func resumeAutomaticConnection() {
+        guard !accessorySetupSuspended else { return }
         manualDisconnectRequested = false
         ensureCentralManager()
         guard let central, central.state == .poweredOn else { return }
@@ -1156,10 +1159,57 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func connectAuthorizedAccessory(identifier: UUID, name: String) {
+        accessorySetupSuspended = false
+        manualDisconnectRequested = false
         scanRequested = false
         authorizedAccessoryConnection = (identifier, name)
         ensureCentralManager()
         connectAuthorizedAccessoryIfReady()
+    }
+
+    func prepareForAccessorySetup() async {
+        guard !accessorySetupSuspended else { return }
+        accessorySetupSuspended = true
+        manualDisconnectRequested = true
+        scanRequested = false
+        scanTimeoutTask?.cancel()
+        scanTimeoutTask = nil
+        gatewayReconnectTask?.cancel()
+        gatewayReconnectTask = nil
+        firmwareReconnectRetryTask?.cancel()
+        firmwareReconnectTimeoutTask?.cancel()
+        firmwareReconnectCancellationTask?.cancel()
+        firmwareReconnectRetryTask = nil
+        firmwareReconnectTimeoutTask = nil
+        firmwareReconnectCancellationTask = nil
+        central?.stopScan()
+        isScanning = false
+
+        if
+            let selectedPeripheralID,
+            let peripheral = peripherals[selectedPeripheralID],
+            peripheral.state == .connected || peripheral.state == .connecting
+        {
+            central?.cancelPeripheralConnection(peripheral)
+        }
+
+        try? await Task.sleep(for: .milliseconds(500))
+        central?.delegate = nil
+        central = nil
+        peripherals.removeAll()
+        characteristics.removeAll()
+        selectedPeripheralID = nil
+        connectedPeripheralName = "未连接"
+        centralState = .unknown
+        lastEvent = "正在打开系统雷达配对"
+    }
+
+    func resumeAfterAccessorySetup() {
+        guard accessorySetupSuspended else { return }
+        accessorySetupSuspended = false
+        manualDisconnectRequested = false
+        ensureCentralManager()
+        resumeAutomaticConnection()
     }
 
     private func connectAuthorizedAccessoryIfReady() {
@@ -1237,6 +1287,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     private func ensureCentralManager() {
+        guard !accessorySetupSuspended else { return }
         guard central == nil else { return }
         central = CBCentralManager(
             delegate: self,

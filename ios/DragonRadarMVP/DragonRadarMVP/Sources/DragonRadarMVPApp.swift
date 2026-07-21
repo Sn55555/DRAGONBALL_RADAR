@@ -164,6 +164,14 @@ struct DragonRadarMVPApp: App {
                 .onChange(of: accessorySetup.completedSelection?.eventID) { _, _ in
                     handleCurrentAuthorizedAccessory()
                 }
+                .onChange(of: accessorySetup.phase) { _, phase in
+                    switch phase {
+                    case .idle, .failed:
+                        bleBridge.resumeAfterAccessorySetup()
+                    default:
+                        break
+                    }
+                }
                 .onChange(of: bleBridge.isBLEConnected) { _, isConnected in
                     guard isConnected, pendingAuthorizedConnectionAnimation else { return }
                     pendingAuthorizedConnectionAnimation = false
@@ -184,18 +192,26 @@ struct DragonRadarMVPApp: App {
 
     private func presentAccessoryPickerAutomaticallyIfEligible() {
         guard automaticPairingEligibility else { return }
-        bleBridge.stopScan()
-        accessorySetup.presentPickerAutomatically()
+        Task {
+            await bleBridge.prepareForAccessorySetup()
+            guard automaticPairingEligibility else {
+                bleBridge.resumeAfterAccessorySetup()
+                return
+            }
+            accessorySetup.presentPickerAutomatically()
+        }
     }
 
     private func handlePairingRequestIfNeeded() {
         guard appState.showPairingSheet else { return }
         appState.showPairingSheet = false
-        bleBridge.stopScan()
         if accessorySetup.completedSelection != nil {
             accessorySetup.reconnectAuthorizedAccessory()
         } else {
-            accessorySetup.presentPicker()
+            Task {
+                await bleBridge.prepareForAccessorySetup()
+                accessorySetup.presentPicker()
+            }
         }
     }
 
