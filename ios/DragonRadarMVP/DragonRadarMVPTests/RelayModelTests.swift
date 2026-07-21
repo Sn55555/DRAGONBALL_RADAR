@@ -472,6 +472,22 @@ final class RelayModelTests: XCTestCase {
         XCTAssertTrue(RadarBlipViewModel.make(from: [waiting, paused]).isEmpty)
     }
 
+    func testRadarKeepsAnotherOnlineRadarFromSameAccountVisible() {
+        var local = makeRadarMember(name: "本机", distance: "0m", bearing: "本机")
+        local.isLocal = true
+        local.isCurrentUser = true
+        var sameAccountRadar = makeRadarMember(name: "另一台雷达", distance: "5m", bearing: "东 90°")
+        sameAccountRadar.isCurrentUser = true
+        var offlineRadar = makeRadarMember(name: "离线雷达", distance: "5m", bearing: "西 270°")
+        offlineRadar.isOnline = false
+
+        let visible = RadarOverviewView.remoteMembers(
+            from: [local, sameAccountRadar, offlineRadar]
+        )
+
+        XCTAssertEqual(visible.map(\.name), ["另一台雷达"])
+    }
+
     private func makeRadarMember(name: String, distance: String, bearing: String) -> RoomMember {
         RoomMember(
             id: UUID(),

@@ -435,7 +435,6 @@ struct BLEConfigDetailView: View {
 private struct RadarBindingRecoveryPanel: View {
     @Environment(AppState.self) private var appState
     @Environment(BLEDeviceBridge.self) private var bleBridge
-    @Environment(CapsuleAccessorySetupCoordinator.self) private var accessorySetup
 
     var body: some View {
         MangaPanel("重新绑定") {

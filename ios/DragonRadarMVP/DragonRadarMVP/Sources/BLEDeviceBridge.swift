@@ -331,6 +331,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
     var candidates: [BLEDeviceCandidate] = []
     var isScanning = false
+    private(set) var bleTransportConnected = false
     var selectedPeripheralID: UUID?
     var connectedPeripheralName = "未连接"
     var discoveredCharacteristics: [String] = []
@@ -390,10 +391,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     var isBLEConnected: Bool {
-        guard let selectedPeripheralID, let peripheral = peripherals[selectedPeripheralID] else {
-            return false
-        }
-        return peripheral.state == .connected
+        bleTransportConnected
     }
 
     var hasSavedGateway: Bool {
@@ -814,6 +812,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         if hasSavedGateway {
             defaults.removeObject(forKey: Self.gatewayPeripheralKey)
             selectedPeripheralID = nil
+            bleTransportConnected = false
         }
         if !isScanning {
             startScan()
@@ -844,6 +843,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         defaults.removeObject(forKey: Self.gatewayPeripheralKey)
         authorizedAccessoryConnection = nil
         selectedPeripheralID = nil
+        bleTransportConnected = false
         connectedPeripheralName = "未连接"
         manualDisconnectRequested = false
         startScan()
@@ -1014,6 +1014,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
         if let peripheral = firmwareReconnectPeripheral(targetID), peripheral.state == .connected {
             selectedPeripheralID = targetID
+            bleTransportConnected = true
             connectedPeripheralName = peripheral.name ?? connectedPeripheralName
             firmwareReconnectText = "OTA 雷达已连接"
             peripheral.delegate = self
@@ -1106,6 +1107,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
         if peripheral.state == .connected {
             selectedPeripheralID = targetID
+            bleTransportConnected = true
             connectedPeripheralName = peripheral.name ?? connectedPeripheralName
             firmwareReconnectText = "OTA 雷达已连接"
             discoverRadarServices(on: peripheral)
@@ -1117,6 +1119,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         }
 
         selectedPeripheralID = targetID
+        bleTransportConnected = false
         connectedPeripheralName = peripheral.name ?? connectedPeripheralName
         firmwareReconnectInFlight = true
         firmwareReconnectText = "正在进行第 \(attemptNumber) 次 OTA 重连"
@@ -1181,6 +1184,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     private func clearSelectedConnection(_ peripheralID: UUID) {
         guard selectedPeripheralID == peripheralID else { return }
         selectedPeripheralID = nil
+        bleTransportConnected = false
         ownerSessionAuthorized = false
         ownerAuthAttemptChallenge = nil
         pairingChallengeText = "未读取"
@@ -1214,6 +1218,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             }
         }
         selectedPeripheralID = candidate.peripheralID
+        bleTransportConnected = false
         connectedPeripheralName = candidate.name
         lastEvent = "正在连接 \(candidate.name)"
         manualDisconnectRequested = false
@@ -1265,6 +1270,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         peripherals.removeAll()
         characteristics.removeAll()
         selectedPeripheralID = nil
+        bleTransportConnected = false
         connectedPeripheralName = "未连接"
         centralState = .unknown
         lastEvent = "正在打开系统雷达配对"
@@ -1302,6 +1308,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         peripheral.delegate = self
         stopScan()
         selectedPeripheralID = target.identifier
+        bleTransportConnected = false
         connectedPeripheralName = target.name.isEmpty ? "Capsule Radar" : target.name
         lastEvent = "正在连接 \(connectedPeripheralName)"
         manualDisconnectRequested = false
@@ -1340,6 +1347,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             scanTimeoutTask = nil
             scanStartedAt = nil
             isScanning = false
+            bleTransportConnected = false
             firmwareReconnectRetryTask?.cancel()
             firmwareReconnectTimeoutTask?.cancel()
             firmwareReconnectCancellationTask?.cancel()
@@ -1355,6 +1363,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
                     if hasSavedGateway {
                         defaults.removeObject(forKey: Self.gatewayPeripheralKey)
                         selectedPeripheralID = nil
+                        bleTransportConnected = false
                     }
                     if !isScanning {
                         startScan()
@@ -1380,6 +1389,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         peripherals[peripheral.identifier] = peripheral
         peripheral.delegate = self
         selectedPeripheralID = peripheral.identifier
+        bleTransportConnected = peripheral.state == .connected
         connectedPeripheralName = peripheral.name ?? persistedDeviceName
         defaults.set(peripheral.identifier.uuidString, forKey: Self.gatewayPeripheralKey)
         lastEvent = "系统已恢复后台雷达连接"
@@ -1401,6 +1411,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         peripherals[peripheralID] = peripheral
         peripheral.delegate = self
         selectedPeripheralID = peripheralID
+        bleTransportConnected = peripheral.state == .connected
         connectedPeripheralName = peripheral.name ?? persistedDeviceName
         if peripheral.state == .disconnected {
             lastEvent = "正在恢复语音网关蓝牙连接"
@@ -1441,6 +1452,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         peripherals[peripheral.identifier] = peripheral
         peripheral.delegate = self
         selectedPeripheralID = peripheral.identifier
+        bleTransportConnected = peripheral.state == .connected
         connectedPeripheralName = peripheral.name ?? persistedDeviceName
         defaults.set(peripheral.identifier.uuidString, forKey: Self.gatewayPeripheralKey)
         scanTimedOut = false
@@ -1487,6 +1499,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             peripherals[target.identifier] = peripheral
             peripheral.delegate = self
             selectedPeripheralID = target.identifier
+            bleTransportConnected = false
             connectedPeripheralName = target.name.isEmpty ? name : target.name
             lastEvent = "正在连接 \(connectedPeripheralName)"
             manualDisconnectRequested = false
@@ -1538,6 +1551,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             "DragonRadar BLE connected "
                 + "name=\(peripheralName) id=\(peripheral.identifier.uuidString)"
         )
+        bleTransportConnected = true
         bleSecurityRepairRequired = false
         bleSecurityRepairPeripheralName = ""
         manualDisconnectRequested = false

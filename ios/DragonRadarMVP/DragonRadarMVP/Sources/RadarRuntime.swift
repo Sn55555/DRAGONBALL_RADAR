@@ -994,11 +994,13 @@ final class RadarRuntime {
             let speaker = object["speaker_name"] as? String ?? "房间成员"
             voicePhase = .connecting
             noteVoiceEvent("收到 \(speaker) 的远端语音唤醒")
+            print("DragonRadar voice wake received request=\(requestID) speaker=\(speaker)")
             voiceWakeHandler?(requestID, speaker)
         case "gateway_voice_granted":
             let requestID = object["request_id"] as? String ?? activeVoiceRequestID
             voicePhase = .ready
             noteVoiceEvent("房间语音权已授予")
+            print("DragonRadar voice floor granted request=\(requestID)")
             voiceGrantedHandler?(requestID)
         case "gateway_voice_frame":
             if let encoded = object["audio_b64"] as? String,
@@ -1008,6 +1010,7 @@ final class RadarRuntime {
         case "gateway_voice_end":
             voicePhase = .idle
             noteVoiceEvent("远端语音已结束")
+            print("DragonRadar voice end received")
             voiceEndHandler?()
         #endif
         case "radar_reminder":
@@ -1083,6 +1086,7 @@ final class RadarRuntime {
             return
         }
         noteRelayEvent("房间已确认 · \(peerID)")
+        print("DragonRadar Relay hello acknowledged peer=\(peerID)")
     }
 
     private func decodeRoomState(from data: Data, fallback object: [String: Any]) {
@@ -1105,6 +1109,10 @@ final class RadarRuntime {
             roomStateSnapshot = acceptedEnvelope
             relayRoomState = "room \(acceptedEnvelope.room) · \(acceptedEnvelope.members.count)/\(acceptedEnvelope.maxMembers) online"
             noteRelayEvent("房间状态已同步 · \(acceptedEnvelope.members.count) 在线")
+            let memberSummary = acceptedEnvelope.members.map {
+                "\($0.memberID):\($0.peerID):\($0.role):app=\($0.appOnline == true ? 1 : 0):device=\($0.deviceOnline == true ? 1 : 0)"
+            }.joined(separator: ",")
+            print("DragonRadar Relay room_state room=\(acceptedEnvelope.room) members=\(acceptedEnvelope.members.count) [\(memberSummary)]")
             #if !APP_ONLY
             updateRoomSwitchState(from: acceptedEnvelope)
             updateDeviceProtocolState(from: acceptedEnvelope)

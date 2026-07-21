@@ -8,7 +8,7 @@ struct RadarOverviewView: View {
     var body: some View {
         @Bindable var state = appState
         let members = appState.members.filter { $0.role == "app" || $0.isLocal }
-        let remoteMembers = members.filter { !$0.isCurrentUser && !$0.isLocal && $0.isOnline }
+        let remoteMembers = Self.remoteMembers(from: members)
         let blips = RadarBlipViewModel.make(from: remoteMembers)
         let targetSnapshot = RadarTargetSnapshot(
             remoteTargetCount: blips.count,
@@ -51,6 +51,13 @@ struct RadarOverviewView: View {
         .navigationDestination(item: $state.selectedMember) { member in
             MemberDetailView(member: member)
         }
+    }
+
+    static func remoteMembers(from members: [RoomMember]) -> [RoomMember] {
+        // A single account can own more than one radar. Only the local BLE/Relay
+        // group is "self" on the radar; another online group from the same
+        // account must remain visible and reachable for room voice wake.
+        members.filter { !$0.isLocal && $0.isOnline }
     }
 }
 

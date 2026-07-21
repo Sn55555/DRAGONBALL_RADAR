@@ -653,7 +653,9 @@ struct AppRuntimeHost<Content: View>: View {
         guard pendingRemoteVoiceRequestID != requestID else { return }
         pendingRemoteVoiceRequestID = requestID
         pushToTalkGateway.setRemoteSpeaker(speaker)
-        if !bleBridge.sendVoiceControl(command: "remote_begin", requestID: requestID) {
+        let sentToRadar = bleBridge.sendVoiceControl(command: "remote_begin", requestID: requestID)
+        print("DragonRadar voice wake BLE remote_begin request=\(requestID) sent=\(sentToRadar ? 1 : 0)")
+        if !sentToRadar {
             radarRuntime.noteVoiceEvent("收到远端语音，但 BLE 雷达尚未就绪")
         }
         if radarRuntime.relayPhase != .ready {
@@ -676,6 +678,7 @@ struct AppRuntimeHost<Content: View>: View {
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let event = object["event"] as? String
         else { return }
+        print("DragonRadar BLE voice control event=\(event)")
         switch event {
         case "ptt_begin":
             let requestID = UUID().uuidString
