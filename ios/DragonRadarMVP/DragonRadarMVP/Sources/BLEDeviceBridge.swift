@@ -16,6 +16,7 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
     case voiceControl = "voice_control"
     case voiceAudioUplink = "voice_audio_uplink"
     case voiceAudioDownlink = "voice_audio_downlink"
+    case roomStateSnapshot = "room_state_snapshot"
 
     var id: String { rawValue }
 
@@ -43,6 +44,8 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
             CBUUID(string: "7d54010a-f82d-4b2f-91c6-4f0f88aa5a11")
         case .voiceAudioDownlink:
             CBUUID(string: "7d54010b-f82d-4b2f-91c6-4f0f88aa5a11")
+        case .roomStateSnapshot:
+            CBUUID(string: "7d540301-f82d-4b2f-91c6-4f0f88aa5a11")
         }
     }
 
@@ -58,6 +61,139 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
         .deviceStatus,
         .serverConfig
     ]
+}
+
+enum RadarRoomStateBLEPacketEncoder {
+    static let version: UInt8 = 1
+    static let beginOpcode: UInt8 = 1
+    static let memberOpcode: UInt8 = 2
+    static let endOpcode: UInt8 = 3
+    static let maximumRemoteMembers = 6
+    static let peerKeyBytes = 12
+    static let maximumNameBytes = 20
+
+    static func packets(
+        snapshot: RelayRoomStateSnapshot,
+        localAppPeerID: String,
+        sequence: UInt16
+    ) -> [Data] {
+        let remoteMembers = snapshot.members.compactMap { member -> (RelayRoomMemberSnapshot, RelayLocationSnapshot)? in
+            guard
+                member.role == "app",
+                member.online,
+                member.appOnline != false,
+                member.peerID != localAppPeerID,
+                member.locationPaused != true,
+                let location = member.location,
+                location.latE7 != nil,
+                location.lonE7 != nil
+            else { return nil }
+            return (member, location)
+        }.prefix(maximumRemoteMembers)
+
+        var result = [beginPacket(
+            sequence: sequence,
+            memberCount: remoteMembers.count,
+            serverTime: snapshot.serverTime
+        )]
+        result.append(contentsOf: remoteMembers.map { memberPacket(
+            member: $0.0,
+            location: $0.1,
+            snapshot: snapshot,
+            sequence: sequence
+        ) })
+        result.append(endPacket(sequence: sequence, memberCount: remoteMembers.count))
+        return result
+    }
+
+    static func emptyPackets(serverTime: Int, sequence: UInt16) -> [Data] {
+        [
+            beginPacket(sequence: sequence, memberCount: 0, serverTime: serverTime),
+            endPacket(sequence: sequence, memberCount: 0)
+        ]
+    }
+
+    private static func beginPacket(sequence: UInt16, memberCount: Int, serverTime: Int) -> Data {
+        var data = Data([version, beginOpcode])
+        appendUInt16(sequence, to: &data)
+        data.append(UInt8(clamping: memberCount))
+        appendUInt32(UInt32(clamping: serverTime), to: &data)
+        return data
+    }
+
+    private static func memberPacket(
+        member: RelayRoomMemberSnapshot,
+        location: RelayLocationSnapshot,
+        snapshot: RelayRoomStateSnapshot,
+        sequence: UInt16
+    ) -> Data {
+        let speaking = member.voiceStatus?.ptt == true
+            || member.voiceStatus?.vad == true
+            || member.voiceStatus?.speaker == true
+            || snapshot.voiceFloor?.speakerGroupID == member.memberID
+            || snapshot.voiceFloor?.speakerPeerID == member.peerID
+        var flags: UInt8 = 0b0000_0001
+        if speaking { flags |= 0b0000_0010 }
+        if member.locationStale == true { flags |= 0b0000_0100 }
+
+        var data = Data([version, memberOpcode])
+        appendUInt16(sequence, to: &data)
+        data.append(flags)
+        data.append(fixedPeerKey(member.memberID.isEmpty ? member.peerID : member.memberID))
+        appendInt32(Int32(clamping: location.latE7 ?? 0), to: &data)
+        appendInt32(Int32(clamping: location.lonE7 ?? 0), to: &data)
+        appendUInt16(UInt16(clamping: location.horizontalAccuracyCM ?? 0), to: &data)
+        appendUInt16(UInt16(clamping: location.speedCMS ?? 0), to: &data)
+        appendUInt16(UInt16(clamping: location.courseDeg100 ?? 0), to: &data)
+        appendUInt32(UInt32(clamping: location.unixTime ?? 0), to: &data)
+        appendUInt32(UInt32(clamping: member.locationAgeMS ?? 0), to: &data)
+
+        let name = utf8Prefix(member.name ?? member.memberID, maximumBytes: maximumNameBytes)
+        data.append(UInt8(name.count))
+        data.append(name)
+        return data
+    }
+
+    private static func endPacket(sequence: UInt16, memberCount: Int) -> Data {
+        var data = Data([version, endOpcode])
+        appendUInt16(sequence, to: &data)
+        data.append(UInt8(clamping: memberCount))
+        return data
+    }
+
+    private static func fixedPeerKey(_ rawValue: String) -> Data {
+        let cleanValue = rawValue.hasPrefix("app-") ? String(rawValue.dropFirst(4)) : rawValue
+        var bytes = Array(cleanValue.utf8.prefix(peerKeyBytes))
+        if bytes.count < peerKeyBytes {
+            bytes.append(contentsOf: repeatElement(0, count: peerKeyBytes - bytes.count))
+        }
+        return Data(bytes)
+    }
+
+    private static func utf8Prefix(_ value: String, maximumBytes: Int) -> Data {
+        var result = Data()
+        for character in value {
+            let bytes = Data(String(character).utf8)
+            guard result.count + bytes.count <= maximumBytes else { break }
+            result.append(bytes)
+        }
+        return result
+    }
+
+    private static func appendUInt16(_ value: UInt16, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func appendUInt32(_ value: UInt32, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func appendInt32(_ value: Int32, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
 }
 
 struct BLEDeviceCandidate: Identifiable, Hashable {
@@ -325,9 +461,16 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     @ObservationIgnored private var voiceGatewayAnnounced = false
     @ObservationIgnored private var voiceControlHandler: ((Data) -> Void)?
     @ObservationIgnored private var voiceUplinkHandler: ((Data) -> Void)?
+    @ObservationIgnored private var latestRoomStateProjection: (snapshot: RelayRoomStateSnapshot, localAppPeerID: String)?
+    @ObservationIgnored private var roomStateClearPending = false
+    @ObservationIgnored private var roomStateWriteQueue: [Data] = []
+    @ObservationIgnored private var roomStateWriteInFlight = false
+    @ObservationIgnored private var roomStateNeedsReplay = false
+    @ObservationIgnored private var roomStateSequence: UInt16 = 0
 
     let radarServiceUUID = CBUUID(string: "7d540100-f82d-4b2f-91c6-4f0f88aa5a11")
     let voiceServiceUUID = CBUUID(string: "7d540200-f82d-4b2f-91c6-4f0f88aa5a11")
+    let roomStateServiceUUID = CBUUID(string: "7d540300-f82d-4b2f-91c6-4f0f88aa5a11")
 
     var candidates: [BLEDeviceCandidate] = []
     var isScanning = false
@@ -440,7 +583,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     private var radarServiceUUIDs: [CBUUID] {
-        [radarServiceUUID, voiceServiceUUID]
+        [radarServiceUUID, voiceServiceUUID, roomStateServiceUUID]
     }
 
     private func discoverRadarServices(on peripheral: CBPeripheral) {
@@ -1192,6 +1335,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         discoveredCharacteristics.removeAll()
         availableCharacteristicNames.removeAll()
         characteristics.removeAll()
+        roomStateWriteQueue.removeAll()
+        roomStateWriteInFlight = false
+        roomStateNeedsReplay = latestRoomStateProjection != nil || roomStateClearPending
     }
 
     func connect(_ candidate: BLEDeviceCandidate) {
@@ -1705,6 +1851,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             ? "雷达连接未准备好"
             : "雷达连接已准备"
         activateVoiceGatewayIfReady()
+        if ownerSessionAuthorized, hasCharacteristic(.roomStateSnapshot) {
+            _ = scheduleLatestRoomStateProjection()
+        }
 
         if
             firmwareReconnectTrackingRequired,
@@ -1883,6 +2032,97 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     @discardableResult
+    func writeRoomStateSnapshot(_ snapshot: RelayRoomStateSnapshot, localAppPeerID: String) -> Bool {
+        latestRoomStateProjection = (snapshot, localAppPeerID)
+        roomStateClearPending = false
+        return scheduleLatestRoomStateProjection()
+    }
+
+    @discardableResult
+    func clearRoomStateTargets() -> Bool {
+        latestRoomStateProjection = nil
+        roomStateClearPending = true
+        return scheduleLatestRoomStateProjection()
+    }
+
+    private func scheduleLatestRoomStateProjection() -> Bool {
+        guard
+            isBLEConnected,
+            ownerSessionAuthorized,
+            hasCharacteristic(.roomStateSnapshot)
+        else {
+            roomStateNeedsReplay = true
+            return false
+        }
+        if roomStateWriteInFlight || !roomStateWriteQueue.isEmpty {
+            roomStateNeedsReplay = true
+            return true
+        }
+
+        roomStateSequence &+= 1
+        if let projection = latestRoomStateProjection {
+            roomStateWriteQueue = RadarRoomStateBLEPacketEncoder.packets(
+                snapshot: projection.snapshot,
+                localAppPeerID: projection.localAppPeerID,
+                sequence: roomStateSequence
+            )
+        } else if roomStateClearPending {
+            roomStateWriteQueue = RadarRoomStateBLEPacketEncoder.emptyPackets(
+                serverTime: Int(Date().timeIntervalSince1970),
+                sequence: roomStateSequence
+            )
+        } else {
+            return false
+        }
+        roomStateNeedsReplay = false
+        flushRoomStateWriteQueue()
+        return true
+    }
+
+    private func flushRoomStateWriteQueue() {
+        guard !roomStateWriteInFlight, !roomStateWriteQueue.isEmpty else { return }
+        guard
+            let selectedPeripheralID,
+            let peripheral = peripherals[selectedPeripheralID],
+            let characteristic = characteristics[.roomStateSnapshot],
+            characteristic.properties.contains(.write)
+        else {
+            roomStateNeedsReplay = true
+            roomStateWriteQueue.removeAll()
+            return
+        }
+
+        let packet = roomStateWriteQueue.removeFirst()
+        let maximumLength = peripheral.maximumWriteValueLength(for: .withResponse)
+        guard packet.count <= maximumLength else {
+            roomStateWriteQueue.removeAll()
+            roomStateNeedsReplay = true
+            print("DragonRadar BLE room_state rejected bytes=\(packet.count) mtu=\(maximumLength)")
+            return
+        }
+        roomStateWriteInFlight = true
+        peripheral.writeValue(packet, for: characteristic, type: .withResponse)
+    }
+
+    private func handleRoomStateWriteResult(error: String?) {
+        roomStateWriteInFlight = false
+        if let error {
+            roomStateWriteQueue.removeAll()
+            roomStateNeedsReplay = true
+            print("DragonRadar BLE room_state write_failed error=\(error)")
+            return
+        }
+        if !roomStateWriteQueue.isEmpty {
+            flushRoomStateWriteQueue()
+            return
+        }
+        print("DragonRadar BLE room_state projected device=\(connectedPeripheralName)")
+        if roomStateNeedsReplay {
+            _ = scheduleLatestRoomStateProjection()
+        }
+    }
+
+    @discardableResult
     func sendVoiceControl(command: String, requestID: String? = nil) -> Bool {
         guard isVoiceGatewayReady else {
             voiceGatewayText = "语音网关未完成所有者授权"
@@ -2046,6 +2286,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     private func handleCharacteristicWriteResult(role: RadarBLECharacteristic, error: String?) {
+        if role == .roomStateSnapshot {
+            handleRoomStateWriteResult(error: error)
+            return
+        }
         if let error {
             lastWriteEvent = "写入雷达失败：\(error)"
             if role == .firmwareControl {
@@ -2063,6 +2307,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     private func remember(status: RadarBLEDeviceStatus) {
+        let ownerSessionWasAuthorized = ownerSessionAuthorized
         if status.ownerAuthRequired == 1 {
             ownerSessionAuthorized = status.ownerAuth == 1
             if !ownerSessionAuthorized {
@@ -2078,6 +2323,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             defaults.set(status.name, forKey: Self.persistedDeviceNameKey)
         }
         activateVoiceGatewayIfReady()
+        if !ownerSessionWasAuthorized, ownerSessionAuthorized, hasCharacteristic(.roomStateSnapshot) {
+            _ = scheduleLatestRoomStateProjection()
+        }
     }
 
     private func rememberConfirmedWrite(_ role: RadarBLECharacteristic) {

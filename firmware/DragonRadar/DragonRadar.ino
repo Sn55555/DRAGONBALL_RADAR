@@ -259,6 +259,9 @@ constexpr const char *kRadarBleServiceUuid = "7d540100-f82d-4b2f-91c6-4f0f88aa5a
 // Voice is versioned as a separate service so bonded iPhones do not reuse the
 // provisioning-only GATT cache that existed before the phone-gateway update.
 constexpr const char *kVoiceBleServiceUuid = "7d540200-f82d-4b2f-91c6-4f0f88aa5a11";
+// Room projection is also versioned as a separate service because it is added
+// after existing phones have already cached the provisioning service.
+constexpr const char *kRoomStateBleServiceUuid = "7d540300-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kPairingChallengeUuid = "7d540101-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kPairingResponseUuid = "7d540102-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kWifiConfigUuid = "7d540103-f82d-4b2f-91c6-4f0f88aa5a11";
@@ -270,6 +273,7 @@ constexpr const char *kFirmwareStatusUuid = "7d540108-f82d-4b2f-91c6-4f0f88aa5a1
 constexpr const char *kVoiceControlUuid = "7d540109-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kVoiceAudioUplinkUuid = "7d54010a-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kVoiceAudioDownlinkUuid = "7d54010b-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kRoomStateSnapshotUuid = "7d540301-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr uint32_t kDeviceStatusNotifyMs = 2000;
 constexpr uint32_t kScreenOffDeviceStatusNotifyMs = 10000;
 constexpr uint32_t kStandbyDeviceStatusNotifyMs = 30000;
@@ -365,6 +369,7 @@ enum class RadarGattWriteRole : uint8_t {
   FirmwareControl,
   VoiceControl,
   VoiceAudioDownlink,
+  RoomStateSnapshot,
 };
 
 enum class RadarUiMode : uint8_t {
@@ -697,6 +702,12 @@ String remoteAppPeerIds[kRemoteAppSlotCount];
 String remoteAppPeerNames[kRemoteAppSlotCount];
 uint32_t remoteAppBlinkStartedSlotsMs[kRemoteAppSlotCount] = {0};
 uint32_t remoteAppSpeakingUntilMs[kRemoteAppSlotCount] = {0};
+bool bleRoomSnapshotSeen[kRemoteAppSlotCount] = {false};
+bool bleRoomSnapshotActive = false;
+bool bleRoomSnapshotSpeakerSeen = false;
+uint16_t bleRoomSnapshotSequence = 0;
+uint8_t bleRoomSnapshotExpectedMembers = 0;
+uint8_t bleRoomSnapshotReceivedMembers = 0;
 bool lastRelayAppLocationWasSelf = false;
 bool remoteRoomSpeakerActive = false;
 uint32_t remoteRoomSpeakerUntilMs = 0;
@@ -4576,18 +4587,33 @@ uint8_t activeRemoteAppLocationCount(uint32_t now) {
   return count;
 }
 
+void clearRemoteAppSlot(uint8_t slot) {
+  if (slot >= kRemoteAppSlotCount) {
+    return;
+  }
+  if (focusedMemberSlot == slot) {
+    focusedMemberSlot = kFocusNone;
+  }
+  remoteAppLocationFrames[slot] = RemoteLocationFrame{};
+  remoteGeoFilterStates[slot] = RemoteGeoFilterState{};
+  remoteAppPeerIds[slot] = "";
+  remoteAppPeerNames[slot] = "";
+  remoteAppBlinkStartedSlotsMs[slot] = 0;
+  remoteAppSpeakingUntilMs[slot] = 0;
+}
+
 void clearRemoteRoomState() {
   focusedMemberSlot = kFocusNone;
   remoteAppLocationFrame = RemoteLocationFrame{};
   remoteAppPeerName = "";
   for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
-    remoteAppLocationFrames[slot] = RemoteLocationFrame{};
-    remoteGeoFilterStates[slot] = RemoteGeoFilterState{};
-    remoteAppPeerIds[slot] = "";
-    remoteAppPeerNames[slot] = "";
-    remoteAppBlinkStartedSlotsMs[slot] = 0;
-    remoteAppSpeakingUntilMs[slot] = 0;
+    clearRemoteAppSlot(slot);
+    bleRoomSnapshotSeen[slot] = false;
   }
+  bleRoomSnapshotActive = false;
+  bleRoomSnapshotSpeakerSeen = false;
+  bleRoomSnapshotExpectedMembers = 0;
+  bleRoomSnapshotReceivedMembers = 0;
   remoteAppBlinkStartedMs = 0;
   remoteRoomSpeakerActive = false;
   remoteRoomSpeakerUntilMs = 0;
@@ -5460,6 +5486,153 @@ void handleLocalLocationWrite(BLECharacteristic *characteristic) {
   }
 }
 
+void handleRoomStateSnapshotWrite(BLECharacteristic *characteristic) {
+  const uint8_t *data = characteristic->getData();
+  const size_t len = characteristic->getLength();
+  if (!data || len < 4 || data[0] != 1) {
+    provisioning.lastWrite = "room_state_invalid";
+    notifyDeviceStatus(true);
+    Serial.print("BLE room_state invalid len=");
+    Serial.println(len);
+    return;
+  }
+
+  const uint8_t opcode = data[1];
+  const uint16_t sequence = readLeUInt16(data + 2);
+  if (opcode == 1) {
+    if (len < 9) {
+      provisioning.lastWrite = "room_state_begin_invalid";
+      notifyDeviceStatus(true);
+      return;
+    }
+    bleRoomSnapshotActive = true;
+    bleRoomSnapshotSequence = sequence;
+    bleRoomSnapshotExpectedMembers = min(data[4], kRemoteAppSlotCount);
+    bleRoomSnapshotReceivedMembers = 0;
+    bleRoomSnapshotSpeakerSeen = false;
+    for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
+      bleRoomSnapshotSeen[slot] = false;
+    }
+    const uint32_t serverTime = readLeUInt32(data + 5);
+    if (serverTime > 0) {
+      relayServerUnixTime = serverTime;
+      relayServerTimeReceivedMs = millis();
+    }
+    provisioning.lastWrite = "room_state_begin";
+    return;
+  }
+
+  if (!bleRoomSnapshotActive || sequence != bleRoomSnapshotSequence) {
+    provisioning.lastWrite = "room_state_sequence_mismatch";
+    notifyDeviceStatus(true);
+    return;
+  }
+
+  if (opcode == 2) {
+    if (len < 40) {
+      provisioning.lastWrite = "room_state_member_invalid";
+      notifyDeviceStatus(true);
+      return;
+    }
+    const uint8_t nameLength = data[39];
+    if (nameLength > 20 || len < static_cast<size_t>(40 + nameLength)) {
+      provisioning.lastWrite = "room_state_name_invalid";
+      notifyDeviceStatus(true);
+      return;
+    }
+
+    String peerId = "ble-";
+    for (uint8_t i = 0; i < 12 && data[5 + i] != 0; ++i) {
+      peerId += static_cast<char>(data[5 + i]);
+    }
+    if (peerId.length() <= 4) {
+      provisioning.lastWrite = "room_state_peer_invalid";
+      notifyDeviceStatus(true);
+      return;
+    }
+    String name;
+    name.reserve(nameLength);
+    for (uint8_t i = 0; i < nameLength; ++i) {
+      name += static_cast<char>(data[40 + i]);
+    }
+
+    const uint8_t flags = data[4];
+    RemoteLocationFrame frame;
+    frame.valid = (flags & 0x01) != 0;
+    frame.reportedHeadingValid = false;
+    frame.latE7 = readLeInt32(data + 17);
+    frame.lonE7 = readLeInt32(data + 21);
+    frame.horizontalAccuracyCm = readLeUInt16(data + 25);
+    frame.speedCms = readLeUInt16(data + 27);
+    frame.courseDeg100 = readLeUInt16(data + 29);
+    frame.reportedHeadingDeg100 = 0;
+    frame.unixTime = readLeUInt32(data + 31);
+    frame.receivedMs = millis();
+    frame.sourceAgeMs = readLeUInt32(data + 35);
+    frame.sourceAgeKnown = true;
+    frame.sourceStale = (flags & 0x04) != 0;
+
+    storeRemoteAppLocation(peerId, name, frame);
+    const bool speaking = (flags & 0x02) != 0;
+    storeRemoteAppSpeaking(peerId, speaking);
+    bleRoomSnapshotSpeakerSeen = bleRoomSnapshotSpeakerSeen || speaking;
+    for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
+      if (remoteAppPeerIds[slot] == peerId) {
+        bleRoomSnapshotSeen[slot] = true;
+        break;
+      }
+    }
+    if (bleRoomSnapshotReceivedMembers < kRemoteAppSlotCount) {
+      ++bleRoomSnapshotReceivedMembers;
+    }
+    provisioning.locationReceived = true;
+    provisioning.lastWrite = "room_state_member";
+    return;
+  }
+
+  if (opcode == 3) {
+    uint8_t activeMembers = 0;
+    for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
+      if (!bleRoomSnapshotSeen[slot]) {
+        clearRemoteAppSlot(slot);
+      } else {
+        ++activeMembers;
+      }
+    }
+    remoteAppLocationFrame = RemoteLocationFrame{};
+    remoteAppPeerName = "";
+    for (uint8_t slot = 0; slot < kRemoteAppSlotCount; ++slot) {
+      if (remoteAppLocationFrames[slot].valid) {
+        copyLocationFrame(remoteAppLocationFrame, remoteAppLocationFrames[slot]);
+        remoteAppPeerName = remoteAppPeerNames[slot];
+        break;
+      }
+    }
+    remoteRoomSpeakerActive = bleRoomSnapshotSpeakerSeen;
+    remoteRoomSpeakerUntilMs = bleRoomSnapshotSpeakerSeen
+                                   ? millis() + kRemoteSpeakingHoldMs
+                                   : 0;
+    provisioning.locationReceived = selfLocationFrame.valid || activeMembers > 0;
+    provisioning.lastWrite = activeMembers > 0
+                                 ? "room_state_projected"
+                                 : "room_state_cleared";
+    bleRoomSnapshotActive = false;
+    notifyDeviceStatus(true);
+    Serial.print("BLE room_state projected sequence=");
+    Serial.print(sequence);
+    Serial.print(" remote=");
+    Serial.print(activeMembers);
+    Serial.print(" received=");
+    Serial.print(bleRoomSnapshotReceivedMembers);
+    Serial.print(" expected=");
+    Serial.println(bleRoomSnapshotExpectedMembers);
+    return;
+  }
+
+  provisioning.lastWrite = "room_state_opcode_invalid";
+  notifyDeviceStatus(true);
+}
+
 void handleFirmwareControlWrite(BLECharacteristic *characteristic) {
   const String control = characteristicValueAsString(characteristic);
   const bool needsNetwork = control.indexOf("\"action\":\"start\"") >= 0 ||
@@ -5630,6 +5803,9 @@ void handleGattWrite(
       break;
     case RadarGattWriteRole::VoiceAudioDownlink:
       handleVoiceAudioDownlinkWrite(characteristic);
+      break;
+    case RadarGattWriteRole::RoomStateSnapshot:
+      handleRoomStateSnapshotWrite(characteristic);
       break;
   }
 }
@@ -5894,9 +6070,16 @@ void setupProvisioningBle() {
       kVoiceAudioDownlinkUuid,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
       new RadarGattWriteCallbacks(RadarGattWriteRole::VoiceAudioDownlink));
+  BLEService *roomStateService = provisioningServer->createService(kRoomStateBleServiceUuid);
+  createProvisioningCharacteristic(
+      roomStateService,
+      kRoomStateSnapshotUuid,
+      BLECharacteristic::PROPERTY_WRITE,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::RoomStateSnapshot));
 
   service->start();
   voiceService->start();
+  roomStateService->start();
 
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(kRadarBleServiceUuid);
@@ -5913,7 +6096,9 @@ void setupProvisioningBle() {
   Serial.print(" service=");
   Serial.print(kRadarBleServiceUuid);
   Serial.print(" voice_service=");
-  Serial.println(kVoiceBleServiceUuid);
+  Serial.print(kVoiceBleServiceUuid);
+  Serial.print(" room_service=");
+  Serial.println(kRoomStateBleServiceUuid);
 }
 
 void provisioningTick() {
@@ -6331,7 +6516,7 @@ void sendRelayHello() {
   payload += String(DRAGON_RADAR_PROTOCOL_VERSION);
   payload += ",\"min_relay_protocol_version\":";
   payload += String(DRAGON_RADAR_MIN_RELAY_PROTOCOL_VERSION);
-  payload += ",\"capabilities\":[\"display\",\"ble\",\"wifi\",\"location\",\"ptt_voice\",\"ota_pull\",\"ota_confirm\"]";
+  payload += ",\"capabilities\":[\"display\",\"ble\",\"wifi\",\"location\",\"ble_room_state\",\"ptt_voice\",\"ota_pull\",\"ota_confirm\"]";
   payload += ",\"room\":\"";
   payload += jsonEscape(provisioning.roomToken);
   payload += "\"}";

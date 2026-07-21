@@ -95,6 +95,61 @@ final class RelayModelTests: XCTestCase {
         XCTAssertEqual(snapshot.members[1].locationAgeMS, 45_000)
     }
 
+    func testBLEProjectionKeepsRemoteRadarFromSameAccountAndFitsOneWritePerPacket() throws {
+        let json = """
+        {
+          "type": "room_state",
+          "room": "KAME-UNIT",
+          "server_time": 1784700000,
+          "max_members": 7,
+          "voice_floor": {
+            "active": true,
+            "speaker_group_id": "remote-group-abcdef",
+            "speaker_peer_id": "app-remote-group-abcdef",
+            "expires_in_ms": 900
+          },
+          "members": [
+            {
+              "role": "app", "member_id": "local-group-abcdef",
+              "peer_id": "app-local-group-abcdef", "name": "隼人 A",
+              "online": true, "app_online": true, "age_ms": 0,
+              "last_seen_ms": 10, "last_type": "app_location",
+              "moderation_ref": "same-account",
+              "location": {"lat_e7": 312304160, "lon_e7": 1214737010, "h_acc_cm": 500}
+            },
+            {
+              "role": "app", "member_id": "remote-group-abcdef",
+              "peer_id": "app-remote-group-abcdef", "name": "远端雷达 B",
+              "online": true, "app_online": true, "age_ms": 0,
+              "last_seen_ms": 20, "last_type": "app_location",
+              "moderation_ref": "same-account",
+              "location_stale": false, "location_age_ms": 120,
+              "voice_status": {"ptt": true, "speaker": true},
+              "location": {
+                "lat_e7": 312304260, "lon_e7": 1214737110,
+                "h_acc_cm": 800, "speed_cms": 35,
+                "course_deg100": 9000, "unix_time": 1784700000
+              }
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+        let snapshot = try JSONDecoder().decode(RelayRoomStateSnapshot.self, from: json)
+
+        let packets = RadarRoomStateBLEPacketEncoder.packets(
+            snapshot: snapshot,
+            localAppPeerID: "app-local-group-abcdef",
+            sequence: 42
+        )
+
+        XCTAssertEqual(packets.count, 3)
+        XCTAssertEqual(Array(packets[0].prefix(5)), [1, 1, 42, 0, 1])
+        XCTAssertEqual(Array(packets[1].prefix(5)), [1, 2, 42, 0, 0b0000_0011])
+        XCTAssertEqual(String(data: packets[1][5..<17], encoding: .utf8), "remote-group")
+        XCTAssertEqual(Array(packets[2]), [1, 3, 42, 0, 1])
+        XCTAssertTrue(packets.allSatisfy { $0.count <= 60 })
+    }
+
     @MainActor
     func testRoomStoreProjectsDistanceBearingAndSpeakingState() {
         let store = RoomsStore()

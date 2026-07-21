@@ -435,10 +435,15 @@ struct AppRuntimeHost<Content: View>: View {
                 guard let snapshot else {
                     appState.clearRelayRoomMembers()
                     appState.updateActiveDeviceBattery(percent: nil)
+                    _ = bleBridge.clearRoomStateTargets()
                     return
                 }
                 appState.applyRelayRoomState(snapshot, localAppPeerID: radarRuntime.localAppPeerID)
                 appState.updateActiveDeviceBattery(percent: radarRuntime.localRelayDeviceStatus?.batteryPercentValue)
+                _ = bleBridge.writeRoomStateSnapshot(
+                    snapshot,
+                    localAppPeerID: radarRuntime.localAppPeerID
+                )
             }
             .onChange(of: scenePhase) { _, phase in
                 guard
@@ -683,7 +688,22 @@ struct AppRuntimeHost<Content: View>: View {
         case "ptt_begin":
             let requestID = UUID().uuidString
             activeLocalVoiceRequestID = requestID
-            Task { await radarRuntime.requestVoiceFloor(requestID: requestID) }
+            let roomCode = appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines)
+            let deviceToken = appState.activeDeviceToken
+            let accessToken = appState.accessToken
+            Task {
+                await radarRuntime.requestVoiceFloor(requestID: requestID)
+                guard
+                    radarRuntime.relayPhase != .ready,
+                    !roomCode.isEmpty,
+                    !accessToken.isEmpty
+                else { return }
+                await radarRuntime.connectRelay(
+                    roomCode: roomCode,
+                    deviceToken: deviceToken,
+                    appAccessToken: accessToken
+                )
+            }
         case "ptt_end", "ptt_cancel":
             let requestID = activeLocalVoiceRequestID
             activeLocalVoiceRequestID = ""

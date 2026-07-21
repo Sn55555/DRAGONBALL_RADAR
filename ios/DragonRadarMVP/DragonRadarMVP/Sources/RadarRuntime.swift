@@ -444,12 +444,12 @@ final class RadarRuntime {
     }
 
     func requestVoiceFloor(requestID: String) async {
+        activeVoiceRequestID = requestID
         guard relayPhase == .ready else {
-            voicePhase = .failed
-            noteVoiceEvent("房间未连接，无法发起语音")
+            voicePhase = .connecting
+            noteVoiceEvent("房间链路恢复后继续申请语音权")
             return
         }
-        activeVoiceRequestID = requestID
         do {
             try await sendRelayJSON([
                 "type": "gateway_voice_request",
@@ -461,8 +461,10 @@ final class RadarRuntime {
             voicePhase = .connecting
             noteVoiceEvent("正在申请房间语音权")
         } catch {
-            voicePhase = .failed
-            noteVoiceEvent("语音申请失败：\(error.localizedDescription)")
+            guard activeVoiceRequestID == requestID else { return }
+            relayPhase = .failed
+            voicePhase = .degraded
+            noteVoiceEvent("语音申请等待房间链路恢复：\(error.localizedDescription)")
         }
     }
 
@@ -631,6 +633,10 @@ final class RadarRuntime {
             if !pendingVoiceReadyRequestID.isEmpty {
                 let pendingRequestID = pendingVoiceReadyRequestID
                 Task { await self.confirmRemoteVoiceReady(requestID: pendingRequestID) }
+            }
+            if !activeVoiceRequestID.isEmpty {
+                let pendingRequestID = activeVoiceRequestID
+                Task { await self.requestVoiceFloor(requestID: pendingRequestID) }
             }
             print("DragonRadar Relay connected path=\(appSocketPath) room=\(roomCode)")
         } catch {
@@ -1028,8 +1034,20 @@ final class RadarRuntime {
             let from = object["from"] as? String ?? "peer"
             noteRelayEvent("房间事件 \(event) · \(from)")
         case "error":
-            relayPhase = .failed
             let code = object["code"] as? String ?? "unknown"
+            let voiceErrorCodes: Set<String> = [
+                "voice_gateway_requires_app",
+                "voice_request_id_required",
+                "voice_request_not_active",
+                "voice_floor_not_granted",
+                "invalid_voice_frame"
+            ]
+            if voiceErrorCodes.contains(code) {
+                voicePhase = code == "voice_request_not_active" ? .idle : .degraded
+                noteVoiceEvent("房间语音状态异常：\(code)")
+                break
+            }
+            relayPhase = .failed
             if code == "protocol_unsupported" {
                 let required = intValue(object["required_protocol"]) ?? DragonRadarProtocol.minRelayProtocolVersion
                 let client = intValue(object["client_protocol"]) ?? DragonRadarProtocol.appProtocolVersion
