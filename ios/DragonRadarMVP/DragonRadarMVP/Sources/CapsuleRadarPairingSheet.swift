@@ -78,6 +78,9 @@ struct CapsuleRadarPairingSheet: View {
         if bleBridge.authorizationText == "已拒绝" || bleBridge.stateText == "未授权" {
             return .failed("请在“设置”中允许 Capsule Radar 使用蓝牙")
         }
+        if bleBridge.bleSecurityRepairRequired {
+            return .failed(bleBridge.bleSecurityRepairText)
+        }
         if bleBridge.isBLEConnected, bleBridge.isRegistrationComplete {
             if appState.devices.isEmpty {
                 return .failed("雷达保留着旧绑定，请先在雷达本机恢复后重新绑定")
@@ -135,6 +138,9 @@ struct CapsuleRadarPairingSheet: View {
         case .connected:
             return "完成"
         case .failed:
+            if bleBridge.bleSecurityRepairRequired {
+                return "重新扫描"
+            }
             return requiresLocalBindingReset ? "关闭" : "重试"
         }
     }
@@ -167,6 +173,13 @@ struct CapsuleRadarPairingSheet: View {
             shouldFinishAfterConnection = true
             Task { await finishPairing() }
         case .failed:
+            if bleBridge.bleSecurityRepairRequired {
+                pairingPhase = .idle
+                didStartPairing = false
+                shouldFinishAfterConnection = false
+                bleBridge.retryAfterSecurityRepair()
+                return
+            }
             if requiresLocalBindingReset {
                 dismiss()
                 return

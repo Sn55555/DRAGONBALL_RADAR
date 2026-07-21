@@ -339,6 +339,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     var deviceStatusText = "未读取"
     var deviceStatus: RadarBLEDeviceStatus?
     var bleSecurityRepairRequired = false
+    var bleSecurityRepairPeripheralName = ""
     var lastDeviceStatusAt: Date?
     var firmwareStatusText = "未读取"
     var firmwareStatus: RadarBLEFirmwareStatus?
@@ -410,6 +411,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         default:
             break
         }
+        if bleSecurityRepairRequired { return "需要更新系统配对" }
         if isBLEConnected { return "已连接" }
         if isScanning || selectedPeripheralID != nil || (hasSavedGateway && !scanTimedOut) {
             return "正在连接"
@@ -418,6 +420,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     var userConnectionDetail: String {
+        if bleSecurityRepairRequired {
+            return bleSecurityRepairText
+        }
         if isBLEConnected {
             return "\(connectedPeripheralName) · 以后打开 App 会自动连接"
         }
@@ -672,9 +677,17 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     var bleSecurityRepairText: String {
-        let name = connectedPeripheralName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let retainedName = bleSecurityRepairPeripheralName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let connectedName = connectedPeripheralName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = retainedName.isEmpty ? connectedName : retainedName
         let target = name.isEmpty || name == "未连接" ? "这台雷达" : name
         return "系统蓝牙安全配对已失效。请在 iPhone 蓝牙设置中忽略 \(target)，再回到 App 重新连接并输入雷达屏幕上的 6 位码。"
+    }
+
+    func retryAfterSecurityRepair() {
+        bleSecurityRepairRequired = false
+        bleSecurityRepairPeripheralName = ""
+        startFreshScan()
     }
 
     var isRegistrationComplete: Bool {
@@ -701,14 +714,14 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
                 return "已绑定 · 雷达当前已确认"
             }
             if deviceStatus.paired == 1 {
-                return "已绑定 · 等待联网配置"
+                return "已绑定 · 等待设备身份确认"
             }
         }
         if hasSavedRegistration {
             return "上次已绑定 · 当前未确认"
         }
         if persistedPaired {
-            return "上次已绑定 · 还没保存完整配置"
+            return "上次已绑定 · 还没保存完整身份"
         }
         return "未绑定"
     }
@@ -748,7 +761,13 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func startScan() {
-        guard !accessorySetupSuspended else { return }
+        // A user-initiated scan always takes precedence over the optional
+        // AccessorySetupKit flow. This keeps the primary first-run path usable
+        // even when the system picker cannot discover the radar.
+        if accessorySetupSuspended {
+            accessorySetupSuspended = false
+            manualDisconnectRequested = false
+        }
         if authorizedAccessoryConnection != nil {
             connectAuthorizedAccessoryIfReady()
             return
@@ -770,9 +789,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         scanStartedAt = Date()
         isScanning = true
         lastEvent = "正在查找附近的雷达"
+        print("DragonRadar BLE scan_start state=\(stateText)")
         central.scanForPeripherals(
             withServices: nil,
-            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+            options: nil
         )
         startScanTimeout()
     }
@@ -787,9 +807,46 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         guard let central, central.state == .poweredOn else { return }
         if recoverSystemConnectedRadarIfNeeded() { return }
         if reconnectSavedGatewayIfNeeded() { return }
-        if !hasSavedGateway, !isScanning {
+        // The phone may still contain our old peripheral UUID after the user
+        // has forgotten the accessory in Settings. If CoreBluetooth can no
+        // longer resolve that UUID, drop only the transport reference and
+        // immediately fall back to discovery.
+        if hasSavedGateway {
+            defaults.removeObject(forKey: Self.gatewayPeripheralKey)
+            selectedPeripheralID = nil
+        }
+        if !isScanning {
             startScan()
         }
+    }
+
+    /// Rebuilds a stale CoreBluetooth manager after the user changes Bluetooth
+    /// from Control Center or Settings while the app is backgrounded.
+    func refreshBluetoothAvailability() {
+        guard !accessorySetupSuspended else { return }
+        if central == nil || centralState == .poweredOff || centralState == .unknown {
+            central?.delegate = nil
+            central = nil
+            centralState = .unknown
+            ensureCentralManager()
+        }
+        resumeAutomaticConnection()
+    }
+
+    /// Explicit user recovery path. Registration and room state are preserved;
+    /// only the stale CoreBluetooth peripheral reference is replaced.
+    func startFreshScan() {
+        if let selectedPeripheralID,
+           let peripheral = peripherals[selectedPeripheralID],
+           peripheral.state == .connecting || peripheral.state == .connected {
+            central?.cancelPeripheralConnection(peripheral)
+        }
+        defaults.removeObject(forKey: Self.gatewayPeripheralKey)
+        authorizedAccessoryConnection = nil
+        selectedPeripheralID = nil
+        connectedPeripheralName = "未连接"
+        manualDisconnectRequested = false
+        startScan()
     }
 
     private func resetStateForNewScan() {
@@ -1134,8 +1191,13 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func connect(_ candidate: BLEDeviceCandidate) {
+        print(
+            "DragonRadar BLE connect_requested "
+                + "name=\(candidate.name) id=\(candidate.peripheralID.uuidString)"
+        )
         guard let peripheral = peripherals[candidate.peripheralID] else {
             lastEvent = "候选设备已失效，请重新扫描"
+            print("DragonRadar BLE connect_rejected reason=stale_candidate")
             return
         }
 
@@ -1155,6 +1217,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         connectedPeripheralName = candidate.name
         lastEvent = "正在连接 \(candidate.name)"
         manualDisconnectRequested = false
+        print("DragonRadar BLE connect_start name=\(candidate.name)")
         central?.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
     }
 
@@ -1167,8 +1230,8 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         connectAuthorizedAccessoryIfReady()
     }
 
-    func prepareForAccessorySetup() async {
-        guard !accessorySetupSuspended else { return }
+    func prepareForAccessorySetup() async -> Bool {
+        guard !accessorySetupSuspended else { return true }
         accessorySetupSuspended = true
         manualDisconnectRequested = true
         scanRequested = false
@@ -1194,6 +1257,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         }
 
         try? await Task.sleep(for: .milliseconds(500))
+        // The in-app scanner may have been opened while the system picker was
+        // being prepared. In that case scanning wins and the picker is aborted.
+        guard accessorySetupSuspended else { return false }
         central?.delegate = nil
         central = nil
         peripherals.removeAll()
@@ -1202,6 +1268,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         connectedPeripheralName = "未连接"
         centralState = .unknown
         lastEvent = "正在打开系统雷达配对"
+        return true
     }
 
     func resumeAfterAccessorySetup() {
@@ -1257,6 +1324,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         centralState = central.state
         lastEvent = "蓝牙状态：\(stateText)"
+        print(
+            "DragonRadar BLE central_state=\(stateText) authorization=\(authorizationText)"
+        )
         if central.state == .poweredOn, authorizedAccessoryConnection != nil {
             connectAuthorizedAccessoryIfReady()
             return
@@ -1281,7 +1351,15 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         } else {
             resumeFirmwareReconnectIfNeeded()
             if !recoverSystemConnectedRadarIfNeeded() {
-                _ = reconnectSavedGatewayIfNeeded()
+                if !reconnectSavedGatewayIfNeeded() {
+                    if hasSavedGateway {
+                        defaults.removeObject(forKey: Self.gatewayPeripheralKey)
+                        selectedPeripheralID = nil
+                    }
+                    if !isScanning {
+                        startScan()
+                    }
+                }
             }
         }
     }
@@ -1424,6 +1502,12 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
         guard likelyRadar else { return }
 
+        print(
+            "DragonRadar BLE scan_discovered "
+                + "name=\(name) rssi=\(RSSI.intValue) connectable="
+                + "\((advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? false)"
+        )
+
         peripherals[peripheral.identifier] = peripheral
         peripheral.delegate = self
 
@@ -1449,6 +1533,13 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        let peripheralName = peripheral.name ?? "unknown"
+        print(
+            "DragonRadar BLE connected "
+                + "name=\(peripheralName) id=\(peripheral.identifier.uuidString)"
+        )
+        bleSecurityRepairRequired = false
+        bleSecurityRepairPeripheralName = ""
         manualDisconnectRequested = false
         gatewayReconnectTask?.cancel()
         defaults.set(peripheral.identifier.uuidString, forKey: Self.gatewayPeripheralKey)
@@ -1482,7 +1573,23 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        lastEvent = "连接失败：\(error?.localizedDescription ?? peripheral.identifier.uuidString)"
+        let peripheralName = peripheral.name ?? "unknown"
+        let failureReason = error?.localizedDescription ?? "unknown"
+        print(
+            "DragonRadar BLE connect_failed "
+                + "name=\(peripheralName) error=\(failureReason)"
+        )
+
+        let nsError = error as NSError?
+        let peerRemovedPairing = nsError?.domain == CBErrorDomain
+            && nsError?.code == CBError.peerRemovedPairingInformation.rawValue
+        if peerRemovedPairing {
+            bleSecurityRepairRequired = true
+            bleSecurityRepairPeripheralName = peripheralName
+            lastEvent = bleSecurityRepairText
+        } else {
+            lastEvent = "连接失败：\(error?.localizedDescription ?? peripheral.identifier.uuidString)"
+        }
         if
             firmwareReconnectTrackingRequired,
             !firmwareReconnectSuppressed,
@@ -1493,7 +1600,13 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         } else {
             clearSelectedConnection(peripheral.identifier)
             if !manualDisconnectRequested {
-                scheduleGatewayReconnect()
+                let savedID = defaults.string(forKey: Self.gatewayPeripheralKey).flatMap(UUID.init(uuidString:))
+                if savedID == peripheral.identifier {
+                    defaults.removeObject(forKey: Self.gatewayPeripheralKey)
+                    startScan()
+                } else {
+                    scheduleGatewayReconnect()
+                }
             }
         }
     }

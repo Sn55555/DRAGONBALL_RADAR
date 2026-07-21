@@ -307,7 +307,7 @@ struct DeviceActionMenuPanel: View {
                 DeviceMenuRow(
                     symbol: "checklist",
                     title: "配置流程",
-                    detail: "授权、绑定、配网、房间和进入雷达。"
+                    detail: "授权、绑定、房间和进入雷达；OTA 网络按需设置。"
                 )
             }
             .buttonStyle(.plain)
@@ -451,12 +451,9 @@ private struct RadarBindingRecoveryPanel: View {
                 .foregroundStyle(MangaTheme.subtle)
 
             Button {
-                Task {
-                    await bleBridge.prepareForAccessorySetup()
-                    accessorySetup.removeAuthorizationAndPresentPicker()
-                }
+                bleBridge.startFreshScan()
             } label: {
-                Label("清除旧授权并重新配对", systemImage: "link")
+                Label("重新扫描并绑定", systemImage: "antenna.radiowaves.left.and.right")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(InkButtonStyle())
@@ -657,10 +654,10 @@ struct DeviceSetupFlowPanel: View {
             )
             DeviceSetupActionRow(
                 index: 3,
-                title: "网络和服务器",
+                title: "OTA 网络（可选）",
                 detail: espNetworkDetail,
-                isReady: espNetworkReady,
-                buttonTitle: espNetworkReady ? "查看" : "配网",
+                isReady: true,
+                buttonTitle: espNetworkReady ? "查看" : "按需设置",
                 symbol: "wifi",
                 action: openWifi
             )
@@ -716,11 +713,11 @@ struct DeviceSetupFlowPanel: View {
 
     private var espNetworkDetail: String {
         guard let status = bleBridge.deviceStatus else {
-            return bleBridge.persistedServerConfigured
-                ? "已写入雷达 · 可独立使用"
-                : bleBridge.lastWriteEvent
+            return "日常语音无需配网 · 固件更新时再设置"
         }
-        return "\(status.wifiText) · \(status.serverText)"
+        return status.wifi == "connected"
+            ? "\(status.wifiText) · 可用于固件更新"
+            : "日常语音无需配网 · 固件更新时再设置"
     }
 
     private var roomDetail: String {
@@ -816,15 +813,15 @@ struct ESPRegistrationChecklist: View {
                 isReady: bleBridge.persistedPaired || (bleBridge.deviceStatus?.paired ?? 0) == 1
             )
             DeviceSetupStatusRow(
-                title: "联网配置",
-                detail: bleBridge.persistedServerConfigured ? "已保存到雷达，可独立使用" : "未写入",
+                title: "设备身份",
+                detail: bleBridge.persistedServerConfigured ? "房间凭证已保存" : "绑定时自动写入",
                 isReady: bleBridge.persistedServerConfigured || (bleBridge.deviceStatus?.server ?? 0) == 1
             )
             if let status = bleBridge.deviceStatus {
                 DeviceSetupStatusRow(
-                    title: "雷达联网",
-                    detail: status.wifiText,
-                    isReady: status.wifi == "connected"
+                    title: "OTA 网络（可选）",
+                    detail: status.wifi == "connected" ? status.wifiText : "未连接 · 日常语音无需 Wi-Fi",
+                    isReady: true
                 )
             }
         }
@@ -873,7 +870,7 @@ struct BLEScanPanel: View {
                 Spacer()
             }
 
-            if !bleBridge.isBLEConnected, !bleBridge.hasSavedGateway {
+            if !bleBridge.isBLEConnected {
                 if bleBridge.candidates.isEmpty {
                     Text("请打开雷达并放在手机附近。首次连接成功后，以后会自动连接。")
                         .font(.caption.weight(.semibold))
@@ -883,16 +880,16 @@ struct BLEScanPanel: View {
                     BLECandidateRow(candidate: candidate)
                 }
                 Button {
-                    bleBridge.startScan()
+                    if bleBridge.hasSavedGateway {
+                        bleBridge.startFreshScan()
+                    } else {
+                        bleBridge.startScan()
+                    }
                 } label: {
-                    Label(bleBridge.isScanning ? "重新扫描" : "开始扫描", systemImage: "antenna.radiowaves.left.and.right")
-                }
-                .buttonStyle(InkButtonStyle())
-            } else if !bleBridge.isBLEConnected, bleBridge.stateText == "可用" {
-                Button {
-                    bleBridge.resumeAutomaticConnection()
-                } label: {
-                    Label("重新连接", systemImage: "arrow.clockwise")
+                    Label(
+                        bleBridge.isScanning || bleBridge.hasSavedGateway ? "重新扫描" : "开始扫描",
+                        systemImage: "antenna.radiowaves.left.and.right"
+                    )
                 }
                 .buttonStyle(InkButtonStyle())
             }
@@ -1105,7 +1102,7 @@ struct DeviceCard: View {
 
             InfoRow(label: "电量", value: batteryText)
             InfoRow(label: "Wi-Fi", value: status?.wifiText ?? "\(device.wifiName) · 本地记录")
-            InfoRow(label: "联网配置", value: status?.serverText ?? registrationText)
+            InfoRow(label: "设备身份", value: status?.serverText ?? registrationText)
             InfoRow(label: "配置连接", value: configChannelText)
             InfoRow(label: "定位", value: status?.locationText ?? "等待雷达上报")
             InfoRow(label: "固件", value: status?.firmwareText ?? "未上报")
@@ -1274,6 +1271,10 @@ struct WifiConfigSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Text("此网络只供 ESP 固件 OTA 更新使用。日常房间、语音和远程唤醒由 iPhone 联网转发，不需要雷达连接 Wi-Fi。")
+                        .foregroundStyle(.secondary)
+                }
                 Section("推荐：iPhone 个人热点") {
                     Text("请手动开启个人热点，SSID 填 iPhone 热点名称，密码填个人热点页面显示的 Wi-Fi 密码。")
                         .foregroundStyle(.secondary)
@@ -1293,7 +1294,7 @@ struct WifiConfigSheet: View {
                     LabeledContent("房间连接", value: serverStatusText)
                 }
             }
-            .navigationTitle("Wi-Fi / 热点配置")
+            .navigationTitle("OTA Wi-Fi / 热点")
             .scrollContentBackground(.hidden)
             .background(MangaBackground())
             .toolbar {
@@ -1338,7 +1339,7 @@ struct WifiConfigSheet: View {
         guard !cleanSSID.isEmpty else { return }
 
         guard bleBridge.isBLEConnected else {
-            writePhase = .failed("雷达未连接，不能写入配网")
+            writePhase = .failed("雷达未连接，不能写入 OTA 网络")
             return
         }
 
@@ -1366,7 +1367,7 @@ struct WifiConfigSheet: View {
             roomToken: roomCode,
             deviceToken: deviceToken
         ) else {
-            writePhase = .failed(userFacingWriteFailure(defaultMessage: "联网配置写入失败"))
+            writePhase = .failed(userFacingWriteFailure(defaultMessage: "设备身份写入失败"))
             return
         }
 

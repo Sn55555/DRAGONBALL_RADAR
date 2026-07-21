@@ -80,6 +80,7 @@ extension Notification.Name {
 
 @main
 struct DragonRadarMVPApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @UIApplicationDelegateAdaptor(DragonRadarAppDelegate.self) private var appDelegate
     @State private var appState: AppState
     @State private var locationBridge = LocationBridge()
@@ -93,6 +94,7 @@ struct DragonRadarMVPApp: App {
     @State private var accessorySetup = CapsuleAccessorySetupCoordinator()
     #if !APP_ONLY
     @State private var showAccessoryConnectionSheet = false
+    @State private var showBLEDiscoverySheet = false
     @State private var handledAccessorySelectionID: UUID?
     @State private var pendingAuthorizedConnectionAnimation = false
     #endif
@@ -131,6 +133,13 @@ struct DragonRadarMVPApp: App {
                         .environment(radarRuntime)
                         .environment(bleBridge)
                 }
+                .sheet(isPresented: $showBLEDiscoverySheet) {
+                    NavigationStack {
+                        BLEConfigDetailView()
+                            .environment(appState)
+                            .environment(bleBridge)
+                    }
+                }
                 .alert(
                     "无法设置 Capsule Radar",
                     isPresented: Binding(
@@ -149,17 +158,17 @@ struct DragonRadarMVPApp: App {
                     Text(accessorySetup.errorMessage ?? "请稍后重试")
                 }
                 .onAppear {
+                    bleBridge.refreshBluetoothAvailability()
                     handleCurrentAuthorizedAccessory()
-                    presentAccessoryPickerAutomaticallyIfEligible()
                     handlePairingRequestIfNeeded()
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    guard phase == .active else { return }
+                    bleBridge.refreshBluetoothAvailability()
                 }
                 .onChange(of: appState.showPairingSheet) { _, requested in
                     guard requested else { return }
                     handlePairingRequestIfNeeded()
-                }
-                .onChange(of: automaticPairingEligibility) { _, isEligible in
-                    guard isEligible else { return }
-                    presentAccessoryPickerAutomaticallyIfEligible()
                 }
                 .onChange(of: accessorySetup.completedSelection?.eventID) { _, _ in
                     handleCurrentAuthorizedAccessory()
@@ -173,6 +182,14 @@ struct DragonRadarMVPApp: App {
                     }
                 }
                 .onChange(of: bleBridge.isBLEConnected) { _, isConnected in
+                    if isConnected, showBLEDiscoverySheet {
+                        showBLEDiscoverySheet = false
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(400))
+                            showAccessoryConnectionSheet = true
+                        }
+                        return
+                    }
                     guard isConnected, pendingAuthorizedConnectionAnimation else { return }
                     pendingAuthorizedConnectionAnimation = false
                     showAccessoryConnectionSheet = true
@@ -182,37 +199,12 @@ struct DragonRadarMVPApp: App {
     }
 
     #if !APP_ONLY
-    private var automaticPairingEligibility: Bool {
-        !appState.isReviewExperienceActive
-            && appState.isSignedIn
-            && !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !bleBridge.hasSavedRegistration
-            && accessorySetup.completedSelection == nil
-    }
-
-    private func presentAccessoryPickerAutomaticallyIfEligible() {
-        guard automaticPairingEligibility else { return }
-        Task {
-            await bleBridge.prepareForAccessorySetup()
-            guard automaticPairingEligibility else {
-                bleBridge.resumeAfterAccessorySetup()
-                return
-            }
-            accessorySetup.presentPickerAutomatically()
-        }
-    }
-
     private func handlePairingRequestIfNeeded() {
         guard appState.showPairingSheet else { return }
         appState.showPairingSheet = false
-        if accessorySetup.completedSelection != nil {
-            accessorySetup.reconnectAuthorizedAccessory()
-        } else {
-            Task {
-                await bleBridge.prepareForAccessorySetup()
-                accessorySetup.presentPicker()
-            }
-        }
+        bleBridge.resumeAfterAccessorySetup()
+        bleBridge.startFreshScan()
+        showBLEDiscoverySheet = true
     }
 
     private func handleCurrentAuthorizedAccessory() {

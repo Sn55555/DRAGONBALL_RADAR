@@ -721,7 +721,7 @@ struct PrivacyPermissionsView: View {
                 MangaPanel("蓝牙配置") {
                     InfoRow(label: "系统权限", value: bleBridge.authorizationText)
                     InfoRow(label: "通道状态", value: bleBridge.stateText)
-                    InfoRow(label: "用途", value: "连接雷达、绑定雷达、写入 Wi-Fi")
+                    InfoRow(label: "用途", value: "连接雷达、绑定身份、传输语音和 OTA 配置")
                     InfoRow(label: "状态", value: bleBridge.isBLEConnected ? "雷达已连接" : "未连接雷达")
                 }
 

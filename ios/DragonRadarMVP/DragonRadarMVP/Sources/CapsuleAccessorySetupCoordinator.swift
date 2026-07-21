@@ -24,8 +24,9 @@ enum CapsuleAccessorySetupPhase: Equatable {
 final class CapsuleAccessorySetupCoordinator {
     static let radarServiceUUID = CBUUID(string: "7d540100-f82d-4b2f-91c6-4f0f88aa5a11")
 
-    private let session = ASAccessorySession()
+    private var session: ASAccessorySession?
     private var isActivated = false
+    private var activationRequested = false
     private var shouldPresentWhenActivated = false
     private var isPickerPresented = false
     private var pendingSelection: CapsuleAuthorizedAccessorySelection?
@@ -36,7 +37,13 @@ final class CapsuleAccessorySetupCoordinator {
     private(set) var completedSelection: CapsuleAuthorizedAccessorySelection?
     var errorMessage: String?
 
-    init() {
+    init() {}
+
+    private func activateSessionIfNeeded() {
+        guard !isActivated, !activationRequested else { return }
+        activationRequested = true
+        let session = ASAccessorySession()
+        self.session = session
         session.activate(on: .main) { [weak self] event in
             self?.handle(event)
         }
@@ -47,6 +54,7 @@ final class CapsuleAccessorySetupCoordinator {
         guard isActivated else {
             shouldPresentWhenActivated = true
             phase = .waitingForSession
+            activateSessionIfNeeded()
             return
         }
         presentActivatedPicker()
@@ -76,6 +84,7 @@ final class CapsuleAccessorySetupCoordinator {
         guard isActivated else {
             shouldRemoveAuthorizationWhenActivated = true
             phase = .waitingForSession
+            activateSessionIfNeeded()
             return
         }
         removeCurrentAuthorizationAndPresentPicker()
@@ -89,6 +98,10 @@ final class CapsuleAccessorySetupCoordinator {
     }
 
     private func presentActivatedPicker() {
+        guard let session else {
+            fail("系统配件会话未启动")
+            return
+        }
         guard let productImage = UIImage(named: "CapsuleRadarSystemPickerProduct") else {
             fail("缺少 Capsule Radar 系统配件图片")
             return
@@ -121,12 +134,13 @@ final class CapsuleAccessorySetupCoordinator {
         switch event.eventType {
         case .activated:
             isActivated = true
+            activationRequested = false
             if shouldRemoveAuthorizationWhenActivated {
                 shouldRemoveAuthorizationWhenActivated = false
                 removeCurrentAuthorizationAndPresentPicker()
                 return
             }
-            if let accessory = session.accessories.first(where: { $0.bluetoothIdentifier != nil }),
+            if let accessory = session?.accessories.first(where: { $0.bluetoothIdentifier != nil }),
                let identifier = accessory.bluetoothIdentifier {
                 shouldPresentWhenActivated = false
                 publish(
@@ -180,6 +194,7 @@ final class CapsuleAccessorySetupCoordinator {
 
         case .invalidated:
             isActivated = false
+            activationRequested = false
             fail("系统配件设置会话已失效，请重新打开 App")
 
         case .accessoryRemoved:
@@ -204,6 +219,10 @@ final class CapsuleAccessorySetupCoordinator {
     }
 
     private func removeCurrentAuthorizationAndPresentPicker() {
+        guard let session else {
+            fail("系统配件会话未启动")
+            return
+        }
         let selectedIdentifier = completedSelection?.bluetoothIdentifier
         let accessory = session.accessories.first(where: {
             guard let identifier = $0.bluetoothIdentifier else { return false }

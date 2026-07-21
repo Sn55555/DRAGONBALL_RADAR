@@ -14,7 +14,7 @@ struct SetupView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("上线顺序")
                             .font(.largeTitle.weight(.black))
-                        Text("一次性完成绑定和联网，之后日常只进房间和雷达。")
+                        Text("一次性完成授权、绑定和房间加入；日常语音由 iPhone 联网转发。")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(MangaTheme.subtle)
                         SetupReadinessStrip(
@@ -49,10 +49,10 @@ struct SetupView: View {
 
                     SetupStepCard(
                         index: 3,
-                        title: "写入网络配置",
+                        title: "OTA 网络（可选）",
                         detail: espNetworkDetail,
-                        isReady: espNetworkReady,
-                        primaryTitle: espNetworkReady ? "查看配置" : "热点配网",
+                        isReady: true,
+                        primaryTitle: espNetworkReady ? "查看 OTA 网络" : "按需设置",
                         primarySymbol: "wifi",
                         primaryAction: openWifiConfig
                     )
@@ -93,13 +93,13 @@ struct SetupView: View {
                     )
                     SetupUsageRow(
                         symbol: "dot.radiowaves.left.and.right",
-                        title: "雷达",
-                        detail: "只在首次绑定或换 Wi-Fi 时连接雷达。"
+                        title: "设备",
+                        detail: "首次绑定后，App 会按保存记录自动连接雷达。"
                     )
                     SetupUsageRow(
                         symbol: "scope",
                         title: "雷达",
-                        detail: "雷达保存配置后，可独立联网进房间。"
+                        detail: "日常通过蓝牙连接 iPhone，不要求 ESP 连接 Wi-Fi。"
                     )
                 }
             }
@@ -147,11 +147,11 @@ struct SetupView: View {
 
     private var espNetworkDetail: String {
         guard let status = bleBridge.deviceStatus else {
-            return bleBridge.persistedServerConfigured
-                ? "已写入雷达 · 可独立联网进房间"
-                : bleBridge.lastWriteEvent
+            return "日常语音无需配网 · 固件更新时再设置"
         }
-        return "\(status.wifiText) · \(status.serverText)"
+        return status.wifi == "connected"
+            ? "\(status.wifiText) · 可用于固件更新"
+            : "日常语音无需配网 · 固件更新时再设置"
     }
 
     private var roomDetail: String {
