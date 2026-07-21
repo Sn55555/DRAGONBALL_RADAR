@@ -279,6 +279,9 @@ private final class AppRuntimeCoordinator {
         radarRuntime: RadarRuntime,
         forceLocation: Bool
     ) async {
+        if !bleBridge.isBLEConnected {
+            bleBridge.resumeAutomaticConnection()
+        }
         if !locationBridge.isSharing && !locationBridge.isUserPaused {
             locationBridge.startSharing()
         }

@@ -257,6 +257,9 @@ constexpr uint8_t kCodecRuntimePercents[kAudioPresetCount] = {0, 65, 65, 65, 65,
 constexpr uint32_t kFrameRuntimeMs[kFramePresetCount] = {kFrameMs, 33, 50, 65, 80, 120};
 constexpr uint32_t kLegacyFrameRuntimeMs[] = {80, 65, 50, 120};
 constexpr const char *kRadarBleServiceUuid = "7d540100-f82d-4b2f-91c6-4f0f88aa5a11";
+// Voice is versioned as a separate service so bonded iPhones do not reuse the
+// provisioning-only GATT cache that existed before the phone-gateway update.
+constexpr const char *kVoiceBleServiceUuid = "7d540200-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kPairingChallengeUuid = "7d540101-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kPairingResponseUuid = "7d540102-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kWifiConfigUuid = "7d540103-f82d-4b2f-91c6-4f0f88aa5a11";
@@ -5888,23 +5891,25 @@ void setupProvisioningBle() {
       service,
       kFirmwareStatusUuid,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  BLEService *voiceService = provisioningServer->createService(kVoiceBleServiceUuid);
   voiceControlCharacteristic = createProvisioningCharacteristic(
-      service,
+      voiceService,
       kVoiceControlUuid,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
           BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY,
       new RadarGattWriteCallbacks(RadarGattWriteRole::VoiceControl));
   voiceAudioUplinkCharacteristic = createProvisioningCharacteristic(
-      service,
+      voiceService,
       kVoiceAudioUplinkUuid,
       BLECharacteristic::PROPERTY_NOTIFY);
   createProvisioningCharacteristic(
-      service,
+      voiceService,
       kVoiceAudioDownlinkUuid,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
       new RadarGattWriteCallbacks(RadarGattWriteRole::VoiceAudioDownlink));
 
   service->start();
+  voiceService->start();
 
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(kRadarBleServiceUuid);
@@ -5919,7 +5924,9 @@ void setupProvisioningBle() {
   Serial.print("BLE provisioning service online name=");
   Serial.print(provisioning.deviceName);
   Serial.print(" service=");
-  Serial.println(kRadarBleServiceUuid);
+  Serial.print(kRadarBleServiceUuid);
+  Serial.print(" voice_service=");
+  Serial.println(kVoiceBleServiceUuid);
 }
 
 void provisioningTick() {

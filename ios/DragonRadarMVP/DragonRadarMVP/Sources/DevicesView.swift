@@ -30,7 +30,7 @@ struct DevicesView: View {
                                 Text("雷达状态")
                                     .font(.largeTitle.weight(.black))
                                 Spacer()
-                                StatusChip(text: setupReady ? "准备完成" : "继续配置", filled: setupReady)
+                                StatusChip(text: bleBridge.userConnectionText, filled: bleBridge.isBLEConnected)
                             }
 
                             DeviceInventorySection()
@@ -103,6 +103,8 @@ struct DeviceInventorySection: View {
                             DeviceInlineRadarRow(
                                 device: device,
                                 status: bleBridge.deviceStatus,
+                                connectionText: bleBridge.userConnectionText,
+                                isConnected: bleBridge.isBLEConnected,
                                 relayOnline: bleBridge.isVoiceGatewayReady && radarRuntime.relayPhase == .ready,
                                 relayStatus: radarRuntime.localRelayDeviceStatus
                             )
@@ -119,6 +121,8 @@ struct DeviceInventorySection: View {
 struct DeviceInlineRadarRow: View {
     var device: RadarDevice
     var status: RadarBLEDeviceStatus?
+    var connectionText: String
+    var isConnected: Bool
     var relayOnline: Bool
     var relayStatus: RelayDeviceStatusSnapshot?
 
@@ -133,25 +137,19 @@ struct DeviceInlineRadarRow: View {
         if relayOnline {
             return "工作中"
         }
-        guard let status else {
-            return device.state.rawValue
-        }
-        if status.paired == 1 {
-            return "等待手机网关"
-        }
-        return "待配置"
+        return connectionText
     }
 
     private var statusReady: Bool {
-        if relayOnline { return true }
-        return false
+        relayOnline || isConnected
     }
 
     private var secondaryText: String {
         if relayOnline {
             return "iPhone 网关在线"
         }
-        return status?.paired == 1 ? "BLE 未就绪" : "等待绑定"
+        if isConnected { return "已连接到 iPhone" }
+        return connectionText == "正在连接" ? "App 正在自动连接" : "打开雷达后会自动连接"
     }
 
     private var batteryText: String {
@@ -207,11 +205,7 @@ struct DeviceInlineRadarRow: View {
 }
 
 struct DeviceConnectionGuidePanel: View {
-    @Environment(AppState.self) private var appState
-    @Environment(LocationBridge.self) private var locationBridge
-    @Environment(RadarRuntime.self) private var radarRuntime
     @Environment(BLEDeviceBridge.self) private var bleBridge
-    @Environment(PushToTalkGateway.self) private var pushToTalkGateway
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -223,219 +217,55 @@ struct DeviceConnectionGuidePanel: View {
                     .overlay(Circle().stroke(MangaTheme.ink, lineWidth: 1.6))
 
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(currentTitle)
+                    Text(bleBridge.userConnectionText)
                         .font(.title3.weight(.black))
+                    Text(bleBridge.userConnectionDetail)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(MangaTheme.subtle)
                 }
                 Spacer()
-                StatusChip(text: setupReady ? "当前可用" : "未确认", filled: setupReady)
+                StatusChip(text: bleBridge.isBLEConnected ? "已连接" : "自动连接", filled: bleBridge.isBLEConnected)
             }
 
-            resolutionActions
-
-            VStack(spacing: 7) {
-                ConnectionStepRow(index: 1, title: "手机蓝牙", detail: bluetoothDetail, isReady: bleBridge.stateText == "可用")
-                ConnectionStepRow(index: 2, title: "雷达 BLE", detail: bleConnectionDetail, isReady: bleBridge.isBLEConnected)
-                ConnectionStepRow(index: 3, title: "绑定配置", detail: pairingDetail, isReady: bindingReady)
-                ConnectionStepRow(index: 4, title: "手机网关", detail: espNetworkDetail, isReady: espNetworkReady)
-                ConnectionStepRow(index: 5, title: "系统 PTT", detail: pushToTalkGateway.phaseText, isReady: pushToTalkGateway.activeChannelUUID != nil)
-                ConnectionStepRow(index: 6, title: "当前房间", detail: roomDetail, isReady: roomReady && radarRuntime.relayPhase == .ready)
-            }
+            connectionAction
         }
         .accessibilityIdentifier("devices.radar.connection.status")
-    }
-
-    private var setupReady: Bool {
-        locationBridge.snapshot != nil
-            && bindingReady
-            && espNetworkReady
-            && pushToTalkGateway.activeChannelUUID != nil
-            && roomReady
-            && radarRuntime.relayPhase == .ready
-    }
-
-    private var bindingReady: Bool {
-        !appState.devices.isEmpty && bleBridge.hasSavedRegistration
-    }
-
-    private var bleCharacteristicsReady: Bool {
-        RadarBLECharacteristic.requiredProvisioningRoles.allSatisfy { bleBridge.hasCharacteristic($0) }
-    }
-
-    private var espProtocolReady: Bool {
-        bleCharacteristicsReady && bleBridge.pairingChallengeText != "未读取"
-    }
-
-    private var roomReady: Bool {
-        !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var espNetworkReady: Bool {
-        bleBridge.isVoiceGatewayReady && radarRuntime.relayPhase == .ready
-    }
-
-    private var bluetoothDetail: String {
-        switch bleBridge.stateText {
-        case "可用": return "可用"
-        case "蓝牙关闭": return "手机蓝牙关闭"
-        case "未授权": return "App 蓝牙权限未开启"
-        default: return bleBridge.stateText
+        .onAppear {
+            bleBridge.resumeAutomaticConnection()
         }
-    }
-
-    private var bleConnectionDetail: String {
-        if bleBridge.isVoiceGatewayReady { return "\(bleBridge.connectedPeripheralName) · 语音通道已就绪" }
-        if bleBridge.isBLEConnected { return "\(bleBridge.connectedPeripheralName) 已连接，正在确认语音通道" }
-        if bleBridge.scanTimedOut { return "没有找到雷达" }
-        if bleBridge.isScanning { return bleBridge.candidates.isEmpty ? "正在查找雷达" : "发现雷达，进入连接" }
-        return "未连接，远程唤醒与语音不可用"
-    }
-
-    private var pairingDetail: String {
-        if bindingReady {
-            return bleBridge.hasLiveDeviceStatus ? "当前已确认" : "上次已保存"
-        }
-        if bleBridge.hasSavedRegistration {
-            return bleBridge.hasLiveDeviceStatus
-                ? "雷达保留旧配置 · 当前账户未绑定"
-                : "本机保留旧配置 · 当前账户未绑定"
-        }
-        if !appState.devices.isEmpty {
-            return "账户已有雷达 · 等待配置确认"
-        }
-        return bleBridge.isBLEConnected ? "未完成" : "等待连接雷达"
-    }
-
-    private var espNetworkDetail: String {
-        if espNetworkReady {
-            return "iPhone 联网 · BLE 语音网关已就绪"
-        }
-        if !bleBridge.isVoiceGatewayReady { return bleBridge.voiceGatewayText }
-        if radarRuntime.relayPhase != .ready { return "等待 iPhone 房间链路" }
-        if pushToTalkGateway.activeChannelUUID == nil { return pushToTalkGateway.phaseText }
-        return "等待 iPhone 房间链路"
-    }
-
-    private var roomDetail: String {
-        guard roomReady else { return "未进入房间" }
-        return radarRuntime.relayPhase == .ready ? "\(appState.activeRoomName) 已连接" : "\(appState.activeRoomName) 连接中"
-    }
-
-    private var currentTitle: String {
-        if bleBridge.stateText != "可用" { return "蓝牙不可用" }
-        if appState.devices.isEmpty, bleBridge.hasSavedRegistration {
-            return "雷达未绑定当前账户"
-        }
-        if setupReady { return "雷达正在工作" }
-        if bleBridge.scanTimedOut { return "没有找到雷达" }
-        if !bleBridge.isBLEConnected { return bleBridge.isScanning ? "正在查找雷达" : "未连接雷达" }
-        if !espProtocolReady { return "雷达连接未就绪" }
-        if !bindingReady { return "雷达未绑定" }
-        if !espNetworkReady { return bleBridge.hasLiveDeviceStatus ? "手机网关未就绪" : "雷达状态未确认" }
-        if !roomReady { return "未进入房间" }
-        if radarRuntime.relayPhase != .ready { return "房间连接中" }
-        return "雷达当前可用"
     }
 
     private var currentSymbol: String {
-        if setupReady { return "checkmark.seal.fill" }
+        if bleBridge.isBLEConnected { return "checkmark.circle.fill" }
         if bleBridge.stateText != "可用" { return "gearshape.fill" }
-        if !bindingReady { return "link" }
-        if !bleBridge.isBLEConnected || !espProtocolReady { return "dot.radiowaves.left.and.right" }
-        if !espNetworkReady { return "iphone.gen3.radiowaves.left.and.right" }
-        if !roomReady || radarRuntime.relayPhase != .ready { return "person.3.sequence.fill" }
-        return "scope"
+        return "dot.radiowaves.left.and.right"
     }
 
     @ViewBuilder
-    private var resolutionActions: some View {
-        HStack(spacing: 10) {
-            if bleBridge.stateText != "可用" {
-                Button {
-                    if let url = URL(string: UIApplication.openSettingsURLString) {
-                        UIApplication.shared.open(url)
-                    }
-                } label: {
-                    Label("打开设置", systemImage: "gearshape.fill")
+    private var connectionAction: some View {
+        if bleBridge.stateText != "可用" {
+            Button {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
                 }
-                .buttonStyle(InkButtonStyle())
-            } else if !bindingReady {
-                NavigationLink {
-                    BLEConfigDetailView()
-                } label: {
-                    Label("进入配置", systemImage: "dot.radiowaves.left.and.right")
-                }
-                .buttonStyle(InkButtonStyle())
-            } else if setupReady {
-                Button {
-                    appState.selectedTab = .radar
-                } label: {
-                    Label("打开雷达", systemImage: "scope")
-                }
-                .buttonStyle(InkButtonStyle())
-
-                NavigationLink {
-                    BLEConfigDetailView()
-                } label: {
-                    Label("配置连接", systemImage: "dot.radiowaves.left.and.right")
-                }
-                .buttonStyle(InkButtonStyle(filled: false))
-            } else if !bleBridge.isBLEConnected {
-                NavigationLink {
-                    BLEConfigDetailView()
-                } label: {
-                    Label("进入连接", systemImage: "dot.radiowaves.left.and.right")
-                }
-                .buttonStyle(InkButtonStyle())
-
-                Button {
-                    bleBridge.startScan()
-                } label: {
-                    Label(bleBridge.isScanning ? "重新扫描" : "扫描雷达", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(InkButtonStyle(filled: false))
-            } else if !espProtocolReady {
-                Button {
-                    bleBridge.refreshCharacteristics()
-                } label: {
-                    Label("重新检测", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(InkButtonStyle())
-
-                Button {
-                    bleBridge.disconnect()
-                } label: {
-                    Label("断开重连", systemImage: "xmark.circle")
-                }
-                .buttonStyle(InkButtonStyle(filled: false))
-            } else if !espNetworkReady {
-                NavigationLink {
-                    BLEConfigDetailView()
-                } label: {
-                    Label("检查手机网关", systemImage: "iphone.gen3.radiowaves.left.and.right")
-                }
-                .buttonStyle(InkButtonStyle())
-
-                Button {
-                    appState.selectedTab = .rooms
-                } label: {
-                    Label("检查房间", systemImage: "person.3.sequence.fill")
-                }
-                .buttonStyle(InkButtonStyle(filled: false))
-            } else if !roomReady || radarRuntime.relayPhase != .ready {
-                Button {
-                    appState.selectedTab = .rooms
-                } label: {
-                    Label("打开房间", systemImage: "person.3.sequence.fill")
-                }
-                .buttonStyle(InkButtonStyle())
-            } else {
-                Button {
-                    appState.selectedTab = .radar
-                } label: {
-                    Label("打开雷达", systemImage: "scope")
-                }
-                .buttonStyle(InkButtonStyle())
+            } label: {
+                Label("打开蓝牙设置", systemImage: "gearshape.fill")
             }
+            .buttonStyle(InkButtonStyle())
+        } else if !bleBridge.isBLEConnected, bleBridge.hasSavedGateway {
+            Button {
+                bleBridge.resumeAutomaticConnection()
+            } label: {
+                Label("重新连接", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(InkButtonStyle())
+        } else if !bleBridge.isBLEConnected {
+            NavigationLink {
+                BLEConfigDetailView()
+            } label: {
+                Label("首次连接雷达", systemImage: "dot.radiowaves.left.and.right")
+            }
+            .buttonStyle(InkButtonStyle())
         }
     }
 }
@@ -488,7 +318,7 @@ struct DeviceActionMenuPanel: View {
                 DeviceMenuRow(
                     symbol: "dot.radiowaves.left.and.right",
                     title: "连接雷达",
-                    detail: "扫描附近雷达，并建立配置连接。"
+                    detail: "首次扫描连接，之后由 App 自动连接。"
                 )
             }
             .buttonStyle(.plain)
@@ -499,7 +329,7 @@ struct DeviceActionMenuPanel: View {
                 DeviceMenuRow(
                     symbol: "stethoscope",
                     title: "状态检查",
-                    detail: "检查雷达、网络、定位和房间状态。"
+                    detail: "查看连接、授权、语音、网络和房间详情。"
                 )
             }
             .buttonStyle(.plain)
@@ -676,10 +506,8 @@ struct ESPWorkingStatusPanel: View {
             }
 
             InfoRow(label: "电量", value: batteryValue)
-            InfoRow(label: "BLE 语音", value: bleBridge.voiceGatewayText)
-            InfoRow(label: "系统 PTT", value: pushToTalkGateway.phaseText)
-            InfoRow(label: "定位桥接", value: locationBridge.snapshot == nil ? locationBridge.sharingText : locationBridge.coordinateText)
-            InfoRow(label: "最近状态", value: bleBridge.deviceStatus?.last ?? "等待雷达当前状态")
+            InfoRow(label: "语音", value: phoneGatewayReady ? "可用" : "正在准备")
+            InfoRow(label: "房间", value: roomReady ? appState.activeRoomName : "未进入房间")
         }
         .accessibilityIdentifier("devices.radar.work.status")
     }
@@ -736,9 +564,9 @@ struct ESPWorkingStatusPanel: View {
 
     private var networkValue: String {
         if phoneGatewayReady { return "在线" }
-        if !bleBridge.isVoiceGatewayReady { return "BLE 未就绪" }
+        if !bleBridge.isVoiceGatewayReady { return "连接中" }
         if radarRuntime.relayPhase != .ready { return "连接房间中" }
-        return "PTT 未加入"
+        return "正在准备"
     }
 
     private var overallTitle: String {
@@ -755,7 +583,7 @@ struct ESPWorkingStatusPanel: View {
             return "雷达还未完成绑定"
         }
         if !phoneGatewayReady {
-            return "等待 iPhone 语音网关"
+            return "正在准备语音连接"
         }
         if !locationReady {
             return "等待 iPhone 定位桥接"
@@ -765,7 +593,7 @@ struct ESPWorkingStatusPanel: View {
 
     private var overallDetail: String {
         if setupReady {
-            return "雷达通过 BLE 使用 iPhone 网络，房间语音和远程唤醒均已就绪。"
+            return "雷达已通过 iPhone 联网，房间语音和远程唤醒均可使用。"
         }
         return "日常工作不再要求雷达连接 Wi-Fi；Wi-Fi 配置仅在 OTA 更新时使用。"
     }
@@ -1031,60 +859,50 @@ struct BLEScanPanel: View {
 
     var body: some View {
         MangaPanel("连接雷达") {
-            InfoRow(label: "权限", value: bleBridge.authorizationText)
-            InfoRow(label: "蓝牙", value: bleBridge.stateText)
-            InfoRow(label: "雷达", value: bleBridge.connectedPeripheralName)
-            RuntimeRow(
-                title: "扫描状态",
-                phase: bleBridge.isScanning ? .connecting : (bleBridge.selectedPeripheralID == nil ? .idle : .ready),
-                detail: scanStatusText
-            )
+            HStack(spacing: 12) {
+                Image(systemName: bleBridge.isBLEConnected ? "checkmark.circle.fill" : "dot.radiowaves.left.and.right")
+                    .font(.title2.weight(.black))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(bleBridge.userConnectionText)
+                        .font(.title3.weight(.black))
+                    Text(bleBridge.userConnectionDetail)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(MangaTheme.subtle)
+                }
+                Spacer()
+            }
 
-            if bleBridge.candidates.isEmpty {
-                Text("未发现雷达。确认雷达已开机并靠近手机；重启后等待十秒再扫描。")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(MangaTheme.subtle)
-            } else {
+            if !bleBridge.isBLEConnected, !bleBridge.hasSavedGateway {
+                if bleBridge.candidates.isEmpty {
+                    Text("请打开雷达并放在手机附近。首次连接成功后，以后会自动连接。")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(MangaTheme.subtle)
+                }
                 ForEach(bleBridge.candidates) { candidate in
                     BLECandidateRow(candidate: candidate)
                 }
-            }
-
-            HStack(spacing: 10) {
                 Button {
                     bleBridge.startScan()
                 } label: {
                     Label(bleBridge.isScanning ? "重新扫描" : "开始扫描", systemImage: "antenna.radiowaves.left.and.right")
                 }
                 .buttonStyle(InkButtonStyle())
-
+            } else if !bleBridge.isBLEConnected, bleBridge.stateText == "可用" {
                 Button {
-                    if bleBridge.isScanning {
-                        bleBridge.stopScan()
-                    } else {
-                        bleBridge.disconnect()
-                    }
+                    bleBridge.resumeAutomaticConnection()
                 } label: {
-                    Label(bleBridge.isScanning ? "停止" : "断开", systemImage: "xmark.circle")
+                    Label("重新连接", systemImage: "arrow.clockwise")
                 }
-                .buttonStyle(InkButtonStyle(filled: false))
+                .buttonStyle(InkButtonStyle())
             }
         }
         .onAppear {
-            if !bleBridge.isBLEConnected, !bleBridge.isScanning {
+            if bleBridge.hasSavedGateway {
+                bleBridge.resumeAutomaticConnection()
+            } else if !bleBridge.isBLEConnected, !bleBridge.isScanning {
                 bleBridge.startScan()
             }
         }
-    }
-
-    private var scanStatusText: String {
-        if bleBridge.isBLEConnected {
-            return "雷达已连接"
-        }
-        if bleBridge.isScanning {
-            return bleBridge.candidates.isEmpty ? "正在查找附近的雷达" : "请选择你的雷达"
-        }
-        return "未连接"
     }
 }
 
@@ -1097,19 +915,18 @@ struct BLECandidateRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(candidate.name)
                     .font(.headline.weight(.black))
-                Text("\(candidate.rssiText) · \(candidate.lastSeenText)")
+                Text("附近的雷达")
                     .font(.caption)
                     .foregroundStyle(MangaTheme.subtle)
             }
             Spacer()
-            StatusChip(text: candidate.isConnectable ? "可连接" : "广播", filled: candidate.isConnectable)
             Button {
                 bleBridge.connect(candidate)
             } label: {
-                Image(systemName: "link")
-                    .font(.headline.weight(.black))
+                Text("连接")
             }
-            .buttonStyle(InkIconButtonStyle())
+            .buttonStyle(InkButtonStyle())
+            .disabled(!candidate.isConnectable)
         }
         .padding(10)
         .background(MangaTheme.panelLight.opacity(0.96), in: RoundedRectangle(cornerRadius: 14))
@@ -1309,67 +1126,102 @@ struct DiagnosticsPanel: View {
     @State private var uploadPhase: AppOperationPhase = .idle
 
     var body: some View {
-        MangaPanel("状态检查") {
-            ForEach(appState.diagnostics) { item in
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: item.passed ? "checkmark.seal.fill" : "xmark.octagon.fill")
-                        .foregroundStyle(MangaTheme.ink)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title)
-                            .font(.headline.weight(.black))
-                        Text(item.detail)
-                            .font(.caption)
-                            .foregroundStyle(MangaTheme.subtle)
+        VStack(alignment: .leading, spacing: 18) {
+            MangaPanel("连接详情") {
+                InfoRow(label: "用户状态", value: bleBridge.userConnectionText)
+                InfoRow(label: "手机蓝牙", value: "\(bleBridge.stateText) · \(bleBridge.authorizationText)")
+                InfoRow(label: "已保存设备", value: bleBridge.hasSavedGateway ? bleBridge.persistedDeviceName : "无")
+                InfoRow(label: "系统连接", value: bleBridge.isBLEConnected ? bleBridge.connectedPeripheralName : "未连接")
+                InfoRow(label: "配置服务", value: provisioningServiceDetail)
+                InfoRow(label: "所有者授权", value: bleBridge.ownerSessionAuthorized ? "已通过" : "未完成")
+                InfoRow(label: "语音服务", value: voiceServiceDetail)
+                InfoRow(label: "最近事件", value: bleBridge.lastEvent)
+
+                Button {
+                    if bleBridge.isBLEConnected {
+                        bleBridge.refreshCharacteristics()
+                    } else {
+                        bleBridge.resumeAutomaticConnection()
                     }
-                    Spacer()
+                } label: {
+                    Label("重新检查连接", systemImage: "arrow.clockwise")
                 }
-                .padding(.vertical, 4)
+                .buttonStyle(InkButtonStyle(filled: false))
             }
 
-            Button {
-                appState.runDiagnostics()
-                Task {
-                    guard appState.isSignedIn else { return }
-                    guard !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-                    await radarRuntime.connectRelay(
-                        roomCode: appState.inviteCode,
-                        deviceToken: appState.activeDeviceToken,
-                        appAccessToken: appState.accessToken
+            MangaPanel("状态检查") {
+                ForEach(appState.diagnostics) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: item.passed ? "checkmark.seal.fill" : "xmark.octagon.fill")
+                            .foregroundStyle(MangaTheme.ink)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.title)
+                                .font(.headline.weight(.black))
+                            Text(item.detail)
+                                .font(.caption)
+                                .foregroundStyle(MangaTheme.subtle)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Button {
+                    appState.runDiagnostics()
+                    Task {
+                        guard appState.isSignedIn else { return }
+                        guard !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                        await radarRuntime.connectRelay(
+                            roomCode: appState.inviteCode,
+                            deviceToken: appState.activeDeviceToken,
+                            appAccessToken: appState.accessToken
+                        )
+                    }
+                } label: {
+                    Label("重新检查", systemImage: "stethoscope")
+                }
+                .buttonStyle(InkButtonStyle())
+
+                Button {
+                    let json = DiagnosticPackageFactory.makeJSONString(
+                        appState: appState,
+                        radarRuntime: radarRuntime,
+                        locationBridge: locationBridge,
+                        bleBridge: bleBridge
                     )
+                    UIPasteboard.general.string = json
+                    diagnosticsActionText = "状态包已复制 · \(json.utf8.count) bytes"
+                } label: {
+                    Label("复制状态包", systemImage: "doc.on.doc")
                 }
-            } label: {
-                Label("重新检查", systemImage: "stethoscope")
+                .buttonStyle(InkButtonStyle(filled: false))
+
+                Button {
+                    Task { await uploadDiagnostics() }
+                } label: {
+                    Label(uploadPhase.isLoading ? "上传中" : "上传状态包", systemImage: "arrow.up.doc")
+                }
+                .buttonStyle(InkButtonStyle(filled: false))
+                .disabled(uploadPhase.isLoading)
+
+                OperationStatusView(phase: diagnosticsUploadPhase)
+
+                Text(diagnosticsActionText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(MangaTheme.subtle)
             }
-            .buttonStyle(InkButtonStyle())
-
-            Button {
-                let json = DiagnosticPackageFactory.makeJSONString(
-                    appState: appState,
-                    radarRuntime: radarRuntime,
-                    locationBridge: locationBridge,
-                    bleBridge: bleBridge
-                )
-                UIPasteboard.general.string = json
-                diagnosticsActionText = "状态包已复制 · \(json.utf8.count) bytes"
-            } label: {
-                Label("复制状态包", systemImage: "doc.on.doc")
-            }
-            .buttonStyle(InkButtonStyle(filled: false))
-
-            Button {
-                Task { await uploadDiagnostics() }
-            } label: {
-                Label(uploadPhase.isLoading ? "上传中" : "上传状态包", systemImage: "arrow.up.doc")
-            }
-            .buttonStyle(InkButtonStyle(filled: false))
-            .disabled(uploadPhase.isLoading)
-
-            OperationStatusView(phase: diagnosticsUploadPhase)
-
-            Text(diagnosticsActionText)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(MangaTheme.subtle)
         }
+    }
+
+    private var provisioningServiceDetail: String {
+        let found = RadarBLECharacteristic.requiredProvisioningRoles.filter { bleBridge.hasCharacteristic($0) }.count
+        return "已发现 \(found)/\(RadarBLECharacteristic.requiredProvisioningRoles.count) 项"
+    }
+
+    private var voiceServiceDetail: String {
+        let roles: [RadarBLECharacteristic] = [.voiceControl, .voiceAudioUplink, .voiceAudioDownlink]
+        let found = roles.filter { bleBridge.hasCharacteristic($0) }.count
+        return bleBridge.isVoiceGatewayReady ? "已就绪" : "已发现 \(found)/\(roles.count) 项"
     }
 
     @MainActor

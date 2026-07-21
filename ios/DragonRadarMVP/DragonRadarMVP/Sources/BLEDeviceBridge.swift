@@ -326,6 +326,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     @ObservationIgnored private var voiceUplinkHandler: ((Data) -> Void)?
 
     let radarServiceUUID = CBUUID(string: "7d540100-f82d-4b2f-91c6-4f0f88aa5a11")
+    let voiceServiceUUID = CBUUID(string: "7d540200-f82d-4b2f-91c6-4f0f88aa5a11")
 
     var candidates: [BLEDeviceCandidate] = []
     var isScanning = false
@@ -390,6 +391,55 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             return false
         }
         return peripheral.state == .connected
+    }
+
+    var hasSavedGateway: Bool {
+        defaults.string(forKey: Self.gatewayPeripheralKey) != nil
+    }
+
+    var userConnectionText: String {
+        switch centralState {
+        case .poweredOff:
+            return "请开启蓝牙"
+        case .unauthorized:
+            return "需要蓝牙权限"
+        case .unsupported:
+            return "此手机不支持蓝牙"
+        default:
+            break
+        }
+        if isBLEConnected { return "已连接" }
+        if isScanning || selectedPeripheralID != nil || (hasSavedGateway && !scanTimedOut) {
+            return "正在连接"
+        }
+        return "未连接"
+    }
+
+    var userConnectionDetail: String {
+        if isBLEConnected {
+            return "\(connectedPeripheralName) · 以后打开 App 会自动连接"
+        }
+        if centralState == .poweredOff {
+            return "开启手机蓝牙后，App 会自动连接已保存的雷达"
+        }
+        if centralState == .unauthorized {
+            return "允许蓝牙权限后，App 会自动连接已保存的雷达"
+        }
+        if isScanning {
+            return candidates.isEmpty ? "正在查找附近的雷达" : "请选择你的雷达"
+        }
+        if hasSavedGateway {
+            return scanTimedOut ? "暂时没有找到已保存的雷达" : "正在自动连接已保存的雷达"
+        }
+        return "首次使用请扫描并连接雷达"
+    }
+
+    private var radarServiceUUIDs: [CBUUID] {
+        [radarServiceUUID, voiceServiceUUID]
+    }
+
+    private func discoverRadarServices(on peripheral: CBPeripheral) {
+        peripheral.discoverServices(radarServiceUUIDs)
     }
 
     var supportsFirmwareOTA: Bool {
@@ -572,11 +622,11 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         availableCharacteristicNames.removeAll()
         lastEvent = "重新检测雷达连接"
         if let services = peripheral.services, !services.isEmpty {
-            for service in services where service.uuid == radarServiceUUID {
+            for service in services where radarServiceUUIDs.contains(service.uuid) {
                 peripheral.discoverCharacteristics(nil, for: service)
             }
         } else {
-            peripheral.discoverServices([radarServiceUUID])
+            discoverRadarServices(on: peripheral)
         }
     }
 
@@ -685,6 +735,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         }
 
         scanRequested = false
+        manualDisconnectRequested = false
+        if recoverSystemConnectedRadarIfNeeded() {
+            return
+        }
         resetStateForNewScan()
         scanStartedAt = Date()
         isScanning = true
@@ -694,6 +748,20 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
         startScanTimeout()
+    }
+
+    /// Daily-use entry point. Once a radar has been selected, reconnect it
+    /// from CoreBluetooth's saved peripheral record without showing scanning
+    /// or service-discovery steps to the user.
+    func resumeAutomaticConnection() {
+        manualDisconnectRequested = false
+        ensureCentralManager()
+        guard let central, central.state == .poweredOn else { return }
+        if recoverSystemConnectedRadarIfNeeded() { return }
+        if reconnectSavedGatewayIfNeeded() { return }
+        if !hasSavedGateway, !isScanning {
+            startScan()
+        }
     }
 
     private func resetStateForNewScan() {
@@ -864,7 +932,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             connectedPeripheralName = peripheral.name ?? connectedPeripheralName
             firmwareReconnectText = "OTA 雷达已连接"
             peripheral.delegate = self
-            peripheral.discoverServices([radarServiceUUID])
+            discoverRadarServices(on: peripheral)
             return
         }
 
@@ -955,7 +1023,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             selectedPeripheralID = targetID
             connectedPeripheralName = peripheral.name ?? connectedPeripheralName
             firmwareReconnectText = "OTA 雷达已连接"
-            peripheral.discoverServices([radarServiceUUID])
+            discoverRadarServices(on: peripheral)
             return
         }
         guard peripheral.state == .disconnected else {
@@ -1137,7 +1205,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             firmwareReconnectAwaitingCancellation = false
         } else {
             resumeFirmwareReconnectIfNeeded()
-            reconnectSavedGatewayIfNeeded()
+            if !recoverSystemConnectedRadarIfNeeded() {
+                _ = reconnectSavedGatewayIfNeeded()
+            }
         }
     }
 
@@ -1160,11 +1230,12 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         defaults.set(peripheral.identifier.uuidString, forKey: Self.gatewayPeripheralKey)
         lastEvent = "系统已恢复后台雷达连接"
         if peripheral.state == .connected {
-            peripheral.discoverServices([radarServiceUUID])
+            discoverRadarServices(on: peripheral)
         }
     }
 
-    private func reconnectSavedGatewayIfNeeded() {
+    @discardableResult
+    private func reconnectSavedGatewayIfNeeded() -> Bool {
         guard
             !manualDisconnectRequested,
             let central,
@@ -1172,7 +1243,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             let rawID = defaults.string(forKey: Self.gatewayPeripheralKey),
             let peripheralID = UUID(uuidString: rawID),
             let peripheral = central.retrievePeripherals(withIdentifiers: [peripheralID]).first
-        else { return }
+        else { return false }
         peripherals[peripheralID] = peripheral
         peripheral.delegate = self
         selectedPeripheralID = peripheralID
@@ -1184,8 +1255,52 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
                 options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true]
             )
         } else if peripheral.state == .connected {
-            peripheral.discoverServices([radarServiceUUID])
+            discoverRadarServices(on: peripheral)
         }
+        return true
+    }
+
+    /// Reconciles the app with a radar connection already owned by iOS. A BLE
+    /// accessory can appear connected in Settings while this app has not yet
+    /// received a CBPeripheral instance, especially after reinstall/relaunch.
+    @discardableResult
+    func recoverSystemConnectedRadarIfNeeded() -> Bool {
+        guard
+            !manualDisconnectRequested,
+            let central,
+            central.state == .poweredOn
+        else { return false }
+
+        let connected = central.retrieveConnectedPeripherals(withServices: [radarServiceUUID])
+        guard !connected.isEmpty else { return false }
+
+        let savedID = defaults.string(forKey: Self.gatewayPeripheralKey).flatMap(UUID.init(uuidString:))
+        let peripheral = connected.first(where: { $0.identifier == savedID })
+            ?? (connected.count == 1 ? connected[0] : nil)
+        guard let peripheral else {
+            lastEvent = "发现多台已连接雷达，请选择当前设备"
+            return false
+        }
+
+        scanRequested = false
+        stopScan()
+        peripherals[peripheral.identifier] = peripheral
+        peripheral.delegate = self
+        selectedPeripheralID = peripheral.identifier
+        connectedPeripheralName = peripheral.name ?? persistedDeviceName
+        defaults.set(peripheral.identifier.uuidString, forKey: Self.gatewayPeripheralKey)
+        scanTimedOut = false
+        lastEvent = "正在恢复雷达连接"
+
+        if peripheral.state == .connected {
+            discoverRadarServices(on: peripheral)
+        } else {
+            central.connect(
+                peripheral,
+                options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true]
+            )
+        }
+        return true
     }
 
     private func scheduleGatewayReconnect() {
@@ -1193,7 +1308,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         gatewayReconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled else { return }
-            self?.reconnectSavedGatewayIfNeeded()
+            guard let self else { return }
+            if !self.recoverSystemConnectedRadarIfNeeded() {
+                _ = self.reconnectSavedGatewayIfNeeded()
+            }
         }
     }
 
@@ -1284,7 +1402,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         } else {
             lastEvent = "已连接 \(connectedPeripheralName)，正在检测雷达"
         }
-        peripheral.discoverServices([radarServiceUUID])
+        discoverRadarServices(on: peripheral)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -1298,6 +1416,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             finishFirmwareReconnectAttemptAndRetry(peripheralID: peripheral.identifier)
         } else {
             clearSelectedConnection(peripheral.identifier)
+            if !manualDisconnectRequested {
+                scheduleGatewayReconnect()
+            }
         }
     }
 
@@ -1336,7 +1457,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         }
 
         lastEvent = "正在读取雷达状态"
-        for service in services {
+        for service in services where radarServiceUUIDs.contains(service.uuid) {
             peripheral.discoverCharacteristics(nil, for: service)
         }
     }
@@ -1347,9 +1468,11 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             return
         }
 
-        let characteristics = service.characteristics ?? []
-        discoveredCharacteristics = characteristics.map(\.uuid.uuidString).sorted()
-        for characteristic in characteristics {
+        let serviceCharacteristics = service.characteristics ?? []
+        discoveredCharacteristics = Array(
+            Set(discoveredCharacteristics + serviceCharacteristics.map(\.uuid.uuidString))
+        ).sorted()
+        for characteristic in serviceCharacteristics {
             guard let role = RadarBLECharacteristic.allCases.first(where: { $0.uuid == characteristic.uuid }) else {
                 continue
             }
@@ -1366,6 +1489,14 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         availableCharacteristicNames = RadarBLECharacteristic.allCases
             .filter { self.characteristics[$0] != nil }
             .map(\.title)
+
+        print(
+            "DragonRadar BLE discovery "
+                + "service=\(service.uuid.uuidString) "
+                + "roles=\(availableCharacteristicNames.count)/\(RadarBLECharacteristic.allCases.count) "
+                + "owner=\(ownerSessionAuthorized ? 1 : 0) "
+                + "voice=\(isVoiceGatewayReady ? 1 : 0)"
+        )
 
         lastEvent = discoveredCharacteristics.isEmpty
             ? "雷达连接未准备好"
@@ -1557,6 +1688,11 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         guard isVoiceGatewayReady else { return }
         if !voiceGatewayAnnounced {
             voiceGatewayAnnounced = sendVoiceControl(command: "gateway_ready")
+            print(
+                "DragonRadar BLE voice gateway "
+                    + "ready=\(voiceGatewayAnnounced ? 1 : 0) "
+                    + "device=\(connectedPeripheralName)"
+            )
         }
         if voiceGatewayAnnounced {
             voiceGatewayText = "BLE 语音网关已就绪"
