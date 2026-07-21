@@ -697,6 +697,12 @@ final class FirmwareUpdateCoordinator {
         defaults.removeObject(forKey: Self.persistenceKey)
     }
 
+    func handleDeviceReadinessFailure(_ message: String) {
+        availableRelease = nil
+        progress = 0
+        fail(message)
+    }
+
     func evaluate(release: VerifiedFirmwareManifest, deviceStatus: RadarBLEDeviceStatus?) {
         let installedText = deviceStatus?.firmwareVersion ?? firmwareStatus?.firmwareVersion
         guard let installedText, let installed = FirmwareSemanticVersion(installedText) else {

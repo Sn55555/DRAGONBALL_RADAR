@@ -337,6 +337,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     var pairingChallengeText = "未读取"
     var deviceStatusText = "未读取"
     var deviceStatus: RadarBLEDeviceStatus?
+    var bleSecurityRepairRequired = false
     var lastDeviceStatusAt: Date?
     var firmwareStatusText = "未读取"
     var firmwareStatus: RadarBLEFirmwareStatus?
@@ -649,6 +650,30 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             let characteristic = characteristics[.firmwareStatus]
         else { return }
         peripheral.readValue(for: characteristic)
+    }
+
+    func refreshOTAReadiness(maxAttempts: Int = 6) async {
+        guard isBLEConnected else { return }
+        let attempts = max(1, maxAttempts)
+        for attempt in 0..<attempts {
+            readDeviceStatus()
+            readFirmwareStatus()
+            if deviceStatus != nil, firmwareStatus != nil {
+                return
+            }
+            if bleSecurityRepairRequired {
+                return
+            }
+            if attempt + 1 < attempts {
+                try? await Task.sleep(for: .milliseconds(350))
+            }
+        }
+    }
+
+    var bleSecurityRepairText: String {
+        let name = connectedPeripheralName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = name.isEmpty || name == "未连接" ? "这台雷达" : name
+        return "系统蓝牙安全配对已失效。请在 iPhone 蓝牙设置中忽略 \(target)，再回到 App 重新连接并输入雷达屏幕上的 6 位码。"
     }
 
     var isRegistrationComplete: Bool {
@@ -1516,9 +1541,24 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error {
-            lastEvent = "读取雷达状态失败：\(error.localizedDescription)"
+            let nsError = error as NSError
+            if nsError.domain == CBATTErrorDomain, nsError.code == CBATTError.insufficientAuthentication.rawValue {
+                bleSecurityRepairRequired = true
+                lastEvent = bleSecurityRepairText
+            } else {
+                lastEvent = "读取雷达状态失败：\(error.localizedDescription)"
+            }
+            print(
+                "DragonRadar BLE read_failed "
+                    + "uuid=\(characteristic.uuid.uuidString) "
+                    + "domain=\(nsError.domain) "
+                    + "code=\(nsError.code) "
+                    + "detail=\(error.localizedDescription)"
+            )
             return
         }
+
+        bleSecurityRepairRequired = false
 
         guard let role = RadarBLECharacteristic.allCases.first(where: { $0.uuid == characteristic.uuid }) else {
             return
@@ -1541,10 +1581,17 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             authorizeOwnerSessionIfPossible()
         case .deviceStatus:
             deviceStatusText = textValue.isEmpty ? "空状态" : textValue
-            if let parsedStatus = try? JSONDecoder().decode(RadarBLEDeviceStatus.self, from: data) {
+            do {
+                let parsedStatus = try JSONDecoder().decode(RadarBLEDeviceStatus.self, from: data)
                 deviceStatus = parsedStatus
                 lastDeviceStatusAt = Date()
                 remember(status: parsedStatus)
+            } catch {
+                lastEvent = "雷达状态格式无法解析"
+                print(
+                    "DragonRadar BLE device_status decode_failed "
+                        + "bytes=\(data.count) error=\(error.localizedDescription)"
+                )
             }
         case .firmwareStatus:
             firmwareStatusText = textValue.isEmpty ? "空状态" : textValue

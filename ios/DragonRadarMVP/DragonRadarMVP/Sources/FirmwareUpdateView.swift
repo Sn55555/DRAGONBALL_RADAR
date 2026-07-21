@@ -21,8 +21,7 @@ struct FirmwareUpdateView: View {
         .background(MangaBackground())
         .navigationTitle("固件更新")
         .task {
-            synchronizeOTAOriginIfNeeded()
-            firmwareUpdate.refreshFromDevice(bleBridge: bleBridge)
+            await refreshOTAState()
         }
         .task(id: ownerSessionRecoveryID) {
             await recoverOwnerSessionIfNeeded()
@@ -53,7 +52,12 @@ struct FirmwareUpdateView: View {
                         .foregroundStyle(MangaTheme.subtle)
                 }
                 Spacer()
-                StatusChip(text: bleBridge.supportsFirmwareOTA ? "支持无线更新" : "需要初始化", filled: bleBridge.supportsFirmwareOTA)
+                StatusChip(
+                    text: bleBridge.bleSecurityRepairRequired
+                        ? "需要重新配对"
+                        : (bleBridge.supportsFirmwareOTA ? "支持无线更新" : "需要初始化"),
+                    filled: bleBridge.supportsFirmwareOTA && !bleBridge.bleSecurityRepairRequired
+                )
             }
 
             InfoRow(label: "构建号", value: currentBuildText)
@@ -118,6 +122,7 @@ struct FirmwareUpdateView: View {
     private var actionButtons: some View {
         Button {
             Task {
+                await refreshOTAState()
                 await firmwareUpdate.checkForUpdates(
                     accessToken: appState.accessToken,
                     deviceStatus: bleBridge.deviceStatus
@@ -128,7 +133,7 @@ struct FirmwareUpdateView: View {
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(InkButtonStyle(filled: firmwareUpdate.phase != .available))
-        .disabled(firmwareUpdate.phase.isBusy)
+        .disabled(firmwareUpdate.phase.isBusy || bleBridge.bleSecurityRepairRequired)
         .accessibilityIdentifier("devices.firmware.check")
 
         if firmwareUpdate.phase == .available {
@@ -170,8 +175,12 @@ struct FirmwareUpdateView: View {
         }
 
         Button {
-            firmwareUpdate.refreshFromDevice(bleBridge: bleBridge)
-            _ = bleBridge.writeFirmwareAction("status")
+            Task {
+                await refreshOTAState()
+                if bleBridge.ownerSessionAuthorized || bleBridge.deviceStatus?.ownerAuthRequired != 1 {
+                    _ = bleBridge.writeFirmwareAction("status")
+                }
+            }
         } label: {
             Label("重新读取雷达状态", systemImage: "wave.3.right")
                 .frame(maxWidth: .infinity)
@@ -183,6 +192,11 @@ struct FirmwareUpdateView: View {
     private var readinessPanel: some View {
         MangaPanel("更新条件") {
             FirmwareGateRow(title: "配置连接", detail: bleBridge.isBLEConnected ? "雷达已连接" : "请先连接附近雷达", passed: bleBridge.isBLEConnected)
+            FirmwareGateRow(
+                title: "蓝牙安全连接",
+                detail: bleSecurityGateDetail,
+                passed: !bleBridge.bleSecurityRepairRequired && bleBridge.deviceStatus?.bleSecure == 1
+            )
             FirmwareGateRow(title: "OTA 通道", detail: bleBridge.supportsFirmwareOTA ? "107 控制与 108 状态可用" : "旧固件需 USB 初始化", passed: bleBridge.supportsFirmwareOTA)
             FirmwareGateRow(title: "绑定与凭证", detail: provisioningGateDetail, passed: bleBridge.deviceStatus?.isOTAProvisioningReady == true)
             FirmwareGateRow(title: "所有者会话", detail: ownerSessionGateDetail, passed: ownerSessionGatePassed)
@@ -293,6 +307,7 @@ struct FirmwareUpdateView: View {
 
             appState.devicesStore.applyServerDevice(matchedDevice)
             ownerSessionRecoveryDetail = "当前连接已由设备凭证确认"
+            synchronizeOTAOriginIfNeeded()
             firmwareUpdate.refreshFromDevice(bleBridge: bleBridge)
         } catch {
             ownerSessionRecoveryDetail = "无法从服务器读取雷达凭证，请检查账号和网络"
@@ -359,6 +374,7 @@ struct FirmwareUpdateView: View {
 
     private var canStartUpdate: Bool {
         bleBridge.isBLEConnected
+            && !bleBridge.bleSecurityRepairRequired
             && bleBridge.supportsFirmwareOTA
             && bleBridge.deviceStatus?.isOTAProvisioningReady == true
             && ownerSessionGatePassed
@@ -422,7 +438,9 @@ struct FirmwareUpdateView: View {
     }
 
     private func synchronizeOTAOriginIfNeeded() {
-        guard bleBridge.deviceStatus?.isOTAOriginConfirmed != true else { return }
+        guard let status = bleBridge.deviceStatus else { return }
+        guard status.isOTAOriginConfirmed != true else { return }
+        guard status.ownerAuthRequired != 1 || bleBridge.ownerSessionAuthorized else { return }
         let roomCode = appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let deviceToken = appState.activeDeviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard
@@ -435,6 +453,28 @@ struct FirmwareUpdateView: View {
             roomToken: roomCode,
             deviceToken: deviceToken
         )
+    }
+
+    @MainActor
+    private func refreshOTAState() async {
+        await bleBridge.refreshOTAReadiness()
+        if bleBridge.bleSecurityRepairRequired {
+            firmwareUpdate.handleDeviceReadinessFailure(bleBridge.bleSecurityRepairText)
+            return
+        }
+        await recoverOwnerSessionIfNeeded()
+        synchronizeOTAOriginIfNeeded()
+        firmwareUpdate.refreshFromDevice(bleBridge: bleBridge)
+    }
+
+    private var bleSecurityGateDetail: String {
+        if bleBridge.bleSecurityRepairRequired {
+            return bleBridge.bleSecurityRepairText
+        }
+        if bleBridge.deviceStatus?.bleSecure == 1 {
+            return "系统加密配对已完成"
+        }
+        return "等待系统安全配对"
     }
 }
 
