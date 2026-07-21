@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 from urllib import error as urlerror
@@ -992,6 +993,19 @@ class RelayStore:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ptt_subscriptions (
+                    device_token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    room_code TEXT NOT NULL,
+                    channel_uuid TEXT NOT NULL,
+                    bundle_id TEXT NOT NULL,
+                    environment TEXT NOT NULL DEFAULT 'sandbox',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ptt_subscriptions_room_updated_idx
+                ON ptt_subscriptions (room_code, enabled, updated_at DESC);
                 CREATE TABLE IF NOT EXISTS radar_reminders (
                     event_id TEXT PRIMARY KEY,
                     request_id TEXT NOT NULL,
@@ -1541,6 +1555,80 @@ class RelayStore:
             "updated_at": row["updated_at"],
         }
 
+    def register_ptt_subscription(
+        self,
+        user_id: str,
+        device_token: str,
+        room_code: str,
+        channel_uuid: str,
+        bundle_id: str,
+        environment: str = "sandbox",
+    ) -> dict[str, Any]:
+        token = clean_push_device_token(device_token)
+        clean_room = normalize_room_code(room_code)
+        if self.get_room_member_for_user(clean_room, user_id) is None:
+            raise PermissionError("not_room_member")
+        try:
+            clean_channel = str(uuid.UUID(channel_uuid))
+        except (ValueError, AttributeError):
+            raise ValueError("invalid_channel_uuid") from None
+        clean_bundle = bundle_id.strip()[:160]
+        if not clean_bundle or any(ch not in string.ascii_letters + string.digits + ".-" for ch in clean_bundle):
+            raise ValueError("invalid_bundle_id")
+        clean_environment = environment.strip().lower() or "sandbox"
+        if clean_environment not in {"sandbox", "production"}:
+            raise ValueError("invalid_push_environment")
+        now = int(time.time())
+        with self.lock, self.db:
+            self.db.execute(
+                """
+                INSERT INTO ptt_subscriptions (
+                    device_token, user_id, room_code, channel_uuid, bundle_id,
+                    environment, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(device_token) DO UPDATE SET
+                  user_id = excluded.user_id,
+                  room_code = excluded.room_code,
+                  channel_uuid = excluded.channel_uuid,
+                  bundle_id = excluded.bundle_id,
+                  environment = excluded.environment,
+                  enabled = 1,
+                  updated_at = excluded.updated_at
+                """,
+                (token, user_id, clean_room, clean_channel, clean_bundle,
+                 clean_environment, now, now),
+            )
+        return {
+            "room": clean_room,
+            "channel_uuid": clean_channel,
+            "bundle_id": clean_bundle,
+            "environment": clean_environment,
+            "updated_at": now,
+        }
+
+    def list_ptt_subscriptions(self, room_code: str, exclude_user_id: str = "") -> list[dict[str, Any]]:
+        clean_room = normalize_room_code(room_code)
+        with self.lock:
+            rows = self.db.execute(
+                """
+                SELECT device_token, user_id, room_code, channel_uuid, bundle_id,
+                       environment, created_at, updated_at
+                FROM ptt_subscriptions
+                WHERE room_code = ? AND enabled = 1 AND user_id != ?
+                ORDER BY updated_at DESC
+                """,
+                (clean_room, exclude_user_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def disable_invalid_ptt_subscription(self, device_token: str) -> None:
+        token = clean_push_device_token(device_token)
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE ptt_subscriptions SET enabled = 0, updated_at = ? WHERE device_token = ?",
+                (int(time.time()), token),
+            )
+
     def audit_event_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         try:
             detail = json.loads(row["detail_json"] or "{}")
@@ -1698,6 +1786,7 @@ class RelayStore:
 
             deleted_room_data = 0
             for room_code in owned_room_codes:
+                self.db.execute("DELETE FROM ptt_subscriptions WHERE room_code = ?", (room_code,))
                 self.db.execute("DELETE FROM radar_reminders WHERE room_code = ?", (room_code,))
                 self.db.execute("DELETE FROM room_invites WHERE room_code = ?", (room_code,))
                 self.db.execute("DELETE FROM room_members WHERE room_code = ?", (room_code,))
@@ -1716,6 +1805,10 @@ class RelayStore:
             ).rowcount
             push_subscriptions = self.db.execute(
                 "DELETE FROM push_subscriptions WHERE user_id = ?",
+                (clean_user_id,),
+            ).rowcount
+            ptt_subscriptions = self.db.execute(
+                "DELETE FROM ptt_subscriptions WHERE user_id = ?",
                 (clean_user_id,),
             ).rowcount
             diagnostics = self.db.execute(
@@ -1764,6 +1857,7 @@ class RelayStore:
             "other_room_memberships": memberships,
             "devices": devices,
             "push_subscriptions": push_subscriptions,
+            "ptt_subscriptions": ptt_subscriptions,
             "diagnostics": diagnostics,
             "content_reports": content_reports,
             "user_blocks": user_blocks,
@@ -2656,12 +2750,22 @@ class Room:
     speaker_group_id: str = ""
     speaker_peer_id: str = ""
     speaker_until: float = 0.0
+    voice_request_id: str = ""
+    voice_speaker_name: str = ""
+    voice_buffer: list[dict[str, Any]] = field(default_factory=list)
+    voice_live_recipient_ids: set[str] = field(default_factory=set)
+    voice_ready_recipient_ids: set[str] = field(default_factory=set)
 
     def expire_voice_floor(self) -> None:
         if self.speaker_group_id and time.time() >= self.speaker_until:
             self.speaker_group_id = ""
             self.speaker_peer_id = ""
             self.speaker_until = 0.0
+            self.voice_request_id = ""
+            self.voice_speaker_name = ""
+            self.voice_buffer.clear()
+            self.voice_live_recipient_ids.clear()
+            self.voice_ready_recipient_ids.clear()
 
     def voice_floor(self) -> dict[str, Any]:
         self.expire_voice_floor()
@@ -3067,12 +3171,16 @@ class APNsConfig:
         )
 
     def live_ready(self) -> bool:
-        return bool(self.team_id and self.key_id and self.key_path and self.topic and os.path.exists(self.key_path))
+        return bool(self.credentials_ready() and self.topic)
+
+    def credentials_ready(self) -> bool:
+        return bool(self.team_id and self.key_id and self.key_path and os.path.exists(self.key_path))
 
     def health_payload(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
             "live_ready": self.live_ready(),
+            "ptt_live_ready": self.credentials_ready(),
             "topic_configured": bool(self.topic),
             "team_configured": bool(self.team_id),
             "key_id_configured": bool(self.key_id),
@@ -3194,6 +3302,106 @@ class PushNotificationService:
             "reason": reason,
             "disable_subscription": permanently_invalid,
         }
+
+    def send_push_to_talk_room(
+        self,
+        relay_store: RelayStore,
+        room_code: str,
+        sender_user_id: str,
+        request_id: str,
+        speaker_name: str,
+    ) -> dict[str, Any]:
+        if self.config.mode == "disabled":
+            return {"status": "skipped", "reason": "notifications_disabled", "attempt_count": 0}
+        subscriptions = relay_store.list_ptt_subscriptions(room_code, exclude_user_id=sender_user_id)
+        attempts: list[dict[str, Any]] = []
+        for subscription in subscriptions:
+            token = str(subscription.get("device_token") or "")
+            environment = str(subscription.get("environment") or "sandbox")
+            bundle_id = str(subscription.get("bundle_id") or "")
+            base = {"device_token_suffix": token[-8:], "environment": environment}
+            if self.config.mode == "dry_run":
+                attempts.append({**base, "status": "dry_run"})
+                continue
+            if not self.config.credentials_ready():
+                attempts.append({**base, "status": "failed", "reason": "apns_not_configured"})
+                continue
+            try:
+                status_code, response_body = self.post_ptt_apns(
+                    token,
+                    environment,
+                    bundle_id,
+                    {
+                        "request_id": request_id,
+                        "room_code": normalize_room_code(room_code),
+                        "speaker_name": speaker_name[:80] or "房间成员",
+                    },
+                )
+            except Exception as exc:
+                attempts.append({**base, "status": "failed", "reason": str(exc)[:160]})
+                continue
+            if 200 <= status_code < 300:
+                attempts.append({**base, "status": "sent", "apns_status": status_code})
+                continue
+            try:
+                reason_code = str(json.loads(response_body).get("reason") or "")
+            except (json.JSONDecodeError, AttributeError):
+                reason_code = ""
+            if status_code == 410 or reason_code in {"BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"}:
+                relay_store.disable_invalid_ptt_subscription(token)
+            attempts.append({
+                **base,
+                "status": "failed",
+                "apns_status": status_code,
+                "reason": (response_body or reason_code)[:240],
+            })
+        status = "skipped" if not attempts else (
+            "dry_run" if all(item["status"] == "dry_run" for item in attempts) else
+            "sent" if all(item["status"] == "sent" for item in attempts) else
+            "partial" if any(item["status"] == "sent" for item in attempts) else "failed"
+        )
+        result = {"status": status, "attempt_count": len(attempts), "attempts": attempts}
+        relay_store.audit_event(
+            "ptt_push_delivery",
+            room_code=room_code,
+            actor_id=sender_user_id,
+            actor_role="user",
+            group_id=sender_user_id,
+            detail={"request_id": request_id, "status": status, "attempt_count": len(attempts)},
+        )
+        return result
+
+    def post_ptt_apns(
+        self,
+        device_token: str,
+        environment: str,
+        bundle_id: str,
+        payload: dict[str, Any],
+    ) -> tuple[int, str]:
+        host = "api.push.apple.com" if environment == "production" else "api.sandbox.push.apple.com"
+        body = {"aps": {"timestamp": int(time.time())}, **payload}
+        command = [
+            "curl", "--silent", "--show-error", "--http2", "--request", "POST",
+            "--max-time", "8",
+            "--header", f"authorization: bearer {self.apns_jwt()}",
+            "--header", f"apns-topic: {bundle_id}.voip-ptt",
+            "--header", "apns-push-type: pushtotalk",
+            "--header", "apns-priority: 10",
+            "--header", "apns-expiration: 0",
+            "--header", "content-type: application/json",
+            "--data-binary", json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            "--write-out", "\n%{http_code}",
+            f"https://{host}/3/device/{device_token}",
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+        output = (completed.stdout or "").rstrip("\n")
+        if completed.returncode != 0:
+            raise RuntimeError((completed.stderr or "apns_curl_failed").strip())
+        body_text, _, status_text = output.rpartition("\n")
+        try:
+            return int(status_text), body_text
+        except ValueError:
+            return 0, body_text
 
     def post_apns(
         self,
@@ -3757,6 +3965,35 @@ class RelayHTTPHandler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.CREATED, {"subscription": subscription})
                 return
 
+            if path == "/v1/push-to-talk/token" and method == "POST":
+                self.require_store()
+                assert store is not None
+                subscription = store.register_ptt_subscription(
+                    user_id=user_id,
+                    device_token=str(payload.get("token") or payload.get("device_token") or ""),
+                    room_code=str(payload.get("room") or payload.get("room_code") or ""),
+                    channel_uuid=str(payload.get("channel_uuid") or ""),
+                    bundle_id=str(payload.get("bundle_id") or ""),
+                    environment=str(payload.get("environment") or "sandbox"),
+                )
+                store.audit_event(
+                    "ptt_token_register",
+                    room_code=str(subscription.get("room") or ""),
+                    actor_id=user_id,
+                    actor_role="user",
+                    group_id=user_id,
+                    detail={
+                        "channel_uuid": subscription.get("channel_uuid"),
+                        "environment": subscription.get("environment"),
+                    },
+                )
+                self.send_json(
+                    HTTPStatus.CREATED,
+                    {"subscription": subscription},
+                    headers={"Cache-Control": "no-store"},
+                )
+                return
+
             if path == "/v1/push/register" and method == "DELETE":
                 self.require_store()
                 assert store is not None
@@ -4250,11 +4487,12 @@ async def send_json(peer: Peer, payload: dict[str, Any]) -> None:
     await peer.socket.send(json_message(payload))
 
 
-async def safe_send_json(peer: Peer, payload: dict[str, Any]) -> None:
+async def safe_send_json(peer: Peer, payload: dict[str, Any]) -> bool:
     try:
         await send_json(peer, payload)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def role_for_path(path: str) -> str:
@@ -4830,6 +5068,162 @@ async def handle_voice_message(peer: Peer, room: Room, message: dict[str, Any]) 
     await broadcast_room_state(room)
 
 
+def clear_gateway_voice_floor(room: Room) -> None:
+    room.speaker_group_id = ""
+    room.speaker_peer_id = ""
+    room.speaker_until = 0.0
+    room.voice_request_id = ""
+    room.voice_speaker_name = ""
+    room.voice_buffer.clear()
+    room.voice_live_recipient_ids.clear()
+    room.voice_ready_recipient_ids.clear()
+
+
+async def send_gateway_voice_to_apps(
+    room: Room,
+    payload: dict[str, Any],
+    exclude_group_id: str = "",
+) -> set[str]:
+    delivered: set[str] = set()
+    for target in list(room.peers.values()):
+        if target.role != "app" or (exclude_group_id and target.group_id == exclude_group_id):
+            continue
+        if await safe_send_json(target, payload):
+            delivered.add(target.member_id)
+    return delivered
+
+
+async def handle_gateway_voice_message(peer: Peer, room: Room, message: dict[str, Any]) -> None:
+    if peer.role != "app":
+        await send_json(peer, {"type": "error", "code": "voice_gateway_requires_app"})
+        return
+    message_type = str(message.get("type") or "")
+    request_id = str(message.get("request_id") or "")[:96]
+    now = time.time()
+    room.expire_voice_floor()
+
+    if message_type == "gateway_voice_request":
+        if not request_id:
+            await send_json(peer, {"type": "error", "code": "voice_request_id_required"})
+            return
+        if room.speaker_group_id and room.speaker_group_id != peer.group_id:
+            await send_json(peer, {
+                "type": "voice_busy",
+                "room": room.code,
+                "request_id": request_id,
+                "speaker_group_id": room.speaker_group_id,
+                "speaker_peer_id": room.speaker_peer_id,
+                "server_time": int(now),
+            })
+            return
+        speaker_name = str(peer.last_payload.get("name") or "房间成员")[:80]
+        room.speaker_group_id = peer.group_id
+        room.speaker_peer_id = peer.peer_id
+        room.speaker_until = now + VOICE_FLOOR_TTL_SECONDS
+        room.voice_request_id = request_id
+        room.voice_speaker_name = speaker_name
+        room.voice_buffer.clear()
+        room.voice_ready_recipient_ids.clear()
+        wake = {
+            "type": "gateway_voice_wake",
+            "room": room.code,
+            "request_id": request_id,
+            "speaker_name": speaker_name,
+            "speaker_peer_id": peer.peer_id,
+            "server_time": int(now),
+        }
+        room.voice_live_recipient_ids = await send_gateway_voice_to_apps(
+            room, wake, exclude_group_id=peer.group_id
+        )
+        await send_json(peer, {
+            "type": "gateway_voice_granted",
+            "room": room.code,
+            "request_id": request_id,
+            "online_receivers": len(room.voice_live_recipient_ids),
+            "server_time": int(now),
+        })
+        if store is not None:
+            asyncio.create_task(asyncio.to_thread(
+                push_notifications.send_push_to_talk_room,
+                store,
+                room.code,
+                peer.user_id,
+                request_id,
+                speaker_name,
+            ))
+            store.audit_event(
+                "gateway_voice_request",
+                room_code=room.code,
+                actor_id=peer.user_id,
+                actor_role="app",
+                group_id=peer.group_id,
+                detail={"request_id": request_id, "online_receivers": len(room.voice_live_recipient_ids)},
+            )
+        await broadcast_room_state(room)
+        return
+
+    if message_type == "gateway_voice_ready":
+        if not request_id or request_id != room.voice_request_id:
+            await send_json(peer, {"type": "error", "code": "voice_request_not_active"})
+            return
+        already_live = peer.member_id in room.voice_live_recipient_ids
+        room.voice_ready_recipient_ids.add(peer.member_id)
+        if not already_live:
+            for buffered in room.voice_buffer:
+                await safe_send_json(peer, buffered)
+        await send_json(peer, {
+            "type": "gateway_voice_ready_ack",
+            "request_id": request_id,
+            "buffered_frames": 0 if already_live else len(room.voice_buffer),
+            "server_time": int(now),
+        })
+        return
+
+    if message_type == "gateway_voice_frame":
+        if room.speaker_group_id != peer.group_id or request_id != room.voice_request_id:
+            await send_json(peer, {"type": "error", "code": "voice_floor_not_granted"})
+            return
+        encoded = str(message.get("audio_b64") or "")
+        try:
+            frame = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            await send_json(peer, {"type": "error", "code": "invalid_voice_frame"})
+            return
+        if not (13 <= len(frame) <= 180) or frame[:3] != b"DR\x01":
+            await send_json(peer, {"type": "error", "code": "invalid_voice_frame"})
+            return
+        room.speaker_until = now + VOICE_FLOOR_TTL_SECONDS
+        event = {
+            "type": "gateway_voice_frame",
+            "room": room.code,
+            "request_id": request_id,
+            "from": peer.peer_id,
+            "sequence": message.get("sequence"),
+            "codec": "ima_adpcm",
+            "audio_b64": encoded,
+            "server_time": int(now),
+        }
+        room.voice_buffer.append(event)
+        if len(room.voice_buffer) > 150:
+            del room.voice_buffer[:-150]
+        await send_gateway_voice_to_apps(room, event, exclude_group_id=peer.group_id)
+        return
+
+    if message_type == "gateway_voice_release":
+        if room.speaker_group_id == peer.group_id:
+            ended_request = room.voice_request_id
+            end_event = {
+                "type": "gateway_voice_end",
+                "room": room.code,
+                "request_id": ended_request,
+                "server_time": int(now),
+            }
+            await send_gateway_voice_to_apps(room, end_event, exclude_group_id=peer.group_id)
+            clear_gateway_voice_floor(room)
+            await broadcast_room_state(room)
+        return
+
+
 async def handle_message(peer: Peer, room: Room, raw: str | bytes) -> None:
     if isinstance(raw, bytes):
         await send_json(peer, {"type": "error", "code": "binary_not_supported"})
@@ -4942,6 +5336,15 @@ async def handle_message(peer: Peer, room: Room, raw: str | bytes) -> None:
 
     if message_type in {"voice_frame", "audio_frame", "voice_state", "mute_update"}:
         await handle_voice_message(peer, room, message)
+        return
+
+    if message_type in {
+        "gateway_voice_request",
+        "gateway_voice_ready",
+        "gateway_voice_frame",
+        "gateway_voice_release",
+    }:
+        await handle_gateway_voice_message(peer, room, message)
         return
 
     if message_type in {
@@ -5083,6 +5486,18 @@ async def handler(socket: WebSocketServerProtocol, path: str) -> None:
         },
     )
     await broadcast_room_state(room)
+    if peer.role == "app" and room.voice_request_id and peer.group_id != room.speaker_group_id:
+        await send_json(
+            peer,
+            {
+                "type": "gateway_voice_wake",
+                "room": room.code,
+                "request_id": room.voice_request_id,
+                "speaker_name": room.voice_speaker_name or "房间成员",
+                "speaker_peer_id": room.speaker_peer_id,
+                "server_time": int(time.time()),
+            },
+        )
     pending_key = (peer.room, peer.group_id, peer.user_id)
     if peer.role == "device" and pending_key in pending_room_switches:
         pending_event = pending_room_switches.pop(pending_key)
@@ -5137,9 +5552,18 @@ async def handler(socket: WebSocketServerProtocol, path: str) -> None:
         pass
     finally:
         if room.speaker_group_id == peer.group_id:
-            room.speaker_group_id = ""
-            room.speaker_peer_id = ""
-            room.speaker_until = 0.0
+            if room.voice_request_id:
+                await send_gateway_voice_to_apps(
+                    room,
+                    {
+                        "type": "gateway_voice_end",
+                        "room": room.code,
+                        "request_id": room.voice_request_id,
+                        "server_time": int(time.time()),
+                    },
+                    exclude_group_id=peer.group_id,
+                )
+            clear_gateway_voice_floor(room)
         current = room.peers.get(peer.member_id)
         if current is peer:
             del room.peers[peer.member_id]

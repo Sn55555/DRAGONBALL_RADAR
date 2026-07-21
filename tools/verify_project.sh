@@ -52,6 +52,7 @@ python3 -m py_compile \
   tools/package_ota_release.py \
   tools/verify_ota_release.py \
   tools/verify_ota_contract.py \
+  tools/test_gateway_voice.py \
   tools/smoke_esp_provisioning_ble.py \
   tools/smoke_relay.py \
   tools/smoke_relay_limits.py \
@@ -59,6 +60,16 @@ python3 -m py_compile \
   tools/list_radar_ports.py \
   tools/wait_for_radar_port.py \
   tools/diagnose_usb_serial.py
+
+log_step "Checking BLE ADPCM codec and phone-gateway Relay state machine"
+(
+  VOICE_TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dragon-radar-voice-test.XXXXXX")"
+  trap 'rm -rf "$VOICE_TEST_ROOT"' EXIT
+  "${CXX:-c++}" -std=c++17 -Wall -Wextra -pedantic \
+    tools/test_voice_adpcm.cpp -o "$VOICE_TEST_ROOT/test_voice_adpcm"
+  "$VOICE_TEST_ROOT/test_voice_adpcm"
+)
+python3 tools/test_gateway_voice.py
 
 log_step "Checking retired character and virtual-pet content"
 for forbidden_path in \

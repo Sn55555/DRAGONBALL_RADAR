@@ -13,6 +13,9 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
     case serverConfig = "server_config"
     case firmwareControl = "firmware_control"
     case firmwareStatus = "firmware_status"
+    case voiceControl = "voice_control"
+    case voiceAudioUplink = "voice_audio_uplink"
+    case voiceAudioDownlink = "voice_audio_downlink"
 
     var id: String { rawValue }
 
@@ -34,6 +37,12 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
             CBUUID(string: "7d540107-f82d-4b2f-91c6-4f0f88aa5a11")
         case .firmwareStatus:
             CBUUID(string: "7d540108-f82d-4b2f-91c6-4f0f88aa5a11")
+        case .voiceControl:
+            CBUUID(string: "7d540109-f82d-4b2f-91c6-4f0f88aa5a11")
+        case .voiceAudioUplink:
+            CBUUID(string: "7d54010a-f82d-4b2f-91c6-4f0f88aa5a11")
+        case .voiceAudioDownlink:
+            CBUUID(string: "7d54010b-f82d-4b2f-91c6-4f0f88aa5a11")
         }
     }
 
@@ -309,6 +318,12 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     @ObservationIgnored private var ownerAuthAttemptChallenge: String?
     @ObservationIgnored private var scanRequested = false
     @ObservationIgnored private var authorizedAccessoryConnection: (identifier: UUID, name: String)?
+    @ObservationIgnored private var manualDisconnectRequested = false
+    @ObservationIgnored private var gatewayReconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var voiceDownlinkQueue: [Data] = []
+    @ObservationIgnored private var voiceGatewayAnnounced = false
+    @ObservationIgnored private var voiceControlHandler: ((Data) -> Void)?
+    @ObservationIgnored private var voiceUplinkHandler: ((Data) -> Void)?
 
     let radarServiceUUID = CBUUID(string: "7d540100-f82d-4b2f-91c6-4f0f88aa5a11")
 
@@ -339,6 +354,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     var persistedPaired = false
     var persistedServerConfigured = false
     var persistedDeviceName = "未注册"
+    var voiceGatewayText = "等待雷达语音通道"
+    var voiceUplinkFrames = 0
+    var voiceDownlinkFrames = 0
+    var voiceDroppedFrames = 0
     var scanTimedOut = false
     private var scanStartedAt: Date?
 
@@ -347,6 +366,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         persistedPaired = defaults.bool(forKey: Self.persistedPairedKey)
         persistedServerConfigured = defaults.bool(forKey: Self.persistedServerConfiguredKey)
         persistedDeviceName = defaults.string(forKey: Self.persistedDeviceNameKey) ?? "未注册"
+        ensureCentralManager()
     }
 
     private static let persistedPairedKey = "dragonRadar.esp.paired"
@@ -355,6 +375,8 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     private static let firmwareReconnectTargetKey = "dragonRadar.ota.reconnect.peripheralID"
     private static let firmwareReconnectWindowKey = "dragonRadar.ota.reconnect.windowStartedAt"
     private static let firmwareReconnectAttemptsKey = "dragonRadar.ota.reconnect.attemptsStarted"
+    private static let gatewayPeripheralKey = "dragonRadar.gateway.peripheralID"
+    private static let centralRestorationID = "com.dragonradar.mvp.ble-gateway"
 
     private static func append(_ value: String, to history: [String]) -> [String] {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -374,6 +396,23 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         guard hasCharacteristic(.firmwareControl), hasCharacteristic(.firmwareStatus) else { return false }
         if deviceStatus?.otaCapable == 0 { return false }
         return true
+    }
+
+    var isVoiceGatewayReady: Bool {
+        isBLEConnected
+            && ownerSessionAuthorized
+            && hasCharacteristic(.voiceControl)
+            && hasCharacteristic(.voiceAudioUplink)
+            && hasCharacteristic(.voiceAudioDownlink)
+    }
+
+    func configureVoiceGateway(
+        onControl: @escaping (Data) -> Void,
+        onUplinkFrame: @escaping (Data) -> Void
+    ) {
+        voiceControlHandler = onControl
+        voiceUplinkHandler = onUplinkFrame
+        activateVoiceGatewayIfReady()
     }
 
     var reportedFirmwareVersion: String? {
@@ -1019,7 +1058,8 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         selectedPeripheralID = candidate.peripheralID
         connectedPeripheralName = candidate.name
         lastEvent = "正在连接 \(candidate.name)"
-        central?.connect(peripheral)
+        manualDisconnectRequested = false
+        central?.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
     }
 
     func connectAuthorizedAccessory(identifier: UUID, name: String) {
@@ -1054,10 +1094,13 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         selectedPeripheralID = target.identifier
         connectedPeripheralName = target.name.isEmpty ? "Capsule Radar" : target.name
         lastEvent = "正在连接 \(connectedPeripheralName)"
-        central.connect(peripheral)
+        manualDisconnectRequested = false
+        central.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
     }
 
     func disconnect() {
+        manualDisconnectRequested = true
+        gatewayReconnectTask?.cancel()
         suspendFirmwareReconnectForManualDisconnect()
         guard
             let selectedPeripheralID,
@@ -1094,12 +1137,64 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             firmwareReconnectAwaitingCancellation = false
         } else {
             resumeFirmwareReconnectIfNeeded()
+            reconnectSavedGatewayIfNeeded()
         }
     }
 
     private func ensureCentralManager() {
         guard central == nil else { return }
-        central = CBCentralManager(delegate: self, queue: .main)
+        central = CBCentralManager(
+            delegate: self,
+            queue: .main,
+            options: [CBCentralManagerOptionRestoreIdentifierKey: Self.centralRestorationID]
+        )
+    }
+
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        let restored = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        guard let peripheral = restored.first else { return }
+        peripherals[peripheral.identifier] = peripheral
+        peripheral.delegate = self
+        selectedPeripheralID = peripheral.identifier
+        connectedPeripheralName = peripheral.name ?? persistedDeviceName
+        defaults.set(peripheral.identifier.uuidString, forKey: Self.gatewayPeripheralKey)
+        lastEvent = "系统已恢复后台雷达连接"
+        if peripheral.state == .connected {
+            peripheral.discoverServices([radarServiceUUID])
+        }
+    }
+
+    private func reconnectSavedGatewayIfNeeded() {
+        guard
+            !manualDisconnectRequested,
+            let central,
+            central.state == .poweredOn,
+            let rawID = defaults.string(forKey: Self.gatewayPeripheralKey),
+            let peripheralID = UUID(uuidString: rawID),
+            let peripheral = central.retrievePeripherals(withIdentifiers: [peripheralID]).first
+        else { return }
+        peripherals[peripheralID] = peripheral
+        peripheral.delegate = self
+        selectedPeripheralID = peripheralID
+        connectedPeripheralName = peripheral.name ?? persistedDeviceName
+        if peripheral.state == .disconnected {
+            lastEvent = "正在恢复语音网关蓝牙连接"
+            central.connect(
+                peripheral,
+                options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true]
+            )
+        } else if peripheral.state == .connected {
+            peripheral.discoverServices([radarServiceUUID])
+        }
+    }
+
+    private func scheduleGatewayReconnect() {
+        gatewayReconnectTask?.cancel()
+        gatewayReconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            self?.reconnectSavedGatewayIfNeeded()
+        }
     }
 
     func centralManager(
@@ -1122,7 +1217,8 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             selectedPeripheralID = target.identifier
             connectedPeripheralName = target.name.isEmpty ? name : target.name
             lastEvent = "正在连接 \(connectedPeripheralName)"
-            central.connect(peripheral)
+            manualDisconnectRequested = false
+            central.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
             return
         }
         let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
@@ -1159,6 +1255,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        manualDisconnectRequested = false
+        gatewayReconnectTask?.cancel()
+        defaults.set(peripheral.identifier.uuidString, forKey: Self.gatewayPeripheralKey)
         selectedPeripheralID = peripheral.identifier
         ownerSessionAuthorized = false
         ownerAuthAttemptChallenge = nil
@@ -1203,6 +1302,8 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        voiceGatewayAnnounced = false
+        voiceGatewayText = "雷达蓝牙已断开，等待后台重连"
         clearSelectedConnection(peripheral.identifier)
         lastEvent = error.map { "已断开：\($0.localizedDescription)" } ?? "已断开 \(peripheral.name ?? "雷达")"
         if
@@ -1218,6 +1319,8 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             firmwareReconnectCancellationTask = nil
             beginFirmwareReconnectWindowIfNeeded()
             scheduleNextFirmwareReconnectAttempt()
+        } else if !manualDisconnectRequested {
+            scheduleGatewayReconnect()
         }
     }
 
@@ -1267,6 +1370,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         lastEvent = discoveredCharacteristics.isEmpty
             ? "雷达连接未准备好"
             : "雷达连接已准备"
+        activateVoiceGatewayIfReady()
 
         if
             firmwareReconnectTrackingRequired,
@@ -1317,6 +1421,12 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
                 firmwareStatus = parsedStatus
                 lastFirmwareStatusAt = Date()
             }
+        case .voiceControl:
+            voiceControlHandler?(data)
+            voiceGatewayText = "雷达语音控制已更新"
+        case .voiceAudioUplink:
+            voiceUplinkFrames += 1
+            voiceUplinkHandler?(data)
         default:
             break
         }
@@ -1414,6 +1524,68 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             return false
         }
         return writeData(snapshot.locationFrameData, role: .localLocation)
+    }
+
+    @discardableResult
+    func sendVoiceControl(command: String, requestID: String? = nil) -> Bool {
+        guard isVoiceGatewayReady else {
+            voiceGatewayText = "语音网关未完成所有者授权"
+            return false
+        }
+        var payload = ["command": command, "v": "1"]
+        if let requestID, !requestID.isEmpty {
+            payload["request_id"] = requestID
+        }
+        let sent = writeJSON(payload, role: .voiceControl)
+        if sent {
+            voiceGatewayText = "语音控制：\(command)"
+        }
+        return sent
+    }
+
+    func sendVoiceDownlinkFrame(_ data: Data) {
+        guard !data.isEmpty else { return }
+        if voiceDownlinkQueue.count >= 8 {
+            voiceDownlinkQueue.removeFirst()
+            voiceDroppedFrames += 1
+        }
+        voiceDownlinkQueue.append(data)
+        flushVoiceDownlinkQueue()
+    }
+
+    private func activateVoiceGatewayIfReady() {
+        guard isVoiceGatewayReady else { return }
+        if !voiceGatewayAnnounced {
+            voiceGatewayAnnounced = sendVoiceControl(command: "gateway_ready")
+        }
+        if voiceGatewayAnnounced {
+            voiceGatewayText = "BLE 语音网关已就绪"
+        }
+        flushVoiceDownlinkQueue()
+    }
+
+    private func flushVoiceDownlinkQueue() {
+        guard
+            isVoiceGatewayReady,
+            let selectedPeripheralID,
+            let peripheral = peripherals[selectedPeripheralID],
+            let characteristic = characteristics[.voiceAudioDownlink]
+        else { return }
+        let maximumLength = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        while peripheral.canSendWriteWithoutResponse, !voiceDownlinkQueue.isEmpty {
+            let frame = voiceDownlinkQueue.removeFirst()
+            guard frame.count <= maximumLength else {
+                voiceDroppedFrames += 1
+                voiceGatewayText = "BLE MTU 过小（\(frame.count)/\(maximumLength)）"
+                continue
+            }
+            peripheral.writeValue(frame, for: characteristic, type: .withoutResponse)
+            voiceDownlinkFrames += 1
+        }
+    }
+
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        flushVoiceDownlinkQueue()
     }
 
     func writeFirmwareStart(_ release: VerifiedFirmwareManifest) -> Bool {
@@ -1544,6 +1716,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             persistedDeviceName = status.name
             defaults.set(status.name, forKey: Self.persistedDeviceNameKey)
         }
+        activateVoiceGatewayIfReady()
     }
 
     private func rememberConfirmedWrite(_ role: RadarBLECharacteristic) {

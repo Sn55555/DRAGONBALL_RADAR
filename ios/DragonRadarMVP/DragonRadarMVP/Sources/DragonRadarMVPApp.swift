@@ -84,6 +84,7 @@ struct DragonRadarMVPApp: App {
     @State private var appState: AppState
     @State private var locationBridge = LocationBridge()
     @State private var radarRuntime = RadarRuntime()
+    @State private var pushToTalkGateway = PushToTalkGateway()
     #if !APP_ONLY
     @State private var bleBridge = BLEDeviceBridge()
     @State private var firmwareUpdate = FirmwareUpdateCoordinator()
@@ -116,6 +117,7 @@ struct DragonRadarMVPApp: App {
                 .environment(appState)
                 .environment(locationBridge)
                 .environment(radarRuntime)
+                .environment(pushToTalkGateway)
                 #if !APP_ONLY
                 .environment(bleBridge)
                 .environment(firmwareUpdate)

@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		058B253CBD68BC5848772DB9 /* PushToTalkGateway.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7706E57E92F63247A0E4B80C /* PushToTalkGateway.swift */; };
 		06BEA9120974AB47B52EDF8D /* FirmwareUpdateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC1DDD4071C4DD91DA86F79 /* FirmwareUpdateTests.swift */; };
 		0CC51FB93DBFFB6A82E2FCB1 /* BLEDeviceBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 342D31BE9AEC27CAF1C7B3CE /* BLEDeviceBridge.swift */; };
 		145F8311EC5770AC2221CBA8 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AB7011D9E9D23863C43307D5 /* Assets.xcassets */; };
@@ -78,6 +79,7 @@
 		65CE3EEF0D56A2D2F1CDBB3F /* RadarBrandMark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadarBrandMark.swift; sourceTree = "<group>"; };
 		65F3F55F6E7EF6F2505A518E /* LaunchReadinessUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchReadinessUITests.swift; sourceTree = "<group>"; };
 		6E646D07D07A906827782D3C /* LocationBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationBridge.swift; sourceTree = "<group>"; };
+		7706E57E92F63247A0E4B80C /* PushToTalkGateway.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushToTalkGateway.swift; sourceTree = "<group>"; };
 		7AA78ED7C9551162F80D2E72 /* RoomsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoomsView.swift; sourceTree = "<group>"; };
 		850BBF77D05788F92213A3D7 /* ModerationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModerationTests.swift; sourceTree = "<group>"; };
 		87E3D3F571EEC89125EB1A28 /* DiagnosticPackage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticPackage.swift; sourceTree = "<group>"; };
@@ -149,6 +151,7 @@
 				8FC624EB93F9C675AD007DC6 /* Moderation.swift */,
 				A05B7D967E27B4026888805C /* NotificationPermissionCenter.swift */,
 				A09275DF1EDC50D3B8DC14DD /* PhysicalOTAAcceptanceCoordinator.swift */,
+				7706E57E92F63247A0E4B80C /* PushToTalkGateway.swift */,
 				65CE3EEF0D56A2D2F1CDBB3F /* RadarBrandMark.swift */,
 				56D38544F3AF0726E54E368E /* RadarOverviewView.swift */,
 				DE079D625E87D18A597ADEC6 /* RadarRuntime.swift */,
@@ -333,6 +336,7 @@
 				5E9A33DEB23BB1661A69A33B /* Moderation.swift in Sources */,
 				3C8506259C6CEF288E4AB46A /* NotificationPermissionCenter.swift in Sources */,
 				631D1FDEDAC411B1618919D4 /* PhysicalOTAAcceptanceCoordinator.swift in Sources */,
+				058B253CBD68BC5848772DB9 /* PushToTalkGateway.swift in Sources */,
 				58E3690BD35666BEBE2F6F0E /* RadarBrandMark.swift in Sources */,
 				1AC63525B9E856BB20793B80 /* RadarOverviewView.swift in Sources */,
 				B20672C71164EE357DDFA135 /* RadarRuntime.swift in Sources */,

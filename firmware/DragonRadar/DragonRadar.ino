@@ -30,6 +30,7 @@ extern "C" {
 #include "HeadingAlignment.h"
 #include "HeadingStability.h"
 #include "OtaManager.h"
+#include "VoiceAdpcm.h"
 #include "bulma_boot_badge.h"
 #include "boot_audio_pcm.h"
 #include "pin_config.h"
@@ -200,6 +201,10 @@ constexpr bool kShowScanLine = DRAGON_RADAR_SCAN_LINE;
 constexpr bool kSnapTargetsToGrid = DRAGON_RADAR_GRID_SNAP;
 constexpr bool kSerialDiagnostics = DRAGON_RADAR_SERIAL_DIAG;
 constexpr bool kRemoteBleEnabled = DRAGON_RADAR_REMOTE_BLE;
+// Runtime networking is delegated to the paired iPhone. The ESP keeps Wi-Fi
+// off except while an explicitly requested OTA installation is running.
+constexpr bool kBlePhoneGatewayEnabled = true;
+constexpr uint32_t kActiveIdleTimeoutMs = 60000;
 constexpr bool kAllowLegacyPairing = DRAGON_RADAR_ALLOW_LEGACY_PAIRING;
 constexpr const char *kPairingHmacKey = DRAGON_RADAR_PAIRING_HMAC_KEY;
 constexpr uint8_t kZoomLevelCount = 3;
@@ -260,6 +265,9 @@ constexpr const char *kDeviceStatusUuid = "7d540105-f82d-4b2f-91c6-4f0f88aa5a11"
 constexpr const char *kServerConfigUuid = "7d540106-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kFirmwareControlUuid = "7d540107-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kFirmwareStatusUuid = "7d540108-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kVoiceControlUuid = "7d540109-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kVoiceAudioUplinkUuid = "7d54010a-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kVoiceAudioDownlinkUuid = "7d54010b-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr uint32_t kDeviceStatusNotifyMs = 2000;
 constexpr uint32_t kScreenOffDeviceStatusNotifyMs = 10000;
 constexpr uint32_t kStandbyDeviceStatusNotifyMs = 30000;
@@ -353,6 +361,8 @@ enum class RadarGattWriteRole : uint8_t {
   LocalLocation,
   ServerConfig,
   FirmwareControl,
+  VoiceControl,
+  VoiceAudioDownlink,
 };
 
 enum class RadarUiMode : uint8_t {
@@ -585,6 +595,15 @@ struct VoiceCaptureState {
   uint32_t lastPlaybackMs = 0;
 };
 
+struct BleVoiceGatewayState {
+  bool ready = false;
+  bool remoteTalkActive = false;
+  uint32_t lastControlMs = 0;
+  uint32_t lastUplinkMs = 0;
+  uint32_t uplinkDrops = 0;
+  uint32_t downlinkDrops = 0;
+};
+
 struct BatteryStatus {
   bool online = false;
   bool present = false;
@@ -645,6 +664,8 @@ BLEServer *provisioningServer = nullptr;
 BLECharacteristic *pairingChallengeCharacteristic = nullptr;
 BLECharacteristic *deviceStatusCharacteristic = nullptr;
 BLECharacteristic *firmwareStatusCharacteristic = nullptr;
+BLECharacteristic *voiceControlCharacteristic = nullptr;
+BLECharacteristic *voiceAudioUplinkCharacteristic = nullptr;
 constexpr uint16_t kInvalidBleConnectionHandle = UINT16_MAX;
 uint16_t activeProvisioningConnectionHandle = kInvalidBleConnectionHandle;
 uint16_t ownerSessionConnectionHandle = kInvalidBleConnectionHandle;
@@ -656,9 +677,12 @@ volatile int8_t bleSecurityEventResult = 0;
 volatile bool bleLinkAuthenticated = false;
 WebSocketsClient relaySocket;
 String relayRootCaPem;
+String pendingOtaControl;
+bool otaWifiSession = false;
 DragonRadarOta::Manager otaManager;
 AudioTone tone;
 VoiceCaptureState voiceCapture;
+BleVoiceGatewayState bleVoiceGateway;
 BatteryStatus batteryStatus;
 PowerResourceState powerResources;
 RemoteProvisioningState provisioning;
@@ -805,6 +829,7 @@ void setupProvisioningBle();
 void provisioningTick();
 void cloudRelayTick();
 void voiceCaptureTick();
+void activeSleepTick();
 void beginPushToTalk();
 void endPushToTalk();
 void cancelPushToTalkDueToBusy(const char *reason);
@@ -849,6 +874,7 @@ void drawCurrentModeFrame();
 void handleBootShortPress();
 void setupPowerButton();
 void pollPowerButton();
+void notifyVoiceControl(const char *event, const char *reason = nullptr);
 
 float degToRad(float deg) {
   return deg * kPi / 180.0f;
@@ -1688,11 +1714,9 @@ void enterScreenOff() {
 }
 
 void enterStandby() {
-  tone.active = false;
-  tone.remainingSamples = 0;
-  voiceCapture.playbackActive = false;
-  invalidateRelativeHeading(false);
-  setRadarUiMode(RadarUiMode::Standby);
+  // Compatibility alias for old serial/UI commands. There is now one low
+  // power state: SLEEP, with BLE remaining available for phone/voice wake.
+  enterScreenOff();
 }
 
 void beginShutdownFallback() {
@@ -3494,23 +3518,37 @@ void applyPowerResourcesForUiMode(RadarUiMode previousMode, RadarUiMode nextMode
   if (nextMode == RadarUiMode::ShutdownPending) {
     return;
   }
-  if (nextMode == RadarUiMode::Standby) {
-    suspendRuntimeAudio("standby");
+  if (nextMode == RadarUiMode::Standby || nextMode == RadarUiMode::ScreenOff) {
+    suspendRuntimeAudio("sleep");
     suspendImuPower();
     suspendDisplayPower();
-    configureWifiPowerSave();
+    if (kBlePhoneGatewayEnabled && !otaWifiSession && WiFi.getMode() != WIFI_OFF) {
+      WiFi.disconnect(true, false);
+      WiFi.mode(WIFI_OFF);
+      powerResources.wifiPowerSave = false;
+    } else {
+      configureWifiPowerSave();
+    }
     return;
   }
-  if (nextMode == RadarUiMode::ScreenOff) {
-    suspendDisplayPower();
-    configureWifiPowerSave();
-    return;
-  }
-  if (previousMode == RadarUiMode::Standby) {
+  if (previousMode == RadarUiMode::Standby || previousMode == RadarUiMode::ScreenOff) {
     resumeImuPower();
   }
   resumeDisplayPower();
   configureWifiPowerSave();
+}
+
+void activeSleepTick() {
+  if (!kBlePhoneGatewayEnabled || !radarUiDisplayActive() ||
+      radarUiMode == RadarUiMode::ShutdownPending || otaManager.blocksPowerAndVoice() ||
+      voiceCapture.pttActive || voiceCapture.playbackActive || tone.active || bootAudioPlaying) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (radarStartedMs > 0 && now - lastUserInputMs >= kActiveIdleTimeoutMs) {
+    provisioning.lastWrite = "auto_sleep_inactive";
+    enterScreenOff();
+  }
 }
 
 void printTouchDiagnostic(int16_t x, int16_t y, const char *action) {
@@ -3531,7 +3569,6 @@ void handleTouch(int16_t x, int16_t y) {
 
 constexpr SystemMenuItem kSystemMenuItems[] = {
     SystemMenuItem::Sleep,
-    SystemMenuItem::Standby,
     SystemMenuItem::Off,
     SystemMenuItem::Info,
     SystemMenuItem::Reset,
@@ -4815,7 +4852,8 @@ void loadProvisioningState() {
 
   provisioning.serverConfigured =
       provisioning.relayUrl.length() > 0 && provisioning.deviceToken.length() > 0;
-  provisioning.wifiConnectRequested = provisioning.wifiSsid.length() > 0;
+  provisioning.wifiConnectRequested =
+      !kBlePhoneGatewayEnabled && provisioning.wifiSsid.length() > 0;
   provisioning.relayState = provisioning.serverConfigured ? "configured" : "unconfigured";
 }
 
@@ -4860,6 +4898,9 @@ const char *wifiStatusText() {
 }
 
 const char *relayStatusText() {
+  if (kBlePhoneGatewayEnabled) {
+    return bleVoiceGateway.ready ? "phone_gateway" : "waiting_phone";
+  }
   if (!provisioning.serverConfigured) {
     return "unconfigured";
   }
@@ -4978,6 +5019,16 @@ String buildDeviceStatusJson(bool includeExtendedState = false, bool compactBleS
   status += "}";
   if (includeExtendedState) {
     status += ",\"voice\":{";
+    status += "\"transport\":\"";
+    status += kBlePhoneGatewayEnabled ? "ble_adpcm" : "wifi_pcm";
+    status += "\"";
+    status += ",\"gateway_ready\":";
+    status += bleVoiceGateway.ready ? "1" : "0";
+    status += ",\"uplink_drops\":";
+    status += String(bleVoiceGateway.uplinkDrops);
+    status += ",\"downlink_drops\":";
+    status += String(bleVoiceGateway.downlinkDrops);
+    status += ",";
     status += "\"capture\":";
     status += voiceCapture.captureOnline ? "1" : "0";
     status += ",\"muted\":";
@@ -5097,6 +5148,20 @@ void firmwareOtaTick() {
     lastFrameMs = 0;
   }
   previouslyBlocking = blocking;
+  if (kBlePhoneGatewayEnabled && otaWifiSession && pendingOtaControl.length() == 0 &&
+      !otaManager.active() && !otaManager.blocksPowerAndVoice()) {
+    const DragonRadarOta::Snapshot snapshot = otaManager.snapshot();
+    if (snapshot.phase == DragonRadarOta::Phase::Error ||
+        snapshot.phase == DragonRadarOta::Phase::Cancelled ||
+        snapshot.phase == DragonRadarOta::Phase::Success ||
+        snapshot.phase == DragonRadarOta::Phase::RolledBack) {
+      provisioning.wifiConnectRequested = false;
+      provisioning.wifiConnectInFlight = false;
+      WiFi.disconnect(true, false);
+      WiFi.mode(WIFI_OFF);
+      otaWifiSession = false;
+    }
+  }
   notifyFirmwareStatus(false);
 }
 
@@ -5315,7 +5380,9 @@ void handleWifiConfigWrite(BLECharacteristic *characteristic) {
   extractJsonStringValue(json, "password", password);
   provisioning.wifiSsid = ssid;
   provisioning.wifiPassword = password;
-  provisioning.wifiConnectRequested = true;
+  // Credentials are retained for explicit OTA use. Runtime room and voice
+  // traffic is carried by the iPhone BLE gateway.
+  provisioning.wifiConnectRequested = !kBlePhoneGatewayEnabled;
   provisioning.wifiConnectInFlight = false;
   lastWifiAttemptMs = 0;
   provisioning.lastWrite = "wifi_config";
@@ -5405,6 +5472,24 @@ void handleLocalLocationWrite(BLECharacteristic *characteristic) {
 
 void handleFirmwareControlWrite(BLECharacteristic *characteristic) {
   const String control = characteristicValueAsString(characteristic);
+  const bool needsNetwork = control.indexOf("\"action\":\"start\"") >= 0 ||
+                            control.indexOf("\"action\":\"retry\"") >= 0;
+  if (kBlePhoneGatewayEnabled && needsNetwork && WiFi.status() != WL_CONNECTED) {
+    if (provisioning.wifiSsid.length() == 0) {
+      provisioning.lastWrite = "ota_rejected_wifi_unconfigured";
+      notifyFirmwareStatus(true);
+      notifyDeviceStatus(true);
+      return;
+    }
+    pendingOtaControl = control;
+    otaWifiSession = true;
+    provisioning.wifiConnectRequested = true;
+    provisioning.wifiConnectInFlight = false;
+    provisioning.lastWrite = "ota_waiting_wifi";
+    notifyFirmwareStatus(true);
+    notifyDeviceStatus(true);
+    return;
+  }
   updateBatteryStatus(false);
   const bool accepted = otaManager.handleControlJson(
       control,
@@ -5422,6 +5507,90 @@ void handleFirmwareControlWrite(BLECharacteristic *characteristic) {
                                      (ota.error.length() > 0 ? ota.error : "busy");
   notifyFirmwareStatus(true);
   notifyDeviceStatus(true);
+}
+
+void notifyVoiceControl(const char *event, const char *reason) {
+  if (!voiceControlCharacteristic || !provisioning.appConnected) return;
+  String payload = "{\"v\":1,\"event\":\"";
+  payload += event ? event : "unknown";
+  payload += "\",\"sequence\":";
+  payload += String(voiceCapture.sequence);
+  if (reason && reason[0] != '\0') {
+    payload += ",\"reason\":\"";
+    payload += jsonEscape(String(reason));
+    payload += "\"";
+  }
+  payload += "}";
+  voiceControlCharacteristic->setValue(payload);
+  voiceControlCharacteristic->notify();
+}
+
+void handleVoiceControlWrite(BLECharacteristic *characteristic) {
+  const String json = characteristicValueAsString(characteristic);
+  String command;
+  if (!extractJsonStringValue(json, "command", command)) {
+    provisioning.lastWrite = "voice_control_invalid";
+    notifyDeviceStatus(true);
+    return;
+  }
+  bleVoiceGateway.lastControlMs = millis();
+  if (command == "gateway_ready") {
+    bleVoiceGateway.ready = true;
+    provisioning.lastWrite = "voice_gateway_ready";
+    notifyVoiceControl("gateway_ready_ack");
+  } else if (command == "gateway_unavailable") {
+    bleVoiceGateway.ready = false;
+    bleVoiceGateway.remoteTalkActive = false;
+    provisioning.lastWrite = "voice_gateway_unavailable";
+  } else if (command == "remote_begin" || command == "wake") {
+    bleVoiceGateway.ready = true;
+    bleVoiceGateway.remoteTalkActive = command == "remote_begin";
+    if (radarUiMode == RadarUiMode::ScreenOff || radarUiMode == RadarUiMode::Standby) {
+      wakeRadarDisplay();
+    }
+    lastUserInputMs = millis();
+    provisioning.lastWrite = command == "remote_begin" ? "remote_voice_begin" : "remote_wake";
+    notifyVoiceControl(command == "remote_begin" ? "remote_ready" : "wake_ack");
+  } else if (command == "remote_end") {
+    bleVoiceGateway.remoteTalkActive = false;
+    provisioning.lastWrite = "remote_voice_end";
+  } else if (command == "sleep") {
+    if (!voiceCapture.pttActive && !voiceCapture.playbackActive && !otaManager.blocksPowerAndVoice()) {
+      enterScreenOff();
+      provisioning.lastWrite = "remote_sleep";
+    }
+  } else {
+    provisioning.lastWrite = "voice_control_unknown";
+  }
+  notifyDeviceStatus(true);
+}
+
+void handleVoiceAudioDownlinkWrite(BLECharacteristic *characteristic) {
+  const uint8_t *packet = characteristic->getData();
+  const size_t packetBytes = characteristic->getLength();
+  int16_t pcm[kVoiceFrameSamples];
+  DragonRadarVoice::DecodedHeader header;
+  const size_t decodedSamples = DragonRadarVoice::decodePacket(
+      packet, packetBytes, pcm, kVoiceFrameSamples, &header);
+  if (decodedSamples == 0) {
+    ++bleVoiceGateway.downlinkDrops;
+    return;
+  }
+  if (voiceCapture.receivedSequence != 0 &&
+      header.sequence != voiceCapture.receivedSequence + 1) {
+    ++bleVoiceGateway.downlinkDrops;
+  }
+  voiceCapture.receivedSequence = header.sequence;
+  bleVoiceGateway.ready = true;
+  bleVoiceGateway.remoteTalkActive = true;
+  bleVoiceGateway.lastControlMs = millis();
+  remoteRoomSpeakerActive = true;
+  remoteRoomSpeakerUntilMs = millis() + kRemoteSpeakingHoldMs;
+  if (radarUiMode == RadarUiMode::ScreenOff || radarUiMode == RadarUiMode::Standby) {
+    wakeRadarDisplay();
+  }
+  lastUserInputMs = millis();
+  playRemoteVoicePcm(reinterpret_cast<const uint8_t *>(pcm), decodedSamples * sizeof(int16_t));
 }
 
 bool authorizeGattWrite(RadarGattWriteRole role, uint16_t connectionHandle) {
@@ -5466,6 +5635,12 @@ void handleGattWrite(
     case RadarGattWriteRole::FirmwareControl:
       handleFirmwareControlWrite(characteristic);
       break;
+    case RadarGattWriteRole::VoiceControl:
+      handleVoiceControlWrite(characteristic);
+      break;
+    case RadarGattWriteRole::VoiceAudioDownlink:
+      handleVoiceAudioDownlinkWrite(characteristic);
+      break;
   }
 }
 
@@ -5501,6 +5676,8 @@ void endProvisioningConnection(uint16_t connectionHandle) {
   blePairingResultUntilMs = 0;
   provisioning.appConnected = false;
   provisioning.ownerSessionAuthorized = false;
+  bleVoiceGateway.ready = false;
+  bleVoiceGateway.remoteTalkActive = false;
   provisioning.lastWrite = "owner_session_closed";
   notifyDeviceStatus(true);
   BLEDevice::startAdvertising();
@@ -5711,6 +5888,21 @@ void setupProvisioningBle() {
       service,
       kFirmwareStatusUuid,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  voiceControlCharacteristic = createProvisioningCharacteristic(
+      service,
+      kVoiceControlUuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+          BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::VoiceControl));
+  voiceAudioUplinkCharacteristic = createProvisioningCharacteristic(
+      service,
+      kVoiceAudioUplinkUuid,
+      BLECharacteristic::PROPERTY_NOTIFY);
+  createProvisioningCharacteristic(
+      service,
+      kVoiceAudioDownlinkUuid,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::VoiceAudioDownlink));
 
   service->start();
 
@@ -5765,6 +5957,28 @@ void provisioningTick() {
     Serial.print(WiFi.localIP());
     Serial.print(" rssi=");
     Serial.println(WiFi.RSSI());
+    notifyDeviceStatus(true);
+  }
+
+  if (wifiStatus == WL_CONNECTED && pendingOtaControl.length() > 0) {
+    const String control = pendingOtaControl;
+    pendingOtaControl = "";
+    updateBatteryStatus(false);
+    const bool accepted = otaManager.handleControlJson(
+        control,
+        provisioning.paired,
+        batteryStatus.percent,
+        batteryStatus.charging,
+        voiceCapture.pttActive,
+        true,
+        provisioning.deviceToken,
+        provisioning.httpApiUrl);
+    const DragonRadarOta::Snapshot ota = otaManager.snapshot();
+    provisioning.lastWrite = accepted
+                                 ? String("ota_") + DragonRadarOta::phaseText(ota.phase)
+                                 : String("ota_rejected_") +
+                                       (ota.error.length() > 0 ? ota.error : "busy");
+    notifyFirmwareStatus(true);
     notifyDeviceStatus(true);
   }
 
@@ -6337,6 +6551,15 @@ void cloudRelayTick() {
   if (!kRemoteBleEnabled || !provisioning.serverConfigured) {
     return;
   }
+  if (kBlePhoneGatewayEnabled) {
+    if (provisioning.relaySocketConfigured || provisioning.relayConnected) {
+      relaySocket.disconnect();
+      provisioning.relaySocketConfigured = false;
+      provisioning.relayConnected = false;
+    }
+    provisioning.relayState = bleVoiceGateway.ready ? "phone_gateway" : "waiting_phone";
+    return;
+  }
   if (otaManager.blocksPowerAndVoice()) {
     if (provisioning.relaySocketConfigured || provisioning.relayConnected) {
       relaySocket.disconnect();
@@ -6400,7 +6623,13 @@ void beginPushToTalk() {
   if (voiceCapture.pttActive) {
     return;
   }
-  if (remoteRoomVoiceBusy()) {
+  if (kBlePhoneGatewayEnabled && !bleVoiceGateway.ready) {
+    provisioning.lastWrite = "ptt_phone_gateway_unavailable";
+    notifyDeviceStatus(true);
+    notifyVoiceControl("ptt_rejected", "gateway_unavailable");
+    return;
+  }
+  if (!kBlePhoneGatewayEnabled && remoteRoomVoiceBusy()) {
     provisioning.lastWrite = "ptt_busy";
     notifyDeviceStatus(true);
     if (kSerialDiagnostics) {
@@ -6425,6 +6654,10 @@ void beginPushToTalk() {
   powerResources.lastAudioActivityMs = millis();
   setSpeakerMutedForCapture(true);
   provisioning.lastWrite = "ptt_start";
+  lastUserInputMs = millis();
+  if (kBlePhoneGatewayEnabled) {
+    notifyVoiceControl("ptt_begin");
+  }
   notifyDeviceStatus(true);
   if (kSerialDiagnostics) {
     Serial.println("DIAG ptt=start");
@@ -6442,7 +6675,9 @@ void cancelPushToTalkDueToBusy(const char *reason) {
   setSpeakerMutedForCapture(false);
   powerResources.lastAudioActivityMs = millis();
   provisioning.lastWrite = reason;
-  if (provisioning.relayConnected) {
+  if (kBlePhoneGatewayEnabled) {
+    notifyVoiceControl("ptt_cancel", reason);
+  } else if (provisioning.relayConnected) {
     ++voiceCapture.sequence;
     sendRelayVoiceFrame(nullptr, 0, false);
   }
@@ -6463,7 +6698,10 @@ void endPushToTalk() {
   setSpeakerMutedForCapture(false);
   powerResources.lastAudioActivityMs = millis();
   provisioning.lastWrite = "ptt_stop";
-  if (provisioning.relayConnected) {
+  lastUserInputMs = millis();
+  if (kBlePhoneGatewayEnabled) {
+    notifyVoiceControl("ptt_end");
+  } else if (provisioning.relayConnected) {
     ++voiceCapture.sequence;
     sendRelayVoiceFrame(nullptr, 0, false);
   }
@@ -6556,7 +6794,23 @@ void voiceCaptureTick() {
   voiceCapture.vadActive = voiceCapture.pttActive && !voiceCapture.muted &&
                            (rms >= kVoiceVadRmsThreshold || peak >= kVoiceVadPeakThreshold);
 
-  if (provisioning.relayConnected && now - voiceCapture.lastFrameMs >= kVoiceFrameTickMs) {
+  if (kBlePhoneGatewayEnabled && bleVoiceGateway.ready && voiceAudioUplinkCharacteristic &&
+      provisioning.appConnected && now - voiceCapture.lastFrameMs >= kVoiceFrameTickMs) {
+    voiceCapture.lastFrameMs = now;
+    ++voiceCapture.sequence;
+    uint8_t packet[DragonRadarVoice::kPacketHeaderBytes + kVoiceFrameSamples / 2];
+    uint8_t flags = voiceCapture.vadActive ? DragonRadarVoice::kFlagVad : 0;
+    const size_t packetBytes = DragonRadarVoice::encodePacket(
+        monoPcm, monoSamples, voiceCapture.sequence, flags, packet, sizeof(packet));
+    if (packetBytes > 0 && packetBytes <= kFirmwareStatusNotifySafeBytes) {
+      voiceAudioUplinkCharacteristic->setValue(packet, packetBytes);
+      voiceAudioUplinkCharacteristic->notify();
+      bleVoiceGateway.lastUplinkMs = now;
+    } else {
+      ++bleVoiceGateway.uplinkDrops;
+    }
+  } else if (!kBlePhoneGatewayEnabled && provisioning.relayConnected &&
+             now - voiceCapture.lastFrameMs >= kVoiceFrameTickMs) {
     voiceCapture.lastFrameMs = now;
     ++voiceCapture.sequence;
     sendRelayVoiceFrame(monoPcm, monoSamples, voiceCapture.pttActive);
@@ -7553,10 +7807,16 @@ void drawStatus() {
 }
 
 bool radarRelayOnline() {
+  if (kBlePhoneGatewayEnabled) {
+    return bleVoiceGateway.ready;
+  }
   return WiFi.status() == WL_CONNECTED && provisioning.relayConnected;
 }
 
 bool radarNetworkOnline() {
+  if (kBlePhoneGatewayEnabled) {
+    return provisioning.appConnected;
+  }
   return WiFi.status() == WL_CONNECTED;
 }
 
@@ -7978,7 +8238,7 @@ SystemMenuItem parseSystemMenuItem(String token) {
     return SystemMenuItem::Sleep;
   }
   if (token == "standby" || token == "stby") {
-    return SystemMenuItem::Standby;
+    return SystemMenuItem::Sleep;
   }
   if (token == "off") {
     return SystemMenuItem::Off;
@@ -8615,14 +8875,20 @@ void drawInfoScreen() {
   drawSystemBackdrop();
   drawCenteredText("INFO", kCx, 63, 2, kGridBright);
 
-  const bool wifiOk = WiFi.status() == WL_CONNECTED;
-  const bool roomOk = provisioning.relayConnected && provisioning.roomToken.length() > 0;
+  const bool wifiOk = kBlePhoneGatewayEnabled ? bleVoiceGateway.ready
+                                               : WiFi.status() == WL_CONNECTED;
+  const bool roomOk = kBlePhoneGatewayEnabled
+                          ? bleVoiceGateway.ready && provisioning.roomToken.length() > 0
+                          : provisioning.relayConnected && provisioning.roomToken.length() > 0;
   const bool voiceBusy = remoteRoomVoiceBusy();
-  const bool voiceOk = audioOnline && voiceInputOnline && provisioning.relayConnected;
+  const bool voiceOk = audioOnline && voiceInputOnline &&
+                       (kBlePhoneGatewayEnabled ? bleVoiceGateway.ready
+                                                : provisioning.relayConnected);
   char versionText[48];
   snprintf(versionText, sizeof(versionText), "VERSION %s", DragonRadarFirmware::kVersion);
   const char *rows[5] = {
-      wifiOk ? "WIFI OK" : "WIFI LOST",
+      kBlePhoneGatewayEnabled ? (wifiOk ? "PHONE OK" : "PHONE LOST")
+                              : (wifiOk ? "WIFI OK" : "WIFI LOST"),
       roomOk ? "ROOM OK" : "ROOM LOST",
       voiceBusy ? "VOICE BUSY" : (voiceOk ? "VOICE OK" : "VOICE LOST"),
       nullptr,
@@ -8835,6 +9101,9 @@ void setup() {
 
   loadRuntimeSettings();
   loadProvisioningState();
+  if (kBlePhoneGatewayEnabled) {
+    WiFi.mode(WIFI_OFF);
+  }
   initRadarChordHalfCache();
   randomSeed(esp_random());
   Wire.begin(IIC_SDA, IIC_SCL);
@@ -8875,6 +9144,7 @@ void loop() {
   pollButtons();
   pollTouch();
   systemUiTick();
+  activeSleepTick();
   provisioningTick();
   firmwareOtaTick();
   cloudRelayTick();

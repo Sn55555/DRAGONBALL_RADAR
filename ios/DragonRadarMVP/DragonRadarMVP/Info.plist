@@ -56,7 +56,9 @@
 	<string>iPhone 定位用于向房间成员共享当前位置。</string>
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>bluetooth-central</string>
 		<string>location</string>
+		<string>push-to-talk</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

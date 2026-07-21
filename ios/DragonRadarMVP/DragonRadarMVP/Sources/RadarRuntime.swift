@@ -359,6 +359,12 @@ final class RadarRuntime {
     @ObservationIgnored private var currentRelayRoomCode = ""
     @ObservationIgnored private var relayConnectionID = UUID()
     @ObservationIgnored private var localDisplayName = "Capsule Radar 用户"
+    @ObservationIgnored private var voiceWakeHandler: ((String, String) -> Void)?
+    @ObservationIgnored private var voiceFrameHandler: ((Data) -> Void)?
+    @ObservationIgnored private var voiceGrantedHandler: ((String) -> Void)?
+    @ObservationIgnored private var voiceEndHandler: (() -> Void)?
+    @ObservationIgnored private var activeVoiceRequestID = ""
+    @ObservationIgnored private var pendingVoiceReadyRequestID = ""
 
     var relayPhase: RuntimePhase = .idle
     #if !APP_ONLY
@@ -423,6 +429,96 @@ final class RadarRuntime {
             ? "Capsule Radar 用户"
             : cleanName
     }
+
+    #if !APP_ONLY
+    func configureVoiceGateway(
+        onWake: @escaping (String, String) -> Void,
+        onFrame: @escaping (Data) -> Void,
+        onGranted: @escaping (String) -> Void,
+        onEnd: @escaping () -> Void
+    ) {
+        voiceWakeHandler = onWake
+        voiceFrameHandler = onFrame
+        voiceGrantedHandler = onGranted
+        voiceEndHandler = onEnd
+    }
+
+    func requestVoiceFloor(requestID: String) async {
+        guard relayPhase == .ready else {
+            voicePhase = .failed
+            noteVoiceEvent("房间未连接，无法发起语音")
+            return
+        }
+        activeVoiceRequestID = requestID
+        do {
+            try await sendRelayJSON([
+                "type": "gateway_voice_request",
+                "request_id": requestID,
+                "codec": "ima_adpcm",
+                "sample_rate": 16_000,
+                "frame_ms": 20
+            ])
+            voicePhase = .connecting
+            noteVoiceEvent("正在申请房间语音权")
+        } catch {
+            voicePhase = .failed
+            noteVoiceEvent("语音申请失败：\(error.localizedDescription)")
+        }
+    }
+
+    func confirmRemoteVoiceReady(requestID: String) async {
+        guard relayPhase == .ready, relaySocket != nil else {
+            pendingVoiceReadyRequestID = requestID
+            noteVoiceEvent("雷达已唤醒，等待房间链路恢复后确认")
+            return
+        }
+        do {
+            try await sendRelayJSON([
+                "type": "gateway_voice_ready",
+                "request_id": requestID
+            ])
+            noteVoiceEvent("雷达已被 BLE 唤醒，等待远端语音")
+            pendingVoiceReadyRequestID = ""
+        } catch {
+            noteVoiceEvent("远端唤醒确认失败：\(error.localizedDescription)")
+        }
+    }
+
+    func releaseVoiceFloor(requestID: String? = nil) async {
+        let effectiveID = requestID ?? activeVoiceRequestID
+        do {
+            try await sendRelayJSON([
+                "type": "gateway_voice_release",
+                "request_id": effectiveID
+            ])
+        } catch {
+            noteVoiceEvent("语音释放失败：\(error.localizedDescription)")
+        }
+        activeVoiceRequestID = ""
+        voicePhase = .idle
+    }
+
+    func sendVoiceFrame(_ frame: Data) async {
+        guard relayPhase == .ready, !frame.isEmpty else { return }
+        let sequence: UInt32 = frame.count >= 8
+            ? frame[4..<8].enumerated().reduce(0) { partial, item in
+                partial | (UInt32(item.element) << UInt32(item.offset * 8))
+            }
+            : 0
+        do {
+            try await sendRelayJSON([
+                "type": "gateway_voice_frame",
+                "request_id": activeVoiceRequestID,
+                "sequence": Int(sequence),
+                "codec": "ima_adpcm",
+                "audio_b64": frame.base64EncodedString()
+            ])
+        } catch {
+            voicePhase = .degraded
+            noteVoiceEvent("语音帧上传失败：\(error.localizedDescription)")
+        }
+    }
+    #endif
 
     #if !APP_ONLY
     var localDeviceMember: RelayRoomMemberSnapshot? {
@@ -495,7 +591,7 @@ final class RadarRuntime {
             #if APP_ONLY
             let capabilities = ["location", "room_admin"]
             #else
-            let capabilities = ["location", "device_config", "room_admin"]
+            let capabilities = ["location", "device_config", "room_admin", "ble_voice_gateway", "ptt_push"]
             #endif
             try await sendRelayJSON([
                 "type": "hello",
@@ -532,6 +628,10 @@ final class RadarRuntime {
             relayPhase = .ready
             relayLatencyMS = 0
             noteRelayEvent("房间已连接")
+            if !pendingVoiceReadyRequestID.isEmpty {
+                let pendingRequestID = pendingVoiceReadyRequestID
+                Task { await self.confirmRemoteVoiceReady(requestID: pendingRequestID) }
+            }
             print("DragonRadar Relay connected path=\(appSocketPath) room=\(roomCode)")
         } catch {
             guard relayConnectionID == connectionID, relaySocket === socket else {
@@ -889,6 +989,26 @@ final class RadarRuntime {
             handleRoomSwitchAck(object)
         case "voice_busy":
             handleVoiceBusy(object)
+        case "gateway_voice_wake":
+            let requestID = object["request_id"] as? String ?? UUID().uuidString
+            let speaker = object["speaker_name"] as? String ?? "房间成员"
+            voicePhase = .connecting
+            noteVoiceEvent("收到 \(speaker) 的远端语音唤醒")
+            voiceWakeHandler?(requestID, speaker)
+        case "gateway_voice_granted":
+            let requestID = object["request_id"] as? String ?? activeVoiceRequestID
+            voicePhase = .ready
+            noteVoiceEvent("房间语音权已授予")
+            voiceGrantedHandler?(requestID)
+        case "gateway_voice_frame":
+            if let encoded = object["audio_b64"] as? String,
+               let frame = Data(base64Encoded: encoded) {
+                voiceFrameHandler?(frame)
+            }
+        case "gateway_voice_end":
+            voicePhase = .idle
+            noteVoiceEvent("远端语音已结束")
+            voiceEndHandler?()
         #endif
         case "radar_reminder":
             NotificationCenter.default.post(

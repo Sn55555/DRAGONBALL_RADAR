@@ -308,10 +308,13 @@ struct AppRuntimeHost<Content: View>: View {
     @Environment(AppState.self) private var appState
     @Environment(LocationBridge.self) private var locationBridge
     @Environment(RadarRuntime.self) private var radarRuntime
+    @Environment(PushToTalkGateway.self) private var pushToTalkGateway
     @Environment(BLEDeviceBridge.self) private var bleBridge
     @Environment(FirmwareUpdateCoordinator.self) private var firmwareUpdate
     @Environment(NotificationPermissionCenter.self) private var notificationCenter
     @State private var coordinator = AppRuntimeCoordinator()
+    @State private var pendingRemoteVoiceRequestID = ""
+    @State private var activeLocalVoiceRequestID = ""
 
     private let content: Content
     private let isUITesting = ProcessInfo.processInfo.arguments.contains("DRAGON_RADAR_UI_TESTING")
@@ -330,6 +333,8 @@ struct AppRuntimeHost<Content: View>: View {
                 await appState.restoreSessionIfNeeded()
                 guard appState.isSignedIn, !appState.isReviewExperienceActive else { return }
                 radarRuntime.configureUserDisplayName(appState.displayName)
+                configureVoiceGateway()
+                preparePushToTalk()
                 await syncPushRegistrationIfPossible()
                 await appState.refreshRoomsFromServer()
                 await appState.refreshDevicesFromServer()
@@ -351,6 +356,8 @@ struct AppRuntimeHost<Content: View>: View {
                     if isSignedIn {
                         guard !appState.isReviewExperienceActive else { return }
                         radarRuntime.configureUserDisplayName(appState.displayName)
+                        configureVoiceGateway()
+                        preparePushToTalk()
                         await syncPushRegistrationIfPossible()
                         await appState.refreshRoomsFromServer()
                         await appState.refreshDevicesFromServer()
@@ -366,6 +373,7 @@ struct AppRuntimeHost<Content: View>: View {
                             radarRuntime: radarRuntime
                         )
                     } else {
+                        pushToTalkGateway.leave()
                         bleBridge.configureOwnerSession(deviceToken: "")
                         await coordinator.stop(locationBridge: locationBridge, radarRuntime: radarRuntime)
                     }
@@ -408,6 +416,7 @@ struct AppRuntimeHost<Content: View>: View {
                     return
                 }
                 Task {
+                    preparePushToTalk(roomCode: roomCode)
                     await coordinator.reconnectRelay(
                         roomCode: roomCode,
                         deviceToken: appState.activeDeviceToken,
@@ -439,6 +448,8 @@ struct AppRuntimeHost<Content: View>: View {
                     await appState.restoreSessionIfNeeded()
                     guard appState.isSignedIn else { return }
                     await syncPushRegistrationIfPossible()
+                    configureVoiceGateway()
+                    preparePushToTalk()
                     bleBridge.configureOwnerSession(deviceToken: appState.activeDeviceToken)
                     firmwareUpdate.refreshFromDevice(bleBridge: bleBridge)
                     guard !appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -500,6 +511,7 @@ struct AppRuntimeHost<Content: View>: View {
         lifecycleContent
             .task {
                 guard !isUITesting, !isPhysicalOTAAcceptance else { return }
+                configureVoiceGateway()
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(10))
                     guard appState.isSignedIn, !appState.isReviewExperienceActive else { continue }
@@ -581,6 +593,103 @@ struct AppRuntimeHost<Content: View>: View {
         await notificationCenter.refresh()
         notificationCenter.registerRemoteNotificationsIfAuthorized()
         await notificationCenter.syncRemoteTokenIfPossible(accessToken: appState.accessToken)
+    }
+
+    private func preparePushToTalk(roomCode: String? = nil) {
+        let effectiveRoom = (roomCode ?? appState.inviteCode)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard appState.isSignedIn, !effectiveRoom.isEmpty else { return }
+        pushToTalkGateway.prepare(
+            roomCode: effectiveRoom,
+            displayName: appState.displayName,
+            accessToken: appState.accessToken
+        )
+    }
+
+    private func configureVoiceGateway() {
+        bleBridge.configureVoiceGateway(
+            onControl: { data in
+                handleBLEVoiceControl(data)
+            },
+            onUplinkFrame: { frame in
+                Task { await radarRuntime.sendVoiceFrame(frame) }
+            }
+        )
+        radarRuntime.configureVoiceGateway(
+            onWake: { requestID, speaker in
+                wakeRadarForRemoteVoice(requestID: requestID, speaker: speaker)
+            },
+            onFrame: { frame in
+                bleBridge.sendVoiceDownlinkFrame(frame)
+            },
+            onGranted: { requestID in
+                activeLocalVoiceRequestID = requestID
+                pushToTalkGateway.beginSystemTransmission()
+            },
+            onEnd: {
+                pendingRemoteVoiceRequestID = ""
+                pushToTalkGateway.setRemoteSpeaker(nil)
+                _ = bleBridge.sendVoiceControl(command: "remote_end")
+            }
+        )
+        pushToTalkGateway.configureCallbacks(
+            onIncomingWake: { requestID, speaker in
+                wakeRadarForRemoteVoice(requestID: requestID, speaker: speaker)
+            },
+            onSystemTransmit: { transmitting in
+                if !transmitting, !activeLocalVoiceRequestID.isEmpty {
+                    let requestID = activeLocalVoiceRequestID
+                    activeLocalVoiceRequestID = ""
+                    Task { await radarRuntime.releaseVoiceFloor(requestID: requestID) }
+                }
+            }
+        )
+    }
+
+    private func wakeRadarForRemoteVoice(requestID: String, speaker: String) {
+        guard pendingRemoteVoiceRequestID != requestID else { return }
+        pendingRemoteVoiceRequestID = requestID
+        pushToTalkGateway.setRemoteSpeaker(speaker)
+        if !bleBridge.sendVoiceControl(command: "remote_begin", requestID: requestID) {
+            radarRuntime.noteVoiceEvent("收到远端语音，但 BLE 雷达尚未就绪")
+        }
+        if radarRuntime.relayPhase != .ready {
+            let roomCode = appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines)
+            let accessToken = appState.accessToken
+            let deviceToken = appState.activeDeviceToken
+            guard !roomCode.isEmpty, !accessToken.isEmpty else { return }
+            Task {
+                await radarRuntime.connectRelay(
+                    roomCode: roomCode,
+                    deviceToken: deviceToken,
+                    appAccessToken: accessToken
+                )
+            }
+        }
+    }
+
+    private func handleBLEVoiceControl(_ data: Data) {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let event = object["event"] as? String
+        else { return }
+        switch event {
+        case "ptt_begin":
+            let requestID = UUID().uuidString
+            activeLocalVoiceRequestID = requestID
+            Task { await radarRuntime.requestVoiceFloor(requestID: requestID) }
+        case "ptt_end", "ptt_cancel":
+            let requestID = activeLocalVoiceRequestID
+            activeLocalVoiceRequestID = ""
+            pushToTalkGateway.endSystemTransmission()
+            Task { await radarRuntime.releaseVoiceFloor(requestID: requestID) }
+        case "remote_ready":
+            guard !pendingRemoteVoiceRequestID.isEmpty else { return }
+            let requestID = pendingRemoteVoiceRequestID
+            Task { await radarRuntime.confirmRemoteVoiceReady(requestID: requestID) }
+        default:
+            break
+        }
     }
 }
 

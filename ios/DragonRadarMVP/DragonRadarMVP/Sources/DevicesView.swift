@@ -6,6 +6,7 @@ struct DevicesView: View {
     @Environment(LocationBridge.self) private var locationBridge
     @Environment(RadarRuntime.self) private var radarRuntime
     @Environment(BLEDeviceBridge.self) private var bleBridge
+    @Environment(PushToTalkGateway.self) private var pushToTalkGateway
 
     var body: some View {
         @Bindable var state = appState
@@ -54,12 +55,16 @@ struct DevicesView: View {
         locationBridge.snapshot != nil
             && !appState.devices.isEmpty
             && bleBridge.hasSavedRegistration
-            && (bleBridge.isLiveNetworkConfirmed || radarRuntime.localDeviceOnline)
+            && bleBridge.isVoiceGatewayReady
+            && pushToTalkGateway.activeChannelUUID != nil
+            && radarRuntime.relayPhase == .ready
             && !appState.inviteCode.isEmpty
     }
 
     private var espNetworkReady: Bool {
-        bleBridge.isLiveNetworkConfirmed || radarRuntime.localDeviceOnline
+        bleBridge.isVoiceGatewayReady
+            && radarRuntime.relayPhase == .ready
+            && pushToTalkGateway.activeChannelUUID != nil
     }
 }
 
@@ -98,7 +103,7 @@ struct DeviceInventorySection: View {
                             DeviceInlineRadarRow(
                                 device: device,
                                 status: bleBridge.deviceStatus,
-                                relayOnline: radarRuntime.localDeviceOnline,
+                                relayOnline: bleBridge.isVoiceGatewayReady && radarRuntime.relayPhase == .ready,
                                 relayStatus: radarRuntime.localRelayDeviceStatus
                             )
                         }
@@ -131,32 +136,22 @@ struct DeviceInlineRadarRow: View {
         guard let status else {
             return device.state.rawValue
         }
-        if status.wifi == "connected", status.server == 1 {
-            return "在线可用"
-        }
         if status.paired == 1 {
-            return "已绑定"
+            return "等待手机网关"
         }
         return "待配置"
     }
 
     private var statusReady: Bool {
         if relayOnline { return true }
-        guard let status else { return device.state == .cloudConnected }
-        return status.wifi == "connected" && status.server == 1
+        return false
     }
 
     private var secondaryText: String {
         if relayOnline {
-            if let relayStatus, relayStatus.wifi == "connected" {
-                return relayStatus.ip ?? "在线"
-            }
-            return "在线"
+            return "iPhone 网关在线"
         }
-        guard let status else {
-            return device.wifiName
-        }
-        return status.wifiText
+        return status?.paired == 1 ? "BLE 未就绪" : "等待绑定"
     }
 
     private var batteryText: String {
@@ -216,6 +211,7 @@ struct DeviceConnectionGuidePanel: View {
     @Environment(LocationBridge.self) private var locationBridge
     @Environment(RadarRuntime.self) private var radarRuntime
     @Environment(BLEDeviceBridge.self) private var bleBridge
+    @Environment(PushToTalkGateway.self) private var pushToTalkGateway
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -238,10 +234,11 @@ struct DeviceConnectionGuidePanel: View {
 
             VStack(spacing: 7) {
                 ConnectionStepRow(index: 1, title: "手机蓝牙", detail: bluetoothDetail, isReady: bleBridge.stateText == "可用")
-                ConnectionStepRow(index: 2, title: "配置连接", detail: bleConnectionDetail, isReady: bleBridge.isBLEConnected)
+                ConnectionStepRow(index: 2, title: "雷达 BLE", detail: bleConnectionDetail, isReady: bleBridge.isBLEConnected)
                 ConnectionStepRow(index: 3, title: "绑定配置", detail: pairingDetail, isReady: bindingReady)
-                ConnectionStepRow(index: 4, title: "当前联网", detail: espNetworkDetail, isReady: espNetworkReady)
-                ConnectionStepRow(index: 5, title: "当前房间", detail: roomDetail, isReady: roomReady && radarRuntime.relayPhase == .ready)
+                ConnectionStepRow(index: 4, title: "手机网关", detail: espNetworkDetail, isReady: espNetworkReady)
+                ConnectionStepRow(index: 5, title: "系统 PTT", detail: pushToTalkGateway.phaseText, isReady: pushToTalkGateway.activeChannelUUID != nil)
+                ConnectionStepRow(index: 6, title: "当前房间", detail: roomDetail, isReady: roomReady && radarRuntime.relayPhase == .ready)
             }
         }
         .accessibilityIdentifier("devices.radar.connection.status")
@@ -251,6 +248,7 @@ struct DeviceConnectionGuidePanel: View {
         locationBridge.snapshot != nil
             && bindingReady
             && espNetworkReady
+            && pushToTalkGateway.activeChannelUUID != nil
             && roomReady
             && radarRuntime.relayPhase == .ready
     }
@@ -272,7 +270,7 @@ struct DeviceConnectionGuidePanel: View {
     }
 
     private var espNetworkReady: Bool {
-        bleBridge.isLiveNetworkConfirmed || radarRuntime.localDeviceOnline
+        bleBridge.isVoiceGatewayReady && radarRuntime.relayPhase == .ready
     }
 
     private var bluetoothDetail: String {
@@ -285,11 +283,11 @@ struct DeviceConnectionGuidePanel: View {
     }
 
     private var bleConnectionDetail: String {
-        if bleBridge.isBLEConnected { return "\(bleBridge.connectedPeripheralName) 已连接" }
-        if radarRuntime.localDeviceOnline { return "配置连接未开启，不影响雷达工作" }
+        if bleBridge.isVoiceGatewayReady { return "\(bleBridge.connectedPeripheralName) · 语音通道已就绪" }
+        if bleBridge.isBLEConnected { return "\(bleBridge.connectedPeripheralName) 已连接，正在确认语音通道" }
         if bleBridge.scanTimedOut { return "没有找到雷达" }
         if bleBridge.isScanning { return bleBridge.candidates.isEmpty ? "正在查找雷达" : "发现雷达，进入连接" }
-        return "未连接，仅用于配置"
+        return "未连接，远程唤醒与语音不可用"
     }
 
     private var pairingDetail: String {
@@ -308,23 +306,13 @@ struct DeviceConnectionGuidePanel: View {
     }
 
     private var espNetworkDetail: String {
-        if let relayStatus = radarRuntime.localRelayDeviceStatus {
-            if relayStatus.wifi == "connected" {
-                return relayStatus.ip.map { "\($0) · 在线" } ?? "在线"
-            }
-            if radarRuntime.localDeviceOnline {
-                return "在线"
-            }
+        if espNetworkReady {
+            return "iPhone 联网 · BLE 语音网关已就绪"
         }
-        if radarRuntime.localDeviceOnline {
-            return "在线"
-        }
-        guard let status = bleBridge.deviceStatus else {
-            return bleBridge.hasSavedRegistration ? "未拿到当前状态" : "未配置"
-        }
-        if status.wifi == "connected", status.server == 1 { return "已联网" }
-        if status.wifi != "connected" { return "Wi-Fi 未连接" }
-        return "服务器未连接"
+        if !bleBridge.isVoiceGatewayReady { return bleBridge.voiceGatewayText }
+        if radarRuntime.relayPhase != .ready { return "等待 iPhone 房间链路" }
+        if pushToTalkGateway.activeChannelUUID == nil { return pushToTalkGateway.phaseText }
+        return "等待 iPhone 房间链路"
     }
 
     private var roomDetail: String {
@@ -337,12 +325,12 @@ struct DeviceConnectionGuidePanel: View {
         if appState.devices.isEmpty, bleBridge.hasSavedRegistration {
             return "雷达未绑定当前账户"
         }
-        if radarRuntime.localDeviceOnline { return "雷达正在工作" }
+        if setupReady { return "雷达正在工作" }
         if bleBridge.scanTimedOut { return "没有找到雷达" }
         if !bleBridge.isBLEConnected { return bleBridge.isScanning ? "正在查找雷达" : "未连接雷达" }
         if !espProtocolReady { return "雷达连接未就绪" }
         if !bindingReady { return "雷达未绑定" }
-        if !espNetworkReady { return bleBridge.hasLiveDeviceStatus ? "雷达网络未连接" : "雷达状态未确认" }
+        if !espNetworkReady { return bleBridge.hasLiveDeviceStatus ? "手机网关未就绪" : "雷达状态未确认" }
         if !roomReady { return "未进入房间" }
         if radarRuntime.relayPhase != .ready { return "房间连接中" }
         return "雷达当前可用"
@@ -352,9 +340,8 @@ struct DeviceConnectionGuidePanel: View {
         if setupReady { return "checkmark.seal.fill" }
         if bleBridge.stateText != "可用" { return "gearshape.fill" }
         if !bindingReady { return "link" }
-        if radarRuntime.localDeviceOnline { return "checkmark.seal.fill" }
         if !bleBridge.isBLEConnected || !espProtocolReady { return "dot.radiowaves.left.and.right" }
-        if !espNetworkReady { return "wifi.exclamationmark" }
+        if !espNetworkReady { return "iphone.gen3.radiowaves.left.and.right" }
         if !roomReady || radarRuntime.relayPhase != .ready { return "person.3.sequence.fill" }
         return "scope"
     }
@@ -378,7 +365,7 @@ struct DeviceConnectionGuidePanel: View {
                     Label("进入配置", systemImage: "dot.radiowaves.left.and.right")
                 }
                 .buttonStyle(InkButtonStyle())
-            } else if radarRuntime.localDeviceOnline {
+            } else if setupReady {
                 Button {
                     appState.selectedTab = .radar
                 } label: {
@@ -421,17 +408,17 @@ struct DeviceConnectionGuidePanel: View {
                 }
                 .buttonStyle(InkButtonStyle(filled: false))
             } else if !espNetworkReady {
-                Button {
-                    appState.showWifiSheet = true
-                } label: {
-                    Label("重新配网", systemImage: "wifi")
-                }
-                .buttonStyle(InkButtonStyle())
-
                 NavigationLink {
                     BLEConfigDetailView()
                 } label: {
-                    Label("连接确认", systemImage: "dot.radiowaves.left.and.right")
+                    Label("检查手机网关", systemImage: "iphone.gen3.radiowaves.left.and.right")
+                }
+                .buttonStyle(InkButtonStyle())
+
+                Button {
+                    appState.selectedTab = .rooms
+                } label: {
+                    Label("检查房间", systemImage: "person.3.sequence.fill")
                 }
                 .buttonStyle(InkButtonStyle(filled: false))
             } else if !roomReady || radarRuntime.relayPhase != .ready {
@@ -665,6 +652,7 @@ struct ESPWorkingStatusPanel: View {
     @Environment(LocationBridge.self) private var locationBridge
     @Environment(RadarRuntime.self) private var radarRuntime
     @Environment(BLEDeviceBridge.self) private var bleBridge
+    @Environment(PushToTalkGateway.self) private var pushToTalkGateway
 
     var body: some View {
         MangaPanel("雷达工作状态") {
@@ -683,12 +671,13 @@ struct ESPWorkingStatusPanel: View {
 
             HStack(spacing: 10) {
                 ESPStatusMetric(title: "配置", value: configValue, isReady: bindingReady)
-                ESPStatusMetric(title: "联网", value: networkValue, isReady: espNetworkReady)
+                ESPStatusMetric(title: "网关", value: networkValue, isReady: phoneGatewayReady)
                 ESPStatusMetric(title: "房间", value: appState.inviteCode, isReady: roomReady)
             }
 
             InfoRow(label: "电量", value: batteryValue)
-            InfoRow(label: "Wi-Fi", value: bleBridge.deviceStatus?.wifiText ?? (bleBridge.hasSavedRegistration ? "上次已配置 · 当前未确认" : "未确认"))
+            InfoRow(label: "BLE 语音", value: bleBridge.voiceGatewayText)
+            InfoRow(label: "系统 PTT", value: pushToTalkGateway.phaseText)
             InfoRow(label: "定位桥接", value: locationBridge.snapshot == nil ? locationBridge.sharingText : locationBridge.coordinateText)
             InfoRow(label: "最近状态", value: bleBridge.deviceStatus?.last ?? "等待雷达当前状态")
         }
@@ -696,7 +685,7 @@ struct ESPWorkingStatusPanel: View {
     }
 
     private var setupReady: Bool {
-        locationReady && bindingReady && espNetworkReady && roomReady
+        locationReady && bindingReady && phoneGatewayReady && roomReady
     }
 
     private var bindingReady: Bool {
@@ -707,8 +696,10 @@ struct ESPWorkingStatusPanel: View {
         locationBridge.isSharing && locationBridge.snapshot != nil
     }
 
-    private var espNetworkReady: Bool {
-        bleBridge.isLiveNetworkConfirmed
+    private var phoneGatewayReady: Bool {
+        bleBridge.isVoiceGatewayReady
+            && radarRuntime.relayPhase == .ready
+            && pushToTalkGateway.activeChannelUUID != nil
     }
 
     private var roomReady: Bool {
@@ -744,10 +735,10 @@ struct ESPWorkingStatusPanel: View {
     }
 
     private var networkValue: String {
-        guard let status = bleBridge.deviceStatus else {
-            return bleBridge.hasSavedRegistration ? "未确认" : "未配置"
-        }
-        return status.wifi == "connected" ? "在线" : status.wifi
+        if phoneGatewayReady { return "在线" }
+        if !bleBridge.isVoiceGatewayReady { return "BLE 未就绪" }
+        if radarRuntime.relayPhase != .ready { return "连接房间中" }
+        return "PTT 未加入"
     }
 
     private var overallTitle: String {
@@ -763,8 +754,8 @@ struct ESPWorkingStatusPanel: View {
         if !bindingReady {
             return "雷达还未完成绑定"
         }
-        if !espNetworkReady {
-            return "雷达网络未确认"
+        if !phoneGatewayReady {
+            return "等待 iPhone 语音网关"
         }
         if !locationReady {
             return "等待 iPhone 定位桥接"
@@ -774,9 +765,9 @@ struct ESPWorkingStatusPanel: View {
 
     private var overallDetail: String {
         if setupReady {
-            return "已拿到雷达当前状态，网络和房间都可用。"
+            return "雷达通过 BLE 使用 iPhone 网络，房间语音和远程唤醒均已就绪。"
         }
-        return "这里显示实时工作状态；历史配置不会被当成当前可用。"
+        return "日常工作不再要求雷达连接 Wi-Fi；Wi-Fi 配置仅在 OTA 更新时使用。"
     }
 }
 
