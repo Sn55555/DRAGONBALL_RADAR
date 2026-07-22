@@ -180,7 +180,8 @@ final class FirmwareUpdateTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let compact = try XCTUnwrap(object["m"] as? [String: Any])
 
-        XCTAssertEqual(object["a"] as? String, "start")
+        XCTAssertEqual(object["action"] as? String, "start")
+        XCTAssertNil(object["a"])
         XCTAssertEqual(compact["s"] as? Int, manifest.schema)
         XCTAssertEqual(compact["sha"] as? String, manifest.sha256)
         XCTAssertEqual(compact["sig"] as? String, manifest.signature)
@@ -426,6 +427,49 @@ final class FirmwareUpdateTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .sending)
         XCTAssertEqual(coordinator.progress, 0)
         XCTAssertTrue(coordinator.detail.contains("正在连接"))
+    }
+
+    @MainActor
+    func testWaitingForOTAWifiHasBoundedConnectionTimeout() async throws {
+        let coordinator = FirmwareUpdateCoordinator(
+            defaults: try XCTUnwrap(UserDefaults(suiteName: "FirmwareUpdateTests.\(UUID().uuidString)")),
+            sendingAcknowledgementTimeout: .seconds(1),
+            wifiConnectionTimeout: .milliseconds(20)
+        )
+        coordinator.phase = .sending
+
+        coordinator.synchronize(
+            status: nil,
+            deviceStatus: try decodeDeviceStatus(
+                percent: 50,
+                charging: true,
+                wifi: "connecting",
+                last: "ota_waiting_wifi"
+            )
+        )
+
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(coordinator.phase, .failed)
+        XCTAssertTrue(coordinator.detail.contains("连接 OTA 网络超时"))
+    }
+
+    @MainActor
+    func testOTAWifiFailureReasonIsUserFacing() throws {
+        let coordinator = makeCoordinator()
+        coordinator.phase = .sending
+
+        coordinator.synchronize(
+            status: nil,
+            deviceStatus: try decodeDeviceStatus(
+                percent: 50,
+                charging: true,
+                wifi: "failed",
+                last: "ota_rejected_wifi_authentication"
+            )
+        )
+
+        XCTAssertEqual(coordinator.phase, .failed)
+        XCTAssertTrue(coordinator.detail.contains("检查热点密码"))
     }
 
     @MainActor

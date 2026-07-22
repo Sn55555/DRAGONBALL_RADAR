@@ -1388,7 +1388,6 @@ final class DevicesStore {
         guard !devices.isEmpty else { return }
         let cleanSSID = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
         devices[0].wifiName = cleanSSID.isEmpty ? "未配置" : cleanSSID
-        devices[0].state = .wifiConnected
         defaults.set(devices[0].wifiName, forKey: Self.activeDeviceWifiKey)
     }
 

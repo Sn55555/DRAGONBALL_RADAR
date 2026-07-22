@@ -112,7 +112,7 @@ struct FirmwareManifest: Codable, Hashable {
     func compactControlData(artifactURL absoluteArtifactURL: URL) throws -> Data {
         let envelope = FirmwareControlEnvelope(
             v: 1,
-            a: "start",
+            action: "start",
             m: .init(
                 s: schema,
                 p: product,
@@ -153,7 +153,11 @@ private struct FirmwareControlEnvelope: Encodable {
     }
 
     var v: Int
-    var a: String
+    // Firmware 1.0.13 decides whether to start temporary OTA Wi-Fi by looking
+    // for the long-form action key before its alias-aware OTA parser runs.
+    // Keep this long key until every field device is newer than that bootstrap
+    // version.
+    var action: String
     var m: CompactManifest
 }
 
@@ -476,7 +480,9 @@ final class FirmwareUpdateCoordinator {
     @ObservationIgnored private var repository: FirmwareManifestRepository
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let sendingAcknowledgementTimeout: Duration
+    @ObservationIgnored private let wifiConnectionTimeout: Duration
     @ObservationIgnored private var sendingTimeoutTask: Task<Void, Never>?
+    @ObservationIgnored private var wifiTimeoutTask: Task<Void, Never>?
     @ObservationIgnored private static let persistenceKey = "dragonRadar.ota.transaction.v1"
 
     var phase: FirmwareUpdatePhase = .idle
@@ -490,11 +496,13 @@ final class FirmwareUpdateCoordinator {
     init(
         repository: FirmwareManifestRepository = FirmwareManifestRepository(),
         defaults: UserDefaults = .standard,
-        sendingAcknowledgementTimeout: Duration = .seconds(12)
+        sendingAcknowledgementTimeout: Duration = .seconds(12),
+        wifiConnectionTimeout: Duration = .seconds(100)
     ) {
         self.repository = repository
         self.defaults = defaults
         self.sendingAcknowledgementTimeout = sendingAcknowledgementTimeout
+        self.wifiConnectionTimeout = wifiConnectionTimeout
         restore()
         if phase == .sending {
             beginSendingAcknowledgementTimeout()
@@ -507,6 +515,7 @@ final class FirmwareUpdateCoordinator {
 
     func checkForUpdates(accessToken: String, deviceStatus: RadarBLEDeviceStatus?) async {
         cancelSendingTimeout()
+        cancelWifiConnectionTimeout()
         phase = .checking
         availableRelease = nil
         progress = 0
@@ -580,6 +589,7 @@ final class FirmwareUpdateCoordinator {
             fail(bleBridge.lastWriteEvent)
             return
         }
+        cancelWifiConnectionTimeout()
         phase = .sending
         progress = 0
         detail = bleBridge.deviceStatus?.wifi == "connected"
@@ -598,6 +608,7 @@ final class FirmwareUpdateCoordinator {
         guard [.sending, .downloading, .verifying].contains(phase) else { return }
         if bleBridge.writeFirmwareAction("cancel") {
             cancelSendingTimeout()
+            cancelWifiConnectionTimeout()
             phase = .canceling
             detail = "取消请求已发送，等待雷达确认"
             beginCancellationAcknowledgementTimeout()
@@ -622,13 +633,35 @@ final class FirmwareUpdateCoordinator {
             switch deviceStatus.last {
             case "ota_waiting_wifi":
                 cancelSendingTimeout()
+                beginWifiConnectionTimeout()
                 detail = "雷达正在连接用于更新的网络，请保持热点或 Wi-Fi 开启"
             case "ota_rejected_wifi_unconfigured":
                 fail("尚未配置 OTA 网络，请设置 Wi-Fi 或个人热点后继续")
                 return
+            case "ota_rejected_wifi_missing":
+                fail("雷达找不到已保存的 Wi-Fi 或个人热点，请确认热点名称和可见性")
+                return
+            case "ota_rejected_wifi_authentication":
+                fail("雷达无法通过 Wi-Fi 验证，请检查热点密码后重试")
+                return
+            case "ota_rejected_wifi_lost":
+                fail("OTA 网络连接已中断，请保持热点开启后重试")
+                return
+            case "ota_rejected_wifi_timeout":
+                fail("雷达连接 OTA 网络超时，请检查热点名称、密码和兼容性")
+                return
             default:
                 break
             }
+        }
+
+        if phase == .canceling, deviceStatus?.last == "ota_cancelled" {
+            cancelSendingTimeout()
+            cancelWifiConnectionTimeout()
+            phase = .canceled
+            detail = "雷达已取消更新"
+            persist()
+            return
         }
 
         if let status {
@@ -655,6 +688,7 @@ final class FirmwareUpdateCoordinator {
             progress = status.progress
             if stage != "idle" && phase != .canceling {
                 cancelSendingTimeout()
+                cancelWifiConnectionTimeout()
             }
             switch stage {
             case "checking":
@@ -674,6 +708,7 @@ final class FirmwareUpdateCoordinator {
                 else { phase = .rebooting; detail = "雷达正在重启并确认新版本" }
             case "success":
                 cancelSendingTimeout()
+                cancelWifiConnectionTimeout()
                 if
                     let expectedVersion,
                     let expectedBuild,
@@ -691,10 +726,12 @@ final class FirmwareUpdateCoordinator {
             case "error": fail(status.errorCode.map { "雷达更新失败：\($0)" } ?? "雷达更新失败")
             case "rollback":
                 cancelSendingTimeout()
+                cancelWifiConnectionTimeout()
                 phase = .rolledBack
                 detail = "新固件未通过启动确认，雷达已回滚"
             case "cancelled", "canceled":
                 cancelSendingTimeout()
+                cancelWifiConnectionTimeout()
                 phase = .canceled
                 detail = "雷达已取消更新"
             case "idle": break
@@ -716,6 +753,7 @@ final class FirmwareUpdateCoordinator {
 
     func reset() {
         cancelSendingTimeout()
+        cancelWifiConnectionTimeout()
         phase = .idle
         availableRelease = nil
         firmwareStatus = nil
@@ -779,6 +817,7 @@ final class FirmwareUpdateCoordinator {
 
     private func fail(_ message: String) {
         cancelSendingTimeout()
+        cancelWifiConnectionTimeout()
         phase = .failed
         lastError = message
         detail = message
@@ -812,9 +851,25 @@ final class FirmwareUpdateCoordinator {
         }
     }
 
+    func beginWifiConnectionTimeout() {
+        guard wifiTimeoutTask == nil else { return }
+        let timeout = wifiConnectionTimeout
+        wifiTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled, let self, self.phase == .sending else { return }
+            self.wifiTimeoutTask = nil
+            self.fail("雷达连接 OTA 网络超时，请检查热点名称、密码和兼容性")
+        }
+    }
+
     private func cancelSendingTimeout() {
         sendingTimeoutTask?.cancel()
         sendingTimeoutTask = nil
+    }
+
+    private func cancelWifiConnectionTimeout() {
+        wifiTimeoutTask?.cancel()
+        wifiTimeoutTask = nil
     }
 
     private struct PersistedState: Codable {

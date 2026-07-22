@@ -204,6 +204,9 @@ constexpr bool kRemoteBleEnabled = DRAGON_RADAR_REMOTE_BLE;
 // off except while an explicitly requested OTA installation is running.
 constexpr bool kBlePhoneGatewayEnabled = true;
 constexpr uint32_t kActiveIdleTimeoutMs = 60000;
+constexpr uint32_t kOtaWifiConnectRetryIntervalMs = 30000;
+constexpr uint32_t kOtaWifiConnectTimeoutMs = 90000;
+constexpr uint8_t kOtaWifiMaxConnectAttempts = 3;
 constexpr bool kAllowLegacyPairing = DRAGON_RADAR_ALLOW_LEGACY_PAIRING;
 constexpr const char *kPairingHmacKey = DRAGON_RADAR_PAIRING_HMAC_KEY;
 constexpr uint8_t kZoomLevelCount = 3;
@@ -686,6 +689,8 @@ WebSocketsClient relaySocket;
 String relayRootCaPem;
 String pendingOtaControl;
 bool otaWifiSession = false;
+uint32_t otaWifiSessionStartedMs = 0;
+uint8_t otaWifiConnectAttempts = 0;
 DragonRadarOta::Manager otaManager;
 AudioTone tone;
 VoiceCaptureState voiceCapture;
@@ -4894,10 +4899,8 @@ void buildProvisioningIdentity() {
 }
 
 const char *wifiStatusText() {
-  if (provisioning.wifiConnectInFlight && WiFi.status() != WL_CONNECTED) {
-    return "connecting";
-  }
-  switch (WiFi.status()) {
+  const wl_status_t status = WiFi.status();
+  switch (status) {
     case WL_CONNECTED:
       return "connected";
     case WL_NO_SSID_AVAIL:
@@ -4906,10 +4909,17 @@ const char *wifiStatusText() {
       return "failed";
     case WL_CONNECTION_LOST:
       return "lost";
+    default:
+      break;
+  }
+  if (provisioning.wifiConnectInFlight) {
+    return "connecting";
+  }
+  switch (status) {
     case WL_DISCONNECTED:
       return "disconnected";
     default:
-      return "connecting";
+      return provisioning.wifiConnectRequested ? "connecting" : "disconnected";
   }
 }
 
@@ -5138,6 +5148,37 @@ void notifyFirmwareStatus(bool force) {
   }
 }
 
+void closeOtaWifiSession() {
+  provisioning.wifiConnectRequested = false;
+  provisioning.wifiConnectInFlight = false;
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  otaWifiSession = false;
+  otaWifiSessionStartedMs = 0;
+  otaWifiConnectAttempts = 0;
+}
+
+const char *otaWifiFailureCode(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SSID_AVAIL:
+      return "missing";
+    case WL_CONNECT_FAILED:
+      return "authentication";
+    case WL_CONNECTION_LOST:
+      return "lost";
+    default:
+      return "timeout";
+  }
+}
+
+void rejectPendingOtaWifi(wl_status_t status) {
+  pendingOtaControl = "";
+  provisioning.lastWrite = String("ota_rejected_wifi_") + otaWifiFailureCode(status);
+  closeOtaWifiSession();
+  notifyFirmwareStatus(true);
+  notifyDeviceStatus(true);
+}
+
 void firmwareOtaTick() {
   static bool previouslyBlocking = false;
   otaManager.setBootHealth(displayOnline, provisioning.serviceOnline);
@@ -5171,11 +5212,7 @@ void firmwareOtaTick() {
         snapshot.phase == DragonRadarOta::Phase::Cancelled ||
         snapshot.phase == DragonRadarOta::Phase::Success ||
         snapshot.phase == DragonRadarOta::Phase::RolledBack) {
-      provisioning.wifiConnectRequested = false;
-      provisioning.wifiConnectInFlight = false;
-      WiFi.disconnect(true, false);
-      WiFi.mode(WIFI_OFF);
-      otaWifiSession = false;
+      closeOtaWifiSession();
     }
   }
   notifyFirmwareStatus(false);
@@ -5635,8 +5672,19 @@ void handleRoomStateSnapshotWrite(BLECharacteristic *characteristic) {
 
 void handleFirmwareControlWrite(BLECharacteristic *characteristic) {
   const String control = characteristicValueAsString(characteristic);
-  const bool needsNetwork = control.indexOf("\"action\":\"start\"") >= 0 ||
-                            control.indexOf("\"action\":\"retry\"") >= 0;
+  String action;
+  if (!extractJsonStringValue(control, "a", action)) {
+    extractJsonStringValue(control, "action", action);
+  }
+  const bool needsNetwork = action == "start" || action == "retry";
+  if (action == "cancel" && pendingOtaControl.length() > 0) {
+    pendingOtaControl = "";
+    provisioning.lastWrite = "ota_cancelled";
+    closeOtaWifiSession();
+    notifyFirmwareStatus(true);
+    notifyDeviceStatus(true);
+    return;
+  }
   if (kBlePhoneGatewayEnabled && needsNetwork && WiFi.status() != WL_CONNECTED) {
     if (provisioning.wifiSsid.length() == 0) {
       provisioning.lastWrite = "ota_rejected_wifi_unconfigured";
@@ -5648,10 +5696,16 @@ void handleFirmwareControlWrite(BLECharacteristic *characteristic) {
     otaWifiSession = true;
     provisioning.wifiConnectRequested = true;
     provisioning.wifiConnectInFlight = false;
+    otaWifiSessionStartedMs = millis();
+    otaWifiConnectAttempts = 0;
+    lastWifiAttemptMs = 0;
     provisioning.lastWrite = "ota_waiting_wifi";
     notifyFirmwareStatus(true);
     notifyDeviceStatus(true);
     return;
+  }
+  if (kBlePhoneGatewayEnabled && needsNetwork) {
+    otaWifiSession = true;
   }
   updateBatteryStatus(false);
   const bool accepted = otaManager.handleControlJson(
@@ -6170,9 +6224,16 @@ void provisioningTick() {
     Serial.println(static_cast<int>(wifiStatus));
   }
 
+  if (otaWifiSession && pendingOtaControl.length() > 0 && wifiStatus != WL_CONNECTED &&
+      now - otaWifiSessionStartedMs >= kOtaWifiConnectTimeoutMs) {
+    rejectPendingOtaWifi(wifiStatus);
+  }
+
   if (provisioning.wifiConnectRequested && provisioning.wifiSsid.length() > 0 &&
       wifiStatus != WL_CONNECTED &&
-      (!provisioning.wifiConnectInFlight || now - lastWifiAttemptMs > 45000)) {
+      otaWifiConnectAttempts < kOtaWifiMaxConnectAttempts &&
+      (!provisioning.wifiConnectInFlight ||
+       now - lastWifiAttemptMs >= kOtaWifiConnectRetryIntervalMs)) {
     lastWifiAttemptMs = now;
     if (provisioning.wifiConnectInFlight) {
       WiFi.disconnect(false, false);
@@ -6181,8 +6242,11 @@ void provisioningTick() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(provisioning.wifiSsid.c_str(), provisioning.wifiPassword.c_str());
     provisioning.wifiConnectInFlight = true;
+    ++otaWifiConnectAttempts;
     Serial.print("Wi-Fi connect requested ssid=");
     Serial.println(provisioning.wifiSsid);
+    Serial.print("Wi-Fi OTA attempt=");
+    Serial.println(otaWifiConnectAttempts);
   }
 
   notifyDeviceStatus(false);

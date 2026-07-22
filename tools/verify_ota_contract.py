@@ -284,8 +284,25 @@ def verify() -> None:
         ("readFirmwareStatus()", app_runtime),
         ("beginSendingAcknowledgementTimeout()", app_update),
         ("handleFirmwareControlWriteFailure", app_update),
+        ('action: "start"', app_update),
+        ("beginWifiConnectionTimeout()", app_update),
+        ('case "ota_rejected_wifi_timeout"', app_update),
     ):
         require(needle in source, f"App OTA BLE acknowledgement fallback missing: {needle}")
+
+    for needle in (
+        'extractJsonStringValue(control, "a", action)',
+        'extractJsonStringValue(control, "action", action)',
+        'const bool needsNetwork = action == "start" || action == "retry"',
+        "kOtaWifiConnectTimeoutMs = 90000",
+        "kOtaWifiMaxConnectAttempts = 3",
+        "rejectPendingOtaWifi(wifiStatus)",
+    ):
+        require(needle in firmware, f"temporary OTA Wi-Fi state machine missing: {needle}")
+    require(
+        'control.indexOf("\\\"action\\\":\\\"start\\\"")' not in firmware,
+        "OTA Wi-Fi trigger must parse compact and long action aliases instead of scanning raw JSON",
+    )
 
     require("DRAGON_RADAR_FW_SECURITY_COUNTER >= 1" in version_header, "firmware security counter floor")
     require("kSigningKeyId[] = \"local-2026-01\"" in trust_header, "embedded OTA key id")

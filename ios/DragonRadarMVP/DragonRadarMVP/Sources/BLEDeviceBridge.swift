@@ -2323,7 +2323,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         } else {
             lastWriteEvent = "雷达写入已确认"
             rememberConfirmedWrite(role)
-            if role == .pairingResponse || role == .serverConfig {
+            if role == .pairingResponse || role == .wifiConfig || role == .serverConfig {
                 readDeviceStatus()
             } else if role == .firmwareControl {
                 readFirmwareStatus()
