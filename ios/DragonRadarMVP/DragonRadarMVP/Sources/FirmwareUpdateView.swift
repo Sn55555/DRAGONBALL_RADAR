@@ -187,11 +187,11 @@ struct FirmwareUpdateView: View {
             .disabled(firmwareUpdate.phase == .canceling)
         }
 
-        if firmwareUpdate.phase == .sending, bleBridge.deviceStatus?.wifi != "connected" {
+        if shouldOfferOTANetworkRetry {
             Button {
                 showingWifiConfiguration = true
             } label: {
-                Label("更换 OTA 网络并自动重试", systemImage: "wifi.exclamationmark")
+                Label("重新写入 OTA 网络并自动重试", systemImage: "wifi.exclamationmark")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(InkButtonStyle(filled: false))
@@ -471,6 +471,12 @@ struct FirmwareUpdateView: View {
 
     private var needsInitialOTANetworkConfiguration: Bool {
         bleBridge.deviceStatus?.wifi != "connected" && recordedOTANetworkName == nil
+    }
+
+    private var shouldOfferOTANetworkRetry: Bool {
+        bleBridge.deviceStatus?.wifi != "connected"
+            && firmwareUpdate.availableRelease != nil
+            && [.sending, .failed, .rolledBack].contains(firmwareUpdate.phase)
     }
 
     private var otaNetworkGatePassed: Bool {

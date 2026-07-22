@@ -1925,6 +1925,13 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
                 deviceStatus = parsedStatus
                 lastDeviceStatusAt = Date()
                 remember(status: parsedStatus)
+                print(
+                    "DragonRadar BLE device_status "
+                        + "device=\(parsedStatus.name) wifi=\(parsedStatus.wifi) "
+                        + "ip=\(parsedStatus.ip.isEmpty ? "none" : parsedStatus.ip) "
+                        + "last=\(parsedStatus.last) fw=\(parsedStatus.firmwareVersion ?? "unknown") "
+                        + "build=\(parsedStatus.firmwareBuild ?? -1)"
+                )
             } catch {
                 lastEvent = "雷达状态格式无法解析"
                 print(
@@ -1937,6 +1944,12 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             if let parsedStatus = try? JSONDecoder().decode(RadarBLEFirmwareStatus.self, from: data) {
                 firmwareStatus = parsedStatus
                 lastFirmwareStatusAt = Date()
+                print(
+                    "DragonRadar BLE firmware_status "
+                        + "stage=\(parsedStatus.stage) progress=\(parsedStatus.progress) "
+                        + "target=\(parsedStatus.targetVersion ?? "none")/\(parsedStatus.targetBuild ?? -1) "
+                        + "error=\(parsedStatus.errorCode ?? "none")"
+                )
             }
         case .voiceControl:
             voiceControlHandler?(data)
