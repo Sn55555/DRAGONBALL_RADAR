@@ -546,10 +546,21 @@ final class FirmwareUpdateCoordinator {
             bleBridge.readDeviceStatus()
             return
         }
-        guard bleBridge.supportsFirmwareOTA else {
+        if bleBridge.firmwareOTACapability == .unsupported {
             phase = .bootstrapRequired
-            detail = "当前固件没有无线更新通道，需要先通过 USB 初始化一次"
+            detail = "雷达已明确上报当前固件不支持无线更新，需要先通过 USB 初始化一次"
             persist()
+            return
+        }
+        guard bleBridge.firmwareOTACapability == .supported else {
+            fail("尚未读取到雷达的 OTA 能力，请保持蓝牙连接后重新读取")
+            bleBridge.refreshCharacteristics()
+            bleBridge.readDeviceStatus()
+            return
+        }
+        guard bleBridge.isFirmwareOTAChannelReady else {
+            fail("当前固件支持无线更新，正在恢复 107/108 通道，请重新读取后再试")
+            bleBridge.refreshCharacteristics()
             return
         }
         guard bleBridge.deviceStatus?.isOTAPowerReady == true else {
@@ -773,8 +784,7 @@ final class FirmwareUpdateCoordinator {
     func evaluate(release: VerifiedFirmwareManifest, deviceStatus: RadarBLEDeviceStatus?) {
         let installedText = deviceStatus?.firmwareVersion ?? firmwareStatus?.firmwareVersion
         guard let installedText, let installed = FirmwareSemanticVersion(installedText) else {
-            phase = .bootstrapRequired
-            detail = "当前固件无法确认安全升级基线，需要先通过 USB 初始化一次"
+            fail("当前固件版本尚未上报，请保持蓝牙连接后重新读取")
             return
         }
         guard let minimum = release.manifest.minimumSemanticVersion, installed >= minimum else {

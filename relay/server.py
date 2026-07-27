@@ -1210,7 +1210,9 @@ class RelayStore:
                         """,
                         (existing["device_id"], user_id),
                     ).fetchone()
-            return self.device_dict(existing)
+            device = self.device_dict(existing)
+            device["registration_created"] = False
+            return device
 
         device_id = "dev_" + secrets.token_urlsafe(12)
         device_token = "ddt_" + secrets.token_urlsafe(32)
@@ -1239,7 +1241,7 @@ class RelayStore:
                     now,
                 ),
             )
-        return self.get_device_for_user(user_id, device_id) or {
+        device = self.get_device_for_user(user_id, device_id) or {
             "device_id": device_id,
             "device_short_id": short_id,
             "name": clean_name,
@@ -1248,6 +1250,8 @@ class RelayStore:
             "created_at": now,
             "updated_at": now,
         }
+        device["registration_created"] = True
+        return device
 
     def list_devices(self, user_id: str) -> list[dict[str, Any]]:
         self.ensure_user(user_id)
@@ -2755,6 +2759,7 @@ class Room:
     voice_buffer: list[dict[str, Any]] = field(default_factory=list)
     voice_live_recipient_ids: set[str] = field(default_factory=set)
     voice_ready_recipient_ids: set[str] = field(default_factory=set)
+    voice_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def expire_voice_floor(self) -> None:
         if self.speaker_group_id and time.time() >= self.speaker_until:
@@ -2897,11 +2902,11 @@ def normalize_room_code(value: str) -> str:
     clean = value.strip().upper()
     if not clean:
         raise ValueError("room_code_required")
-    # Older physical devices persist the room token in NVS. Accept the retired
-    # prefix only as an input alias so those devices reconnect after the public
-    # brand migration without ever returning the legacy code to clients.
-    if clean.startswith("KAME-"):
-        clean = "CAPS-" + clean[5:]
+    # Existing rooms and physical devices may still persist the retired KAME
+    # prefix. Keep that identifier stable until the database rows and every
+    # client/ESP reference are migrated atomically; rewriting only the incoming
+    # value makes a real KAME room look like a missing CAPS room. Newly created
+    # rooms already use the CAPS prefix through make_room_code().
     return clean
 
 
@@ -5094,6 +5099,17 @@ async def send_gateway_voice_to_apps(
 
 
 async def handle_gateway_voice_message(peer: Peer, room: Room, message: dict[str, Any]) -> None:
+    # Requests, receiver readiness, buffered replay, and live frames must remain
+    # ordered across the sender and receiver websocket tasks.
+    async with room.voice_lock:
+        await handle_gateway_voice_message_locked(peer, room, message)
+
+
+async def handle_gateway_voice_message_locked(
+    peer: Peer,
+    room: Room,
+    message: dict[str, Any],
+) -> None:
     if peer.role != "app":
         await send_json(peer, {"type": "error", "code": "voice_gateway_requires_app"})
         return
@@ -5166,15 +5182,17 @@ async def handle_gateway_voice_message(peer: Peer, room: Room, message: dict[str
         if not request_id or request_id != room.voice_request_id:
             await send_json(peer, {"type": "error", "code": "voice_request_not_active"})
             return
-        already_live = peer.member_id in room.voice_live_recipient_ids
-        room.voice_ready_recipient_ids.add(peer.member_id)
-        if not already_live:
-            for buffered in room.voice_buffer:
-                await safe_send_json(peer, buffered)
+        already_ready = peer.member_id in room.voice_ready_recipient_ids
+        replayed_frames = 0
+        if not already_ready:
+            for buffered in list(room.voice_buffer):
+                if await safe_send_json(peer, buffered):
+                    replayed_frames += 1
+            room.voice_ready_recipient_ids.add(peer.member_id)
         await send_json(peer, {
             "type": "gateway_voice_ready_ack",
             "request_id": request_id,
-            "buffered_frames": 0 if already_live else len(room.voice_buffer),
+            "buffered_frames": replayed_frames,
             "server_time": int(now),
         })
         return
@@ -5206,7 +5224,14 @@ async def handle_gateway_voice_message(peer: Peer, room: Room, message: dict[str
         room.voice_buffer.append(event)
         if len(room.voice_buffer) > 150:
             del room.voice_buffer[:-150]
-        await send_gateway_voice_to_apps(room, event, exclude_group_id=peer.group_id)
+        for target in list(room.peers.values()):
+            if (
+                target.role != "app"
+                or target.group_id == peer.group_id
+                or target.member_id not in room.voice_ready_recipient_ids
+            ):
+                continue
+            await safe_send_json(target, event)
         return
 
     if message_type == "gateway_voice_release":

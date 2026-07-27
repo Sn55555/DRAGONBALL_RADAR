@@ -83,11 +83,16 @@ enum PhysicalOTAAcceptanceCoordinator {
 
         try await wait(seconds: 30, description: "读取实体 ESP 的 101-108 GATT 通道") {
             bleBridge.isBLEConnected
-                && RadarBLECharacteristic.allCases.allSatisfy { bleBridge.hasCharacteristic($0) }
+                && RadarBLECharacteristic.requiredPhysicalAcceptanceRoles.allSatisfy {
+                    bleBridge.hasCharacteristic($0)
+                }
                 && bleBridge.pairingChallengeText.hasPrefix("CR-")
                 && bleBridge.deviceStatus != nil
         }
-        log("BLE", "connected characteristics=8")
+        log(
+            "BLE",
+            "connected characteristics=\(RadarBLECharacteristic.requiredPhysicalAcceptanceRoles.count)"
+        )
 
         guard let initialStatus = bleBridge.deviceStatus else {
             throw AcceptanceError.state("雷达状态未上报")

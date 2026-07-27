@@ -38,12 +38,34 @@ async def main():
                 "VALUES ('room-1', 'ROOM1234', 'Test', 'sender', ?, ?)",
                 (now, now),
             )
+            store.db.execute(
+                "INSERT INTO rooms (room_id, room_code, name, owner_user_id, created_at, updated_at) "
+                "VALUES ('room-legacy', 'KAME-OLD1', 'Legacy Test', 'sender', ?, ?)",
+                (now, now),
+            )
             for user_id in ("sender", "receiver"):
                 store.db.execute(
                     "INSERT INTO room_members "
                     "(room_code, member_id, user_id, joined_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                     ("ROOM1234", user_id, user_id, now, now),
                 )
+
+        assert relay.normalize_room_code(" kame-old1 ") == "KAME-OLD1"
+        assert store.get_room("KAME-OLD1") is not None
+
+        first_registration = store.register_device_challenge(
+            "sender",
+            "CR-A17C-00112233445566778899AABBCCDDEEFF",
+            name="Test Radar",
+        )
+        reused_registration = store.register_device_challenge(
+            "sender",
+            "CR-A17C-FFEEDDCCBBAA99887766554433221100",
+            name="Test Radar Again",
+        )
+        assert first_registration["registration_created"] is True
+        assert reused_registration["registration_created"] is False
+        assert reused_registration["device_id"] == first_registration["device_id"]
 
         token = "a" * 64
         subscription = store.register_ptt_subscription(
@@ -91,8 +113,45 @@ async def main():
                 "sequence": 1,
                 "audio_b64": relay.base64.b64encode(frame).decode("ascii"),
             })
-            assert any(item["type"] == "gateway_voice_frame" for item in receiver_socket.messages)
+            assert not any(item["type"] == "gateway_voice_frame" for item in receiver_socket.messages)
             assert len(room.voice_buffer) == 1
+
+            await relay.handle_gateway_voice_message(receiver, room, {
+                "type": "gateway_voice_ready", "request_id": request_id,
+            })
+            received_frames = [
+                item for item in receiver_socket.messages
+                if item["type"] == "gateway_voice_frame"
+            ]
+            assert len(received_frames) == 1
+            ready_acks = [
+                item for item in receiver_socket.messages
+                if item["type"] == "gateway_voice_ready_ack"
+            ]
+            assert ready_acks[-1]["buffered_frames"] == 1
+
+            await relay.handle_gateway_voice_message(receiver, room, {
+                "type": "gateway_voice_ready", "request_id": request_id,
+            })
+            assert len([
+                item for item in receiver_socket.messages
+                if item["type"] == "gateway_voice_frame"
+            ]) == 1
+            assert [
+                item for item in receiver_socket.messages
+                if item["type"] == "gateway_voice_ready_ack"
+            ][-1]["buffered_frames"] == 0
+
+            await relay.handle_gateway_voice_message(sender, room, {
+                "type": "gateway_voice_frame",
+                "request_id": request_id,
+                "sequence": 2,
+                "audio_b64": relay.base64.b64encode(frame).decode("ascii"),
+            })
+            assert len([
+                item for item in receiver_socket.messages
+                if item["type"] == "gateway_voice_frame"
+            ]) == 2
 
             await relay.handle_gateway_voice_message(sender, room, {
                 "type": "gateway_voice_release", "request_id": request_id,

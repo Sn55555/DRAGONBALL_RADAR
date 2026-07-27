@@ -11,8 +11,13 @@
 #include <Preferences.h>
 #include <Wire.h>
 #include <base64.h>
+#include <esp_agc.h>
+#include <esp_ns.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
+#include <esp_vad.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <host/ble_store.h>
 #include <math.h>
 #include <mbedtls/md.h>
@@ -178,9 +183,14 @@ constexpr uint8_t kAxpIrqEnable1Reg = 0x41;
 constexpr uint8_t kAxpIrqStatus1Reg = 0x49;
 constexpr uint8_t kAxpBatteryVoltageHighReg = 0x34;
 constexpr uint8_t kAxpBatteryVoltageLowReg = 0x35;
+constexpr uint8_t kAxpLdoOnOffCtrl0Reg = 0x90;
+constexpr uint8_t kAxpLdoVoltage0Reg = 0x92;
 constexpr uint8_t kAxpBatteryPercentReg = 0xA4;
 constexpr uint8_t kAxpGaugeEnableBit = 0x08;
 constexpr uint8_t kAxpBatteryPresentBit = 0x08;
+constexpr uint8_t kAxpAldo1EnableBit = 0x01;
+constexpr uint8_t kAxpAldo1VoltageMask = 0x1f;
+constexpr uint8_t kAxpAldo1Voltage3300mV = 0x1c;
 constexpr uint8_t kAxpPowerKeyLongPressBit = 0x04;
 constexpr uint8_t kAxpPowerKeyShortPressBit = 0x08;
 constexpr uint8_t kAxpSoftwareShutdownBit = 0x01;
@@ -255,7 +265,9 @@ constexpr uint8_t kAudioPrefsSchema = 2;
 constexpr size_t kRadarChordCacheSize = kRadarRadius * 2 + 1;
 constexpr uint8_t kBrightnessPercents[kBrightnessPresetCount] = {35, 55, 80, 105, 125};
 constexpr uint8_t kAudioRuntimePercents[kAudioPresetCount] = {0, 12, 32, 52, 72, 92};
-constexpr uint8_t kCodecRuntimePercents[kAudioPresetCount] = {0, 65, 65, 65, 65, 65};
+// Keep the normal voice preset aligned with the board vendor's proven ES8311
+// playback level (85%) while retaining useful lower and higher user settings.
+constexpr uint8_t kCodecRuntimePercents[kAudioPresetCount] = {0, 45, 60, 72, 85, 96};
 constexpr uint32_t kFrameRuntimeMs[kFramePresetCount] = {kFrameMs, 33, 50, 65, 80, 120};
 constexpr uint32_t kLegacyFrameRuntimeMs[] = {80, 65, 50, 120};
 constexpr const char *kRadarBleServiceUuid = "7d540100-f82d-4b2f-91c6-4f0f88aa5a11";
@@ -265,6 +277,9 @@ constexpr const char *kVoiceBleServiceUuid = "7d540200-f82d-4b2f-91c6-4f0f88aa5a
 // Room projection is also versioned as a separate service because it is added
 // after existing phones have already cached the provisioning service.
 constexpr const char *kRoomStateBleServiceUuid = "7d540300-f82d-4b2f-91c6-4f0f88aa5a11";
+// Ownership changes live on a versioned service so iPhones that have cached
+// earlier provisioning services can still discover the release control.
+constexpr const char *kOwnerBleServiceUuid = "7d540400-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kPairingChallengeUuid = "7d540101-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kPairingResponseUuid = "7d540102-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kWifiConfigUuid = "7d540103-f82d-4b2f-91c6-4f0f88aa5a11";
@@ -277,6 +292,9 @@ constexpr const char *kVoiceControlUuid = "7d540109-f82d-4b2f-91c6-4f0f88aa5a11"
 constexpr const char *kVoiceAudioUplinkUuid = "7d54010a-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kVoiceAudioDownlinkUuid = "7d54010b-f82d-4b2f-91c6-4f0f88aa5a11";
 constexpr const char *kRoomStateSnapshotUuid = "7d540301-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr const char *kOwnerControlUuid = "7d540401-f82d-4b2f-91c6-4f0f88aa5a11";
+constexpr uint32_t kOwnerReleasePrepareWindowMs = 60000;
+constexpr uint32_t kOwnerReleaseCommitDelayMs = 1200;
 constexpr uint32_t kDeviceStatusNotifyMs = 2000;
 constexpr uint32_t kScreenOffDeviceStatusNotifyMs = 10000;
 constexpr uint32_t kStandbyDeviceStatusNotifyMs = 30000;
@@ -305,11 +323,41 @@ constexpr uint32_t kVoiceSampleTickMs = 20;
 constexpr uint32_t kAudioIdleSuspendMs = 3000;
 constexpr uint32_t kVoiceFrameTickMs = 20;
 constexpr uint16_t kVoiceFrameDurationMs = 20;
+constexpr uint32_t kAudioIoTimeoutMs = 30;
+constexpr uint32_t kVoicePlaybackTailMs = 350;
+constexpr uint8_t kVoiceAmplifierWarmupMs = 5;
 constexpr uint16_t kVoiceVadRmsThreshold = 650;
 constexpr uint16_t kVoiceVadPeakThreshold = 1600;
 constexpr uint16_t kVoiceFrameSamples = (kAudioSampleRate * kVoiceFrameDurationMs) / 1000;
 constexpr size_t kVoicePcmBytes = kVoiceFrameSamples * sizeof(int16_t);
+constexpr uint8_t kBleVoiceEventQueueDepth = 18;
+constexpr uint8_t kBleVoiceEventsPerTick = 6;
+constexpr uint8_t kBleVoicePlaybackMaxBufferedFrames = 4;
+constexpr uint16_t kVoicePlaybackTargetPeak = 24000;
+constexpr uint16_t kVoicePlaybackUnityGainQ8 = 256;
+constexpr uint16_t kVoicePlaybackMaxGainQ8[kAudioPresetCount] = {
+    0, 256, 256, 256, 256, 256};
+// ES8311 register 0x32 is a 0.5 dB/step DAC gain control, not a linear
+// percentage. Use a speech-specific curve that restores useful loudness while
+// keeping preset 5 14 dB below the previous +26.5 dB reverberant setting.
+// Other sounds continue to use kCodecRuntimePercents unchanged.
+constexpr uint8_t kVoicePlaybackCodecRegisters[kAudioPresetCount] = {
+    0x00, 0xA7, 0xB7, 0xC7, 0xCF, 0xD8};  // off, -12, -4, +4, +8, +12.5 dB
+constexpr uint16_t kVoiceCaptureUnityGainQ8 = 256;
+constexpr uint16_t kVoiceDspSubframeSamples = kAudioSampleRate / 100;
+constexpr uint16_t kVoiceDspSubframeMs = 10;
+constexpr uint16_t kVoiceVadMinSpeechMs = 40;
+constexpr uint16_t kVoiceVadMinNoiseMs = 60;
+constexpr int kVoiceNoiseSuppressionMode = 0;
+constexpr int kVoiceAgcCompressionGainDb = 15;
+constexpr int kVoiceAgcTargetLevelDbfs = 6;
+static_assert(
+    kVoiceFrameSamples == kVoiceDspSubframeSamples * 2,
+    "Voice DSP requires one 20 ms frame split into two 10 ms subframes.");
 constexpr uint8_t kEs7210Address = 0x40;
+// Waveshare's current ESP-IDF spectrum example for this exact 1.75C board
+// drives the physical MIC1/MIC2 inputs at +24 dB (ES7210 gain code 0x08).
+constexpr uint8_t kEs7210PhysicalMicGainRegister = 0x08;
 constexpr float kEarthRadiusM = 6371000.0f;
 constexpr float kRemoteRadarFullScaleM = 5000.0f;
 constexpr uint32_t kSelfLocationPersistMinIntervalMs = 20000;
@@ -373,6 +421,7 @@ enum class RadarGattWriteRole : uint8_t {
   VoiceControl,
   VoiceAudioDownlink,
   RoomStateSnapshot,
+  OwnerControl,
 };
 
 enum class RadarUiMode : uint8_t {
@@ -593,6 +642,7 @@ struct AudioTone {
 struct VoiceCaptureState {
   bool captureOnline = false;
   bool muted = false;
+  bool pttPending = false;
   bool pttActive = false;
   bool vadActive = false;
   bool playbackActive = false;
@@ -603,6 +653,11 @@ struct VoiceCaptureState {
   uint32_t lastSampleMs = 0;
   uint32_t lastFrameMs = 0;
   uint32_t lastPlaybackMs = 0;
+  uint16_t captureGainQ8 = kVoiceCaptureUnityGainQ8;
+  uint32_t micNoiseRmsQ8[2] = {0, 0};
+  uint8_t selectedMic = 0;
+  uint8_t candidateMic = 0;
+  uint8_t candidateMicFrames = 0;
 };
 
 struct BleVoiceGatewayState {
@@ -612,6 +667,31 @@ struct BleVoiceGatewayState {
   uint32_t lastUplinkMs = 0;
   uint32_t uplinkDrops = 0;
   uint32_t downlinkDrops = 0;
+  uint32_t controlDrops = 0;
+  uint16_t playbackGainQ8 = kVoicePlaybackUnityGainQ8;
+  uint16_t lastPlaybackRms = 0;
+  uint16_t lastPlaybackPeak = 0;
+  size_t lastPlaybackBytesWritten = 0;
+};
+
+enum class BleVoiceEventKind : uint8_t {
+  GatewayReady,
+  GatewayUnavailable,
+  PttGranted,
+  PttCancel,
+  RemoteBegin,
+  RemoteEnd,
+  Sleep,
+  GatewayDisconnected,
+  AudioFrame,
+  Invalid,
+  Unknown,
+};
+
+struct BleVoiceEvent {
+  BleVoiceEventKind kind = BleVoiceEventKind::Unknown;
+  uint16_t packetBytes = 0;
+  uint8_t packet[kFirmwareStatusNotifySafeBytes] = {0};
 };
 
 struct BatteryStatus {
@@ -841,6 +921,25 @@ float gridGestureScale = 1.0f;
 float edgeGestureLastAngle = 0.0f;
 wl_status_t lastLoggedWifiStatus = WL_IDLE_STATUS;
 String lastFirmwareStatusJson;
+bool ownerReleasePrepared = false;
+uint32_t ownerReleasePreparedAtMs = 0;
+bool ownerReleaseCommitPending = false;
+uint32_t ownerReleaseCommitAtMs = 0;
+QueueHandle_t bleVoiceEventQueue = nullptr;
+ns_handle_t voiceCaptureNoiseSuppressor = nullptr;
+vad_handle_t voiceCaptureVad = nullptr;
+void *voiceCaptureAgc = nullptr;
+bool voiceCaptureDspOnline = false;
+bool voiceCaptureDspFailureLogged = false;
+// These buffers live for the lifetime of the firmware because the Arduino
+// loopTask stack is not large enough for five simultaneous 20 ms PCM frames.
+// Capture and DSP run synchronously on loopTask, so no other task accesses
+// them concurrently.
+alignas(16) int16_t voiceCaptureStereoPcm[kVoiceFrameSamples * 2];
+alignas(16) int16_t voiceCaptureFirstMicPcm[kVoiceFrameSamples];
+alignas(16) int16_t voiceCaptureSecondMicPcm[kVoiceFrameSamples];
+alignas(16) int16_t voiceCaptureProcessedPcm[kVoiceFrameSamples];
+alignas(16) int16_t voiceCaptureNoiseSuppressedPcm[kVoiceFrameSamples];
 
 void startTone(float frequency, uint16_t durationMs, int16_t level, bool force);
 void setupProvisioningBle();
@@ -887,12 +986,30 @@ void toggleSystemMenu();
 void wakeRadarDisplay();
 void systemUiTick();
 void beginShutdownFallback();
-void clearProvisioningAndRestart();
+void clearProvisioningAndRestart(const char *title = "BINDING RESET");
 void drawCurrentModeFrame();
 void handleBootShortPress();
 void setupPowerButton();
 void pollPowerButton();
 void notifyVoiceControl(const char *event, const char *reason = nullptr);
+void setupBleVoiceEventQueue();
+void bleVoiceGatewayTick();
+void setupVoiceCaptureDsp();
+void resetVoiceCaptureDspState();
+bool processVoiceCaptureDsp(
+    int16_t *input,
+    size_t sampleCount,
+    int16_t *output,
+    bool &speechDetected);
+uint8_t selectVoiceCaptureMic(
+    uint16_t firstRms,
+    uint16_t secondRms,
+    uint16_t firstPeak,
+    uint16_t secondPeak);
+void playRemoteVoicePcm(
+    const uint8_t *pcmBytes,
+    size_t byteLen,
+    bool speechActive = true);
 
 float degToRad(float deg) {
   return deg * kPi / 180.0f;
@@ -1621,6 +1738,7 @@ bool radarUiOverlayActive() {
 bool northCalibrationInteractive(uint32_t now) {
   return radarUiMode == RadarUiMode::Main &&
          !otaManager.shouldShowOverlay() &&
+         !voiceCapture.pttPending &&
          !voiceCapture.pttActive &&
          now >= displaySelfTestUntilMs;
 }
@@ -1716,7 +1834,7 @@ void wakeRadarDisplay() {
 }
 
 void toggleSystemMenu() {
-  if (voiceCapture.pttActive) {
+  if (voiceCapture.pttPending || voiceCapture.pttActive) {
     return;
   }
   if (radarUiMode == RadarUiMode::ScreenOff || radarUiMode == RadarUiMode::Standby) {
@@ -1746,7 +1864,7 @@ void beginShutdownFallback() {
   if (radarUiMode == RadarUiMode::ShutdownPending) {
     return;
   }
-  if (voiceCapture.pttActive) {
+  if (voiceCapture.pttPending || voiceCapture.pttActive) {
     endPushToTalk();
   }
   tone.active = false;
@@ -2148,6 +2266,46 @@ bool axpWrite(uint8_t reg, uint8_t value) {
   return Wire.endTransmission() == 0;
 }
 
+bool ensureAudioAnalogPower() {
+  uint8_t enabled = 0;
+  uint8_t voltage = 0;
+  if (!axpRead(kAxpLdoOnOffCtrl0Reg, enabled) ||
+      !axpRead(kAxpLdoVoltage0Reg, voltage)) {
+    return false;
+  }
+  if (kSerialDiagnostics) {
+    Serial.print("DIAG audio_power before_enable=");
+    Serial.print((enabled & kAxpAldo1EnableBit) ? 1 : 0);
+    Serial.print(" before_code=");
+    Serial.println(voltage & kAxpAldo1VoltageMask);
+  }
+
+  const uint8_t configuredVoltage =
+      (voltage & ~kAxpAldo1VoltageMask) | kAxpAldo1Voltage3300mV;
+  if (!axpWrite(kAxpLdoVoltage0Reg, configuredVoltage) ||
+      !axpWrite(kAxpLdoOnOffCtrl0Reg, enabled | kAxpAldo1EnableBit)) {
+    return false;
+  }
+  delay(2);
+
+  uint8_t verifiedEnabled = 0;
+  uint8_t verifiedVoltage = 0;
+  const bool verified =
+      axpRead(kAxpLdoOnOffCtrl0Reg, verifiedEnabled) &&
+      axpRead(kAxpLdoVoltage0Reg, verifiedVoltage) &&
+      (verifiedEnabled & kAxpAldo1EnableBit) != 0 &&
+      (verifiedVoltage & kAxpAldo1VoltageMask) == kAxpAldo1Voltage3300mV;
+  if (kSerialDiagnostics) {
+    Serial.print("DIAG audio_power enabled=");
+    Serial.print((verifiedEnabled & kAxpAldo1EnableBit) ? 1 : 0);
+    Serial.print(" code=");
+    Serial.print(verifiedVoltage & kAxpAldo1VoltageMask);
+    Serial.print(" result=");
+    Serial.println(verified ? "ok" : "failed");
+  }
+  return verified;
+}
+
 bool requestAxp2101Shutdown() {
   uint8_t commonConfig = 0;
   if (!axpRead(kAxpCommonConfigReg, commonConfig)) {
@@ -2247,7 +2405,7 @@ void pollPowerButton() {
 
   lastUserInputMs = now;
   if ((keyStatus & kAxpPowerKeyLongPressBit) != 0) {
-    if (voiceCapture.pttActive) {
+    if (voiceCapture.pttPending || voiceCapture.pttActive) {
       return;
     }
     if (radarUiMode == RadarUiMode::PowerConfirm) {
@@ -2294,6 +2452,13 @@ bool applyCodecOutputVolumePercent(uint8_t percent) {
   return codecWrite(0x32, codecVolumeRegister(percent));
 }
 
+bool applyVoicePlaybackCodecVolume() {
+  if (!audioOnline || audioPreset >= kAudioPresetCount) {
+    return false;
+  }
+  return codecWrite(0x32, kVoicePlaybackCodecRegisters[audioPreset]);
+}
+
 bool setCodecOutputMuted(bool muted) {
   uint8_t reg = 0;
   if (!codecRead(0x31, reg)) {
@@ -2330,11 +2495,43 @@ bool beginI2sBus(uint32_t sampleRate) {
   audioTxFailureLogged = false;
   audioRxFailureLogged = false;
 
+  // The current Waveshare BSP fixes this board's audio bus to I2S1. ESP_I2S
+  // otherwise requests I2S_NUM_AUTO and normally takes I2S0 first. Reserve the
+  // first controller during allocation so the wrapper selects the board's
+  // documented controller, then release the temporary channel immediately.
+  i2s_chan_handle_t i2s0Reservation = nullptr;
+  i2s_chan_config_t reserveConfig =
+      I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  const bool reservedI2s0 =
+      i2s_new_channel(&reserveConfig, &i2s0Reservation, nullptr) == ESP_OK;
   i2s.setPins(PIN_ES7210_BCLK, PIN_ES7210_LRCK, PIN_ES8311_DOUT, PIN_ES7210_DIN, PIN_ES7210_MCLK);
-  if (!i2s.begin(I2S_MODE_STD, sampleRate, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+  const bool started =
+      i2s.begin(I2S_MODE_STD, sampleRate, I2S_DATA_BIT_WIDTH_16BIT,
+                I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH);
+  if (i2s0Reservation) {
+    i2s_del_channel(i2s0Reservation);
+  }
+  if (!started) {
     return false;
   }
-  i2s.setTimeout(1);
+  if (kSerialDiagnostics) {
+    i2s_chan_info_t channelInfo = {};
+    Serial.print("DIAG i2s reserve0=");
+    Serial.print(reservedI2s0 ? 1 : 0);
+    if (i2s_channel_get_info(i2s.rxChan(), &channelInfo) == ESP_OK) {
+      Serial.print(" port=");
+      Serial.print(static_cast<int>(channelInfo.id));
+      Serial.print(" mclk=");
+      Serial.print(channelInfo.mclk_hz);
+      Serial.print(" bclk=");
+      Serial.print(channelInfo.bclk_hz);
+    }
+    Serial.println();
+  }
+  // A stereo 16-bit voice frame contains 20 ms of samples. A 1 ms timeout
+  // caused otherwise healthy DMA reads/writes to return before a frame was
+  // complete, so allow one full frame plus scheduling margin.
+  i2s.setTimeout(kAudioIoTimeoutMs);
   return true;
 }
 
@@ -2385,21 +2582,24 @@ bool setupEs7210Adc16k() {
 
   ok &= es7210Write(0x00, 0xff);
   ok &= es7210Write(0x00, 0x41);
-  ok &= es7210Write(0x01, 0x1f);
+  ok &= es7210Write(0x01, 0x3f);
   ok &= es7210Write(0x09, 0x30);
   ok &= es7210Write(0x0a, 0x30);
-  ok &= es7210Write(0x40, 0xc3);
+  ok &= es7210Write(0x23, 0x2a);
+  ok &= es7210Write(0x22, 0x0a);
+  ok &= es7210Write(0x20, 0x0a);
+  ok &= es7210Write(0x21, 0x2a);
+  ok &= es7210Update(0x08, 0x01, 0x00);
+  ok &= es7210Write(0x40, 0x43);
   ok &= es7210Write(0x41, 0x70);
   ok &= es7210Write(0x42, 0x70);
 
+  // Official 4.096 MHz MCLK / 16 kHz coefficients require ADC divider 1,
+  // clock doubler enabled and DLL enabled: 0x01 | 0x40 | 0x80 = 0xC1.
   ok &= es7210Write(0x02, 0xc1);
   ok &= es7210Write(0x07, 0x20);
   ok &= es7210Write(0x04, 0x01);
   ok &= es7210Write(0x05, 0x00);
-  // 0xC1 is only the ES7210 clock-state reset value. For a 4.096 MHz
-  // MCLK and 16 kHz LRCK the running divider must be 0x01; leaving the
-  // reset bits enabled produces near-zero PCM even though the ADC responds.
-  ok &= es7210Write(0x02, 0x01);
 
   for (uint8_t reg = 0x43; reg <= 0x46; ++reg) {
     ok &= es7210Update(reg, 0x10, 0x00);
@@ -2407,43 +2607,53 @@ bool setupEs7210Adc16k() {
   ok &= es7210Write(0x4b, 0xff);
   ok &= es7210Write(0x4c, 0xff);
 
+  // This board routes its two physical microphones to MIC1/MIC2 and SDOUT1.
   ok &= es7210Update(0x01, 0x0b, 0x00);
   ok &= es7210Write(0x4b, 0x00);
   ok &= es7210Update(0x43, 0x10, 0x10);
-  ok &= es7210Update(0x01, 0x0b, 0x00);
-  ok &= es7210Write(0x4b, 0x00);
   ok &= es7210Update(0x44, 0x10, 0x10);
-  ok &= es7210Update(0x01, 0x15, 0x00);
-  ok &= es7210Write(0x4c, 0x00);
-  ok &= es7210Update(0x45, 0x10, 0x10);
-  ok &= es7210Update(0x01, 0x15, 0x00);
-  ok &= es7210Write(0x4c, 0x00);
-  ok &= es7210Update(0x46, 0x10, 0x10);
 
   ok &= es7210Update(0x11, 0xe0, 0x60);
   ok &= es7210Update(0x11, 0x03, 0x00);
   ok &= es7210Write(0x12, 0x00);
 
-  ok &= es7210Update(0x43, 0x0f, 0x00);
-  ok &= es7210Update(0x44, 0x0f, 0x00);
-  ok &= es7210Update(0x45, 0x0f, 0x0e);
-  ok &= es7210Update(0x46, 0x0f, 0x0e);
+  ok &= es7210Update(0x43, 0x0f, kEs7210PhysicalMicGainRegister);
+  ok &= es7210Update(0x44, 0x0f, kEs7210PhysicalMicGainRegister);
+  ok &= es7210Update(0x45, 0x0f, 0x00);
+  ok &= es7210Update(0x46, 0x0f, 0x00);
 
-  ok &= es7210Write(0x01, 0x00);
   ok &= es7210Write(0x06, 0x00);
-  ok &= es7210Write(0x47, 0x00);
-  ok &= es7210Write(0x48, 0x00);
-  ok &= es7210Write(0x49, 0x00);
-  ok &= es7210Write(0x4a, 0x00);
+  ok &= es7210Write(0x40, 0x43);
+  ok &= es7210Write(0x47, 0x08);
+  ok &= es7210Write(0x48, 0x08);
+  ok &= es7210Write(0x49, 0x08);
+  ok &= es7210Write(0x4a, 0x08);
   ok &= es7210Write(0x4b, 0x00);
-  ok &= es7210Write(0x4c, 0x00);
+  ok &= es7210Write(0x4c, 0xff);
+  // The current Espressif ES7210 start sequence latches the analog and clock
+  // state with this final reset transition. Without it, I2C remains online but
+  // SDOUT1 carries only near-zero samples.
+  ok &= es7210Write(0x00, 0x71);
+  ok &= es7210Write(0x00, 0x41);
 
   if (kSerialDiagnostics) {
-    uint8_t chipState = 0;
-    if (es7210Read(0x01, chipState)) {
-      Serial.print("DIAG es7210 clock=");
-      Serial.println(chipState, HEX);
+    constexpr uint8_t kDiagnosticRegisters[] = {
+        0x01, 0x02, 0x06, 0x11, 0x12, 0x40, 0x41, 0x42,
+        0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a,
+        0x4b, 0x4c};
+    Serial.print("DIAG es7210 regs=");
+    for (size_t i = 0; i < sizeof(kDiagnosticRegisters); ++i) {
+      uint8_t value = 0;
+      if (es7210Read(kDiagnosticRegisters[i], value)) {
+        if (i > 0) {
+          Serial.print(',');
+        }
+        Serial.print(kDiagnosticRegisters[i], HEX);
+        Serial.print(':');
+        Serial.print(value, HEX);
+      }
     }
+    Serial.println();
   }
   return ok;
 }
@@ -2478,6 +2688,23 @@ bool configureAudioTx(uint32_t sampleRate) {
 bool configureAudioRx() {
   if (!voiceInputOnline) {
     return false;
+  }
+  // TX and RX share the I2S1 clock in full-duplex mode. Keep both sides in the
+  // same stereo format and select the stronger MIC1/MIC2 sample below.
+  if (i2s.rxSampleRate() != kAudioSampleRate ||
+      i2s.rxDataWidth() != I2S_DATA_BIT_WIDTH_16BIT ||
+      i2s.rxSlotMode() != I2S_SLOT_MODE_STEREO) {
+    if (!i2s.configureRX(
+            kAudioSampleRate,
+            I2S_DATA_BIT_WIDTH_16BIT,
+            I2S_SLOT_MODE_STEREO,
+            I2S_RX_TRANSFORM_NONE)) {
+      if (!audioRxFailureLogged) {
+        Serial.println("I2S RX stereo configure failed.");
+        audioRxFailureLogged = true;
+      }
+      return false;
+    }
   }
   audioRxConfigured = true;
   audioRxFailureLogged = false;
@@ -2705,6 +2932,9 @@ void setupBootAudio() {
   digitalWrite(PA, LOW);
   speakerMutedForCapture = false;
 
+  if (!ensureAudioAnalogPower()) {
+    Serial.println("AXP2101 audio analog rail setup failed.");
+  }
   voiceInputOnline = false;
   voiceCapture.captureOnline = false;
   if (!beginI2sBus(kBootAudioSampleRate)) {
@@ -2728,6 +2958,9 @@ void setupAudio() {
   digitalWrite(PA, LOW);
   speakerMutedForCapture = false;
 
+  if (!ensureAudioAnalogPower()) {
+    Serial.println("AXP2101 audio analog rail setup failed.");
+  }
   if (!beginI2sBus(kAudioSampleRate)) {
     audioOnline = false;
     voiceInputOnline = false;
@@ -2750,6 +2983,204 @@ void setupAudio() {
   powerResources.lastAudioActivityMs = millis();
   Serial.println(audioOnline ? "ES8311 audio online." : "ES8311 codec offline.");
   Serial.println(voiceInputOnline ? "ES7210 mic online." : "ES7210 mic offline.");
+}
+
+void setupVoiceCaptureDsp() {
+  if (voiceCaptureDspOnline) {
+    return;
+  }
+
+  if (voiceCaptureNoiseSuppressor) {
+    ns_destroy(voiceCaptureNoiseSuppressor);
+    voiceCaptureNoiseSuppressor = nullptr;
+  }
+  if (voiceCaptureVad) {
+    vad_destroy(voiceCaptureVad);
+    voiceCaptureVad = nullptr;
+  }
+  if (voiceCaptureAgc) {
+    esp_agc_close(voiceCaptureAgc);
+    voiceCaptureAgc = nullptr;
+  }
+
+  // Keep the existing 20 ms BLE/ADPCM contract. Espressif's professional NS
+  // and WebRTC AGC both operate on 10 ms subframes at 16 kHz.
+  voiceCaptureNoiseSuppressor = ns_pro_create(
+      kVoiceDspSubframeMs,
+      kVoiceNoiseSuppressionMode,
+      kAudioSampleRate);
+  voiceCaptureVad = vad_create_with_param(
+      VAD_MODE_2,
+      kAudioSampleRate,
+      kVoiceFrameDurationMs,
+      kVoiceVadMinSpeechMs,
+      kVoiceVadMinNoiseMs);
+  voiceCaptureAgc = esp_agc_open(AGC_MODE_3, kAudioSampleRate);
+
+  voiceCaptureDspOnline =
+      voiceCaptureNoiseSuppressor &&
+      voiceCaptureVad &&
+      voiceCaptureAgc;
+  if (!voiceCaptureDspOnline) {
+    if (voiceCaptureNoiseSuppressor) {
+      ns_destroy(voiceCaptureNoiseSuppressor);
+      voiceCaptureNoiseSuppressor = nullptr;
+    }
+    if (voiceCaptureVad) {
+      vad_destroy(voiceCaptureVad);
+      voiceCaptureVad = nullptr;
+    }
+    if (voiceCaptureAgc) {
+      esp_agc_close(voiceCaptureAgc);
+      voiceCaptureAgc = nullptr;
+    }
+    Serial.println("Voice DSP offline; using unamplified microphone PCM.");
+    return;
+  }
+
+  set_agc_config(
+      voiceCaptureAgc,
+      kVoiceAgcCompressionGainDb,
+      1,
+      kVoiceAgcTargetLevelDbfs);
+  voiceCaptureDspFailureLogged = false;
+  Serial.println("Voice DSP online: NS mild, VAD mode 2, fixed AGC +15 dB.");
+}
+
+void resetVoiceCaptureDspState() {
+  if (voiceCaptureVad) {
+    vad_reset_trigger(voiceCaptureVad);
+  }
+  voiceCapture.candidateMic = voiceCapture.selectedMic;
+  voiceCapture.candidateMicFrames = 0;
+  voiceCaptureDspFailureLogged = false;
+}
+
+uint8_t selectVoiceCaptureMic(
+    uint16_t firstRms,
+    uint16_t secondRms,
+    uint16_t firstPeak,
+    uint16_t secondPeak) {
+  const uint16_t rms[2] = {firstRms, secondRms};
+  const uint16_t peak[2] = {firstPeak, secondPeak};
+  if (voiceCapture.micNoiseRmsQ8[0] == 0 ||
+      voiceCapture.micNoiseRmsQ8[1] == 0) {
+    voiceCapture.micNoiseRmsQ8[0] =
+        static_cast<uint32_t>(max<uint16_t>(firstRms, 1)) << 8;
+    voiceCapture.micNoiseRmsQ8[1] =
+        static_cast<uint32_t>(max<uint16_t>(secondRms, 1)) << 8;
+  }
+
+  uint32_t scoreQ8[2] = {0, 0};
+  for (uint8_t mic = 0; mic < 2; ++mic) {
+    const uint32_t noiseQ8 =
+        max<uint32_t>(voiceCapture.micNoiseRmsQ8[mic], 1U << 8);
+    scoreQ8[mic] = static_cast<uint32_t>(
+        (static_cast<uint64_t>(rms[mic]) << 16) / noiseQ8);
+
+    const uint32_t sampleQ8 =
+        static_cast<uint32_t>(max<uint16_t>(rms[mic], 1)) << 8;
+    if (sampleQ8 < noiseQ8) {
+      // Follow a quieter room quickly.
+      voiceCapture.micNoiseRmsQ8[mic] =
+          (noiseQ8 * 7U + sampleQ8) / 8U;
+    } else if (!voiceCapture.vadActive) {
+      // Adapt slowly while the previous frame was non-speech. Once VAD is
+      // active, freeze upward adaptation so speech and reflections never
+      // become the learned noise floor.
+      voiceCapture.micNoiseRmsQ8[mic] =
+          (noiseQ8 * 127U + sampleQ8) / 128U;
+    }
+  }
+
+  const uint8_t current = min<uint8_t>(voiceCapture.selectedMic, 1);
+  const uint8_t alternate = current == 0 ? 1 : 0;
+  const bool currentInvalid =
+      peak[current] <= 4 && peak[alternate] > 16;
+  const bool alternateClearlyBetter =
+      currentInvalid ||
+      (scoreQ8[alternate] * 4U > scoreQ8[current] * 5U);
+  if (!alternateClearlyBetter) {
+    voiceCapture.candidateMic = current;
+    voiceCapture.candidateMicFrames = 0;
+    return current;
+  }
+
+  if (voiceCapture.candidateMic != alternate) {
+    voiceCapture.candidateMic = alternate;
+    voiceCapture.candidateMicFrames = 1;
+    return current;
+  }
+  if (voiceCapture.candidateMicFrames < UINT8_MAX) {
+    ++voiceCapture.candidateMicFrames;
+  }
+  if (currentInvalid || voiceCapture.candidateMicFrames >= 3) {
+    voiceCapture.selectedMic = alternate;
+    voiceCapture.candidateMicFrames = 0;
+  }
+  return voiceCapture.selectedMic;
+}
+
+bool processVoiceCaptureDsp(
+    int16_t *input,
+    size_t sampleCount,
+    int16_t *output,
+    bool &speechDetected) {
+  speechDetected = false;
+  if (!input || !output || sampleCount == 0) {
+    return false;
+  }
+  if (!voiceCaptureDspOnline ||
+      sampleCount != kVoiceFrameSamples ||
+      (sampleCount % kVoiceDspSubframeSamples) != 0) {
+    memcpy(output, input, sampleCount * sizeof(int16_t));
+    return false;
+  }
+
+  for (size_t offset = 0;
+       offset < sampleCount;
+       offset += kVoiceDspSubframeSamples) {
+    ns_process(
+        voiceCaptureNoiseSuppressor,
+        input + offset,
+        voiceCaptureNoiseSuppressedPcm + offset);
+  }
+
+  speechDetected =
+      vad_process_with_trigger(
+          voiceCaptureVad,
+          voiceCaptureNoiseSuppressedPcm) == VAD_SPEECH;
+  if (!speechDetected) {
+    // Never normalize room tone or late reflections up to speech level.
+    memcpy(
+        output,
+        voiceCaptureNoiseSuppressedPcm,
+        sampleCount * sizeof(int16_t));
+    return true;
+  }
+
+  for (size_t offset = 0;
+       offset < sampleCount;
+       offset += kVoiceDspSubframeSamples) {
+    const int result = esp_agc_process(
+        voiceCaptureAgc,
+        voiceCaptureNoiseSuppressedPcm + offset,
+        output + offset,
+        kVoiceDspSubframeSamples,
+        kAudioSampleRate);
+    if (result != ESP_AGC_SUCCESS) {
+      memcpy(
+          output + offset,
+          voiceCaptureNoiseSuppressedPcm + offset,
+          kVoiceDspSubframeSamples * sizeof(int16_t));
+      if (!voiceCaptureDspFailureLogged) {
+        Serial.print("Voice AGC frame failed code=");
+        Serial.println(result);
+        voiceCaptureDspFailureLogged = true;
+      }
+    }
+  }
+  return true;
 }
 
 void runBootAnimation() {
@@ -3440,7 +3871,7 @@ void resumeDisplayPower() {
 }
 
 void suspendRuntimeAudio(const char *reason) {
-  if (voiceCapture.pttActive) {
+  if (voiceCapture.pttPending || voiceCapture.pttActive) {
     return;
   }
   tone.active = false;
@@ -3841,7 +4272,7 @@ void pollButtons() {
 
   if (!pressed && bootButtonWasPressed) {
     const uint32_t heldMs = bootButtonPressedAtMs > 0 ? now - bootButtonPressedAtMs : 0;
-    if (bootButtonLongHandled && voiceCapture.pttActive) {
+    if (bootButtonLongHandled && (voiceCapture.pttPending || voiceCapture.pttActive)) {
       endPushToTalk();
       lastButtonMs = now;
     } else if (!bootButtonLongHandled && heldMs >= kButtonDebounceMs && now - lastButtonMs > 160) {
@@ -4769,7 +5200,7 @@ void saveProvisioningState() {
   prefs.end();
 }
 
-void clearProvisioningAndRestart() {
+void clearProvisioningAndRestart(const char *title) {
   if (otaManager.blocksPowerAndVoice()) {
     provisioning.lastWrite = "ota_factory_reset_blocked";
     notifyDeviceStatus(true);
@@ -4790,7 +5221,7 @@ void clearProvisioningAndRestart() {
   }
 
   gfx->fillScreen(kScreenBg);
-  drawCenteredText("BINDING RESET", kCx, kCy - 18, 2, kAmber);
+  drawCenteredText(title && title[0] != '\0' ? title : "BINDING RESET", kCx, kCy - 18, 2, kAmber);
   drawCenteredText("RESTARTING", kCx, kCy + 22, 1, kGrid);
   gfx->flush();
   Serial.println("BLE provisioning physically reset by local hold");
@@ -5061,6 +5492,8 @@ String buildDeviceStatusJson(bool includeExtendedState = false, bool compactBleS
     status += voiceCapture.muted ? "1" : "0";
     status += ",\"ptt\":";
     status += voiceCapture.pttActive ? "1" : "0";
+    status += ",\"ptt_pending\":";
+    status += voiceCapture.pttPending ? "1" : "0";
     status += ",\"vad\":";
     status += voiceCapture.vadActive ? "1" : "0";
     status += ",\"playback\":";
@@ -5189,7 +5622,8 @@ void firmwareOtaTick() {
     tone.remainingSamples = 0;
     bootAudioPlaying = false;
     voiceCapture.playbackActive = false;
-    if (voiceCapture.pttActive || speakerMutedForCapture) {
+    if (voiceCapture.pttPending || voiceCapture.pttActive || speakerMutedForCapture) {
+      voiceCapture.pttPending = false;
       voiceCapture.pttActive = false;
       voiceCapture.vadActive = false;
       setSpeakerMutedForCapture(false);
@@ -5713,7 +6147,7 @@ void handleFirmwareControlWrite(BLECharacteristic *characteristic) {
       provisioning.paired,
       batteryStatus.percent,
       batteryStatus.charging,
-      voiceCapture.pttActive,
+      voiceCapture.pttPending || voiceCapture.pttActive,
       WiFi.status() == WL_CONNECTED,
       provisioning.deviceToken,
       provisioning.httpApiUrl);
@@ -5742,49 +6176,125 @@ void notifyVoiceControl(const char *event, const char *reason) {
   voiceControlCharacteristic->notify();
 }
 
+BleVoiceEventKind bleVoiceEventKindForCommand(const String &command) {
+  if (command == "gateway_ready") return BleVoiceEventKind::GatewayReady;
+  if (command == "gateway_unavailable") return BleVoiceEventKind::GatewayUnavailable;
+  if (command == "ptt_granted") return BleVoiceEventKind::PttGranted;
+  if (command == "ptt_cancel") return BleVoiceEventKind::PttCancel;
+  if (command == "remote_begin") return BleVoiceEventKind::RemoteBegin;
+  if (command == "remote_end") return BleVoiceEventKind::RemoteEnd;
+  if (command == "sleep") return BleVoiceEventKind::Sleep;
+  return BleVoiceEventKind::Unknown;
+}
+
+bool enqueueBleVoiceEvent(const BleVoiceEvent &event, TickType_t waitTicks = 0) {
+  if (!bleVoiceEventQueue ||
+      xQueueSend(bleVoiceEventQueue, &event, waitTicks) != pdTRUE) {
+    uint32_t *dropCounter = event.kind == BleVoiceEventKind::AudioFrame
+                                ? &bleVoiceGateway.downlinkDrops
+                                : &bleVoiceGateway.controlDrops;
+    __atomic_add_fetch(dropCounter, 1U, __ATOMIC_RELAXED);
+    return false;
+  }
+  return true;
+}
+
 void handleVoiceControlWrite(BLECharacteristic *characteristic) {
   const String json = characteristicValueAsString(characteristic);
   String command;
   if (!extractJsonStringValue(json, "command", command)) {
-    provisioning.lastWrite = "voice_control_invalid";
-    notifyDeviceStatus(true);
+    BleVoiceEvent invalidEvent;
+    invalidEvent.kind = BleVoiceEventKind::Invalid;
+    enqueueBleVoiceEvent(invalidEvent, pdMS_TO_TICKS(10));
     return;
   }
-  bleVoiceGateway.lastControlMs = millis();
-  if (command == "gateway_ready") {
-    bleVoiceGateway.ready = true;
-    provisioning.lastWrite = "voice_gateway_ready";
-    notifyVoiceControl("gateway_ready_ack");
-  } else if (command == "gateway_unavailable") {
-    bleVoiceGateway.ready = false;
-    bleVoiceGateway.remoteTalkActive = false;
-    provisioning.lastWrite = "voice_gateway_unavailable";
-  } else if (command == "remote_begin") {
-    bleVoiceGateway.ready = true;
-    bleVoiceGateway.remoteTalkActive = true;
-    if (radarUiMode == RadarUiMode::ScreenOff || radarUiMode == RadarUiMode::Standby) {
-      wakeRadarDisplay();
-    }
-    lastUserInputMs = millis();
-    provisioning.lastWrite = "remote_voice_begin";
-    notifyVoiceControl("remote_ready");
-  } else if (command == "remote_end") {
-    bleVoiceGateway.remoteTalkActive = false;
-    provisioning.lastWrite = "remote_voice_end";
-  } else if (command == "sleep") {
-    if (!voiceCapture.pttActive && !voiceCapture.playbackActive && !otaManager.blocksPowerAndVoice()) {
-      enterScreenOff();
-      provisioning.lastWrite = "remote_sleep";
-    }
-  } else {
-    provisioning.lastWrite = "voice_control_unknown";
-  }
-  notifyDeviceStatus(true);
+  BleVoiceEvent event;
+  event.kind = bleVoiceEventKindForCommand(command);
+  enqueueBleVoiceEvent(event, pdMS_TO_TICKS(10));
 }
 
 void handleVoiceAudioDownlinkWrite(BLECharacteristic *characteristic) {
   const uint8_t *packet = characteristic->getData();
   const size_t packetBytes = characteristic->getLength();
+  if (!packet || packetBytes == 0 || packetBytes > kFirmwareStatusNotifySafeBytes) {
+    __atomic_add_fetch(&bleVoiceGateway.downlinkDrops, 1U, __ATOMIC_RELAXED);
+    return;
+  }
+  BleVoiceEvent event;
+  event.kind = BleVoiceEventKind::AudioFrame;
+  event.packetBytes = static_cast<uint16_t>(packetBytes);
+  memcpy(event.packet, packet, packetBytes);
+  enqueueBleVoiceEvent(event);
+}
+
+void processBleVoiceControlEvent(BleVoiceEventKind kind) {
+  bleVoiceGateway.lastControlMs = millis();
+  switch (kind) {
+    case BleVoiceEventKind::GatewayReady:
+      bleVoiceGateway.ready = true;
+      provisioning.lastWrite = "voice_gateway_ready";
+      notifyVoiceControl("gateway_ready_ack");
+      break;
+    case BleVoiceEventKind::GatewayUnavailable:
+      bleVoiceGateway.ready = false;
+      bleVoiceGateway.remoteTalkActive = false;
+      if (voiceCapture.pttPending || voiceCapture.pttActive) {
+        cancelPushToTalkDueToBusy("gateway_unavailable");
+      }
+      provisioning.lastWrite = "voice_gateway_unavailable";
+      break;
+    case BleVoiceEventKind::PttGranted:
+      activatePushToTalkAfterGrant();
+      break;
+    case BleVoiceEventKind::PttCancel:
+      cancelPushToTalkDueToBusy("phone_gateway_cancelled");
+      break;
+    case BleVoiceEventKind::RemoteBegin:
+      if (voiceCapture.pttPending || voiceCapture.pttActive) {
+        cancelPushToTalkDueToBusy("remote_voice_preempted");
+      }
+      bleVoiceGateway.ready = true;
+      bleVoiceGateway.remoteTalkActive = true;
+      bleVoiceGateway.playbackGainQ8 = kVoicePlaybackUnityGainQ8;
+      if (radarUiMode == RadarUiMode::ScreenOff || radarUiMode == RadarUiMode::Standby) {
+        wakeRadarDisplay();
+      }
+      lastUserInputMs = millis();
+      provisioning.lastWrite = "remote_voice_begin";
+      notifyVoiceControl("remote_ready");
+      break;
+    case BleVoiceEventKind::RemoteEnd:
+      bleVoiceGateway.remoteTalkActive = false;
+      provisioning.lastWrite = "remote_voice_end";
+      break;
+    case BleVoiceEventKind::Sleep:
+      if (!voiceCapture.pttPending && !voiceCapture.pttActive &&
+          !voiceCapture.playbackActive && !otaManager.blocksPowerAndVoice()) {
+        enterScreenOff();
+        provisioning.lastWrite = "remote_sleep";
+      }
+      break;
+    case BleVoiceEventKind::GatewayDisconnected:
+      if (voiceCapture.pttPending || voiceCapture.pttActive) {
+        cancelPushToTalkDueToBusy("phone_gateway_disconnected");
+      }
+      bleVoiceGateway.ready = false;
+      bleVoiceGateway.remoteTalkActive = false;
+      provisioning.lastWrite = "owner_session_closed";
+      break;
+    case BleVoiceEventKind::Invalid:
+      provisioning.lastWrite = "voice_control_invalid";
+      break;
+    case BleVoiceEventKind::Unknown:
+      provisioning.lastWrite = "voice_control_unknown";
+      break;
+    case BleVoiceEventKind::AudioFrame:
+      return;
+  }
+  notifyDeviceStatus(true);
+}
+
+void processBleVoiceAudioFrame(const uint8_t *packet, size_t packetBytes) {
   int16_t pcm[kVoiceFrameSamples];
   DragonRadarVoice::DecodedHeader header;
   const size_t decodedSamples = DragonRadarVoice::decodePacket(
@@ -5807,7 +6317,103 @@ void handleVoiceAudioDownlinkWrite(BLECharacteristic *characteristic) {
     wakeRadarDisplay();
   }
   lastUserInputMs = millis();
-  playRemoteVoicePcm(reinterpret_cast<const uint8_t *>(pcm), decodedSamples * sizeof(int16_t));
+  playRemoteVoicePcm(
+      reinterpret_cast<const uint8_t *>(pcm),
+      decodedSamples * sizeof(int16_t),
+      (header.flags & DragonRadarVoice::kFlagVad) != 0);
+}
+
+void setupBleVoiceEventQueue() {
+  if (bleVoiceEventQueue) {
+    return;
+  }
+  bleVoiceEventQueue =
+      xQueueCreate(kBleVoiceEventQueueDepth, sizeof(BleVoiceEvent));
+  if (!bleVoiceEventQueue) {
+    Serial.println("BLE voice event queue allocation failed.");
+  }
+}
+
+void bleVoiceGatewayTick() {
+  if (!bleVoiceEventQueue) {
+    return;
+  }
+  BleVoiceEvent event;
+  // CoreBluetooth may deliver the Relay wake buffer in a burst. Keep only a
+  // short jitter window so old audio cannot accumulate into an audible echo;
+  // control events are still applied in order instead of being discarded.
+  while (uxQueueMessagesWaiting(bleVoiceEventQueue) >
+         kBleVoicePlaybackMaxBufferedFrames) {
+    if (xQueueReceive(bleVoiceEventQueue, &event, 0) != pdTRUE) {
+      break;
+    }
+    if (event.kind == BleVoiceEventKind::AudioFrame) {
+      ++bleVoiceGateway.downlinkDrops;
+    } else {
+      processBleVoiceControlEvent(event.kind);
+    }
+  }
+
+  uint8_t processed = 0;
+  while (processed < kBleVoiceEventsPerTick &&
+         xQueueReceive(bleVoiceEventQueue, &event, 0) == pdTRUE) {
+    if (event.kind == BleVoiceEventKind::AudioFrame) {
+      processBleVoiceAudioFrame(event.packet, event.packetBytes);
+    } else {
+      processBleVoiceControlEvent(event.kind);
+    }
+    ++processed;
+  }
+}
+
+void handleOwnerControlWrite(BLECharacteristic *characteristic) {
+  const String json = characteristicValueAsString(characteristic);
+  String command;
+  if (!extractJsonStringValue(json, "command", command)) {
+    provisioning.lastWrite = "release_command_invalid";
+    notifyDeviceStatus(true);
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (command == "prepare_release") {
+    if (!provisioning.paired || provisioning.deviceToken.length() == 0) {
+      provisioning.lastWrite = "release_not_bound";
+    } else if (otaManager.blocksPowerAndVoice()) {
+      provisioning.lastWrite = "release_blocked_ota";
+    } else {
+      ownerReleasePrepared = true;
+      ownerReleasePreparedAtMs = now;
+      provisioning.lastWrite = "release_prepared";
+      Serial.println("BLE owner release prepared");
+    }
+  } else if (command == "cancel_release") {
+    ownerReleasePrepared = false;
+    ownerReleasePreparedAtMs = 0;
+    provisioning.lastWrite = "release_cancelled";
+    Serial.println("BLE owner release cancelled");
+  } else if (command == "commit_release") {
+    const bool prepareExpired =
+        !ownerReleasePrepared ||
+        now - ownerReleasePreparedAtMs > kOwnerReleasePrepareWindowMs;
+    if (prepareExpired) {
+      ownerReleasePrepared = false;
+      ownerReleasePreparedAtMs = 0;
+      provisioning.lastWrite = "release_not_prepared";
+    } else if (otaManager.blocksPowerAndVoice()) {
+      provisioning.lastWrite = "release_blocked_ota";
+    } else {
+      ownerReleasePrepared = false;
+      ownerReleasePreparedAtMs = 0;
+      ownerReleaseCommitPending = true;
+      ownerReleaseCommitAtMs = now;
+      provisioning.lastWrite = "release_committed";
+      Serial.println("BLE owner release committed");
+    }
+  } else {
+    provisioning.lastWrite = "release_command_unknown";
+  }
+  notifyDeviceStatus(true);
 }
 
 bool authorizeGattWrite(RadarGattWriteRole role, uint16_t connectionHandle) {
@@ -5861,6 +6467,9 @@ void handleGattWrite(
     case RadarGattWriteRole::RoomStateSnapshot:
       handleRoomStateSnapshotWrite(characteristic);
       break;
+    case RadarGattWriteRole::OwnerControl:
+      handleOwnerControlWrite(characteristic);
+      break;
   }
 }
 
@@ -5896,8 +6505,15 @@ void endProvisioningConnection(uint16_t connectionHandle) {
   blePairingResultUntilMs = 0;
   provisioning.appConnected = false;
   provisioning.ownerSessionAuthorized = false;
+  if (!ownerReleaseCommitPending) {
+    ownerReleasePrepared = false;
+    ownerReleasePreparedAtMs = 0;
+  }
   bleVoiceGateway.ready = false;
   bleVoiceGateway.remoteTalkActive = false;
+  BleVoiceEvent disconnectEvent;
+  disconnectEvent.kind = BleVoiceEventKind::GatewayDisconnected;
+  enqueueBleVoiceEvent(disconnectEvent, pdMS_TO_TICKS(10));
   provisioning.lastWrite = "owner_session_closed";
   notifyDeviceStatus(true);
   BLEDevice::startAdvertising();
@@ -6130,10 +6746,17 @@ void setupProvisioningBle() {
       kRoomStateSnapshotUuid,
       BLECharacteristic::PROPERTY_WRITE,
       new RadarGattWriteCallbacks(RadarGattWriteRole::RoomStateSnapshot));
+  BLEService *ownerService = provisioningServer->createService(kOwnerBleServiceUuid);
+  createProvisioningCharacteristic(
+      ownerService,
+      kOwnerControlUuid,
+      BLECharacteristic::PROPERTY_WRITE,
+      new RadarGattWriteCallbacks(RadarGattWriteRole::OwnerControl));
 
   service->start();
   voiceService->start();
   roomStateService->start();
+  ownerService->start();
 
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(kRadarBleServiceUuid);
@@ -6152,7 +6775,9 @@ void setupProvisioningBle() {
   Serial.print(" voice_service=");
   Serial.print(kVoiceBleServiceUuid);
   Serial.print(" room_service=");
-  Serial.println(kRoomStateBleServiceUuid);
+  Serial.print(kRoomStateBleServiceUuid);
+  Serial.print(" owner_service=");
+  Serial.println(kOwnerBleServiceUuid);
 }
 
 void provisioningTick() {
@@ -6161,6 +6786,20 @@ void provisioningTick() {
   }
 
   const uint32_t now = millis();
+  if (ownerReleaseCommitPending &&
+      now - ownerReleaseCommitAtMs >= kOwnerReleaseCommitDelayMs) {
+    ownerReleaseCommitPending = false;
+    clearProvisioningAndRestart("DEVICE RELEASED");
+    return;
+  }
+  if (ownerReleasePrepared &&
+      now - ownerReleasePreparedAtMs > kOwnerReleasePrepareWindowMs) {
+    ownerReleasePrepared = false;
+    ownerReleasePreparedAtMs = 0;
+    provisioning.lastWrite = "release_expired";
+    notifyDeviceStatus(true);
+  }
+
   static uint32_t handledSecurityEventSerial = 0;
   const uint32_t securityEventSerial = bleSecurityEventSerial;
   if (securityEventSerial != handledSecurityEventSerial) {
@@ -6202,7 +6841,7 @@ void provisioningTick() {
         provisioning.paired,
         batteryStatus.percent,
         batteryStatus.charging,
-        voiceCapture.pttActive,
+        voiceCapture.pttPending || voiceCapture.pttActive,
         true,
         provisioning.deviceToken,
         provisioning.httpApiUrl);
@@ -6436,8 +7075,39 @@ bool relayTlsClockReady() {
   return false;
 }
 
-void playRemoteVoicePcm(const uint8_t *pcmBytes, size_t byteLen) {
+uint16_t selectVoicePlaybackGainQ8(uint16_t peak, bool speechActive) {
+  if (audioPreset == 0 || audioPreset >= kAudioPresetCount) {
+    return 0;
+  }
+  const uint16_t maxGainQ8 = kVoicePlaybackMaxGainQ8[audioPreset];
+  uint16_t desiredGainQ8 = kVoicePlaybackUnityGainQ8;
+  if (speechActive && peak > 0) {
+    const uint32_t normalized =
+        (static_cast<uint32_t>(kVoicePlaybackTargetPeak) << 8) / peak;
+    desiredGainQ8 = static_cast<uint16_t>(
+        constrain(normalized,
+                  static_cast<uint32_t>(kVoicePlaybackUnityGainQ8),
+                  static_cast<uint32_t>(maxGainQ8)));
+  }
+
+  const uint16_t previousGainQ8 =
+      max<uint16_t>(bleVoiceGateway.playbackGainQ8, kVoicePlaybackUnityGainQ8);
+  if (desiredGainQ8 >= previousGainQ8) {
+    return desiredGainQ8;
+  }
+  return static_cast<uint16_t>(
+      (static_cast<uint32_t>(previousGainQ8) * 3U + desiredGainQ8) / 4U);
+}
+
+void playRemoteVoicePcm(
+    const uint8_t *pcmBytes,
+    size_t byteLen,
+    bool speechActive) {
   if (byteLen < sizeof(int16_t)) {
+    return;
+  }
+  if (audioPreset == 0) {
+    voiceCapture.playbackActive = false;
     return;
   }
   if (radarUiMode == RadarUiMode::Standby ||
@@ -6454,25 +7124,95 @@ void playRemoteVoicePcm(const uint8_t *pcmBytes, size_t byteLen) {
   tone.active = false;
   tone.remainingSamples = 0;
   bootAudioPlaying = false;
-  digitalWrite(PA, HIGH);
-  setCodecOutputMuted(false);
   if (!configureAudioTx(kAudioSampleRate)) {
     return;
   }
 
   const size_t monoSamples = min<size_t>(byteLen / sizeof(int16_t), kVoiceFrameSamples);
+  uint64_t sumSquares = 0;
+  uint16_t peak = 0;
+  for (size_t i = 0; i < monoSamples; ++i) {
+    const uint16_t raw = static_cast<uint16_t>(pcmBytes[i * 2]) |
+                         (static_cast<uint16_t>(pcmBytes[i * 2 + 1]) << 8);
+    const int16_t sample = static_cast<int16_t>(raw);
+    const uint32_t magnitude =
+        static_cast<uint32_t>(sample < 0 ? -static_cast<int32_t>(sample) : sample);
+    peak = max<uint16_t>(
+        peak, static_cast<uint16_t>(min<uint32_t>(magnitude, UINT16_MAX)));
+    const int64_t signedSample = sample;
+    sumSquares += static_cast<uint64_t>(signedSample * signedSample);
+  }
+  const uint16_t rms = monoSamples > 0
+                           ? static_cast<uint16_t>(min<uint32_t>(
+                                 static_cast<uint32_t>(sqrtf(
+                                     static_cast<float>(sumSquares / monoSamples))),
+                                 UINT16_MAX))
+                           : 0;
+  const uint16_t gainQ8 = selectVoicePlaybackGainQ8(peak, speechActive);
+  bleVoiceGateway.playbackGainQ8 = gainQ8;
+  bleVoiceGateway.lastPlaybackRms = rms;
+  bleVoiceGateway.lastPlaybackPeak = peak;
+
   int16_t stereo[kVoiceFrameSamples * 2];
   for (size_t i = 0; i < monoSamples; ++i) {
     const uint16_t raw = static_cast<uint16_t>(pcmBytes[i * 2]) |
                          (static_cast<uint16_t>(pcmBytes[i * 2 + 1]) << 8);
     const int16_t sample = static_cast<int16_t>(raw);
-    stereo[i * 2] = sample;
-    stereo[i * 2 + 1] = sample;
+    const int32_t amplified =
+        (static_cast<int32_t>(sample) * static_cast<int32_t>(gainQ8)) >> 8;
+    const int16_t output =
+        static_cast<int16_t>(constrain(amplified, -30000L, 30000L));
+    stereo[i * 2] = output;
+    stereo[i * 2 + 1] = output;
   }
-  i2s.write(reinterpret_cast<uint8_t *>(stereo), monoSamples * 2 * sizeof(int16_t));
+
+  const bool startingPlayback = !voiceCapture.playbackActive;
+  applyVoicePlaybackCodecVolume();
+  digitalWrite(PA, HIGH);
+  if (startingPlayback) {
+    delay(kVoiceAmplifierWarmupMs);
+  }
+  setCodecOutputMuted(false);
+  const size_t requestedBytes = monoSamples * 2 * sizeof(int16_t);
+  const size_t writtenBytes =
+      i2s.write(reinterpret_cast<uint8_t *>(stereo), requestedBytes);
+  bleVoiceGateway.lastPlaybackBytesWritten = writtenBytes;
+  if (writtenBytes != requestedBytes) {
+    ++bleVoiceGateway.downlinkDrops;
+  }
+  if (writtenBytes == 0) {
+    setCodecOutputMuted(true);
+    digitalWrite(PA, LOW);
+    voiceCapture.playbackActive = false;
+    Serial.println("I2S remote voice write failed.");
+    return;
+  }
   voiceCapture.playbackActive = true;
   voiceCapture.lastPlaybackMs = millis();
   powerResources.lastAudioActivityMs = voiceCapture.lastPlaybackMs;
+  if (kSerialDiagnostics &&
+      (voiceCapture.receivedSequence % 25U == 0U || writtenBytes < requestedBytes)) {
+    Serial.print("DIAG voice_rx seq=");
+    Serial.print(voiceCapture.receivedSequence);
+    Serial.print(" rms=");
+    Serial.print(rms);
+    Serial.print(" peak=");
+    Serial.print(peak);
+    Serial.print(" vad=");
+    Serial.print(speechActive ? 1 : 0);
+    Serial.print(" gainQ8=");
+    Serial.print(gainQ8);
+    Serial.print(" codecReg=0x");
+    Serial.print(kVoicePlaybackCodecRegisters[audioPreset], HEX);
+    Serial.print(" written=");
+    Serial.print(writtenBytes);
+    Serial.print("/");
+    Serial.print(requestedBytes);
+    Serial.print(" queue=");
+    Serial.print(bleVoiceEventQueue ? uxQueueMessagesWaiting(bleVoiceEventQueue) : 0);
+    Serial.print(" drops=");
+    Serial.println(bleVoiceGateway.downlinkDrops);
+  }
 }
 
 bool handleRelayVoiceFrame(const String &json) {
@@ -6863,7 +7603,7 @@ void beginPushToTalk() {
     notifyDeviceStatus(true);
     return;
   }
-  if (voiceCapture.pttActive) {
+  if (voiceCapture.pttPending || voiceCapture.pttActive) {
     return;
   }
   if (kBlePhoneGatewayEnabled && !bleVoiceGateway.ready) {
@@ -6887,33 +7627,66 @@ void beginPushToTalk() {
   }
   pttRippleStartedMs = millis();
   pttRippleEndedMs = 0;
+  voiceCapture.pttPending = kBlePhoneGatewayEnabled;
+  voiceCapture.pttActive = !kBlePhoneGatewayEnabled;
+  voiceCapture.vadActive = false;
+  voiceCapture.lastFrameMs = 0;
+  voiceCapture.captureGainQ8 = kVoiceCaptureUnityGainQ8;
+  resetVoiceCaptureDspState();
+  provisioning.lastWrite = kBlePhoneGatewayEnabled ? "ptt_waiting_grant" : "ptt_start";
+  lastUserInputMs = millis();
+  if (kBlePhoneGatewayEnabled) {
+    notifyVoiceControl("ptt_begin");
+  } else {
+    tone.active = false;
+    tone.remainingSamples = 0;
+    bootAudioPlaying = false;
+    voiceCapture.playbackActive = false;
+    powerResources.lastAudioActivityMs = millis();
+    setSpeakerMutedForCapture(true);
+  }
+  notifyDeviceStatus(true);
+  if (kSerialDiagnostics) {
+    Serial.println(kBlePhoneGatewayEnabled ? "DIAG ptt=pending" : "DIAG ptt=start");
+  }
+}
+
+void activatePushToTalkAfterGrant() {
+  if (!voiceCapture.pttPending || voiceCapture.pttActive) {
+    return;
+  }
+  if (!ensureRuntimeAudio(true, "ptt_granted")) {
+    cancelPushToTalkDueToBusy("ptt_audio_unavailable");
+    return;
+  }
+  voiceCapture.pttPending = false;
+  voiceCapture.pttActive = true;
+  voiceCapture.vadActive = false;
+  voiceCapture.lastFrameMs = 0;
+  voiceCapture.captureGainQ8 = kVoiceCaptureUnityGainQ8;
+  resetVoiceCaptureDspState();
   tone.active = false;
   tone.remainingSamples = 0;
   bootAudioPlaying = false;
   voiceCapture.playbackActive = false;
-  voiceCapture.pttActive = true;
-  voiceCapture.vadActive = false;
-  voiceCapture.lastFrameMs = 0;
   powerResources.lastAudioActivityMs = millis();
   setSpeakerMutedForCapture(true);
-  provisioning.lastWrite = "ptt_start";
-  lastUserInputMs = millis();
-  if (kBlePhoneGatewayEnabled) {
-    notifyVoiceControl("ptt_begin");
-  }
+  provisioning.lastWrite = "ptt_granted";
   notifyDeviceStatus(true);
   if (kSerialDiagnostics) {
-    Serial.println("DIAG ptt=start");
+    Serial.println("DIAG ptt=granted");
   }
 }
 
 void cancelPushToTalkDueToBusy(const char *reason) {
-  if (!voiceCapture.pttActive && !speakerMutedForCapture) {
+  if (!voiceCapture.pttPending && !voiceCapture.pttActive && !speakerMutedForCapture) {
     return;
   }
+  voiceCapture.pttPending = false;
   voiceCapture.pttActive = false;
   voiceCapture.vadActive = false;
   voiceCapture.playbackActive = false;
+  voiceCapture.captureGainQ8 = kVoiceCaptureUnityGainQ8;
   pttRippleEndedMs = millis();
   setSpeakerMutedForCapture(false);
   powerResources.lastAudioActivityMs = millis();
@@ -6932,11 +7705,13 @@ void cancelPushToTalkDueToBusy(const char *reason) {
 }
 
 void endPushToTalk() {
-  if (!voiceCapture.pttActive) {
+  if (!voiceCapture.pttPending && !voiceCapture.pttActive) {
     return;
   }
+  voiceCapture.pttPending = false;
   voiceCapture.pttActive = false;
   voiceCapture.vadActive = false;
+  voiceCapture.captureGainQ8 = kVoiceCaptureUnityGainQ8;
   pttRippleEndedMs = millis();
   setSpeakerMutedForCapture(false);
   powerResources.lastAudioActivityMs = millis();
@@ -6956,7 +7731,8 @@ void endPushToTalk() {
 
 void voiceCaptureTick() {
   const uint32_t now = millis();
-  if (voiceCapture.playbackActive && now - voiceCapture.lastPlaybackMs > 120) {
+  if (voiceCapture.playbackActive &&
+      now - voiceCapture.lastPlaybackMs > kVoicePlaybackTailMs) {
     voiceCapture.playbackActive = false;
     setCodecOutputMuted(true);
     digitalWrite(PA, LOW);
@@ -6994,11 +7770,11 @@ void voiceCaptureTick() {
     return;
   }
 
-  int16_t stereoSamples[kVoiceFrameSamples * 2];
-  int16_t monoPcm[kVoiceFrameSamples];
   const bool rxMono = i2s.rxSlotMode() == I2S_SLOT_MODE_MONO;
   const size_t requestedBytes = (rxMono ? kVoiceFrameSamples : kVoiceFrameSamples * 2) * sizeof(int16_t);
-  const size_t readBytes = i2s.readBytes(reinterpret_cast<char *>(stereoSamples), requestedBytes);
+  const size_t readBytes = i2s.readBytes(
+      reinterpret_cast<char *>(voiceCaptureStereoPcm),
+      requestedBytes);
   const size_t sampleCount = readBytes / sizeof(int16_t);
   if (sampleCount == 0) {
     voiceCapture.vadActive = false;
@@ -7007,20 +7783,34 @@ void voiceCaptureTick() {
     return;
   }
 
-  uint64_t sumSquares = 0;
-  uint16_t peak = 0;
+  uint16_t rawFirstPeak = 0;
+  uint16_t rawSecondPeak = 0;
+  uint64_t rawFirstSumSquares = 0;
+  uint64_t rawSecondSumSquares = 0;
   size_t monoSamples = 0;
   for (size_t i = 0; i < sampleCount && monoSamples < kVoiceFrameSamples; i += rxMono ? 1 : 2) {
-    const int32_t first = stereoSamples[i];
-    const int32_t second = (!rxMono && i + 1 < sampleCount) ? stereoSamples[i + 1] : first;
-    const uint32_t firstMagnitude = static_cast<uint32_t>(first < 0 ? -first : first);
-    const uint32_t secondMagnitude = static_cast<uint32_t>(second < 0 ? -second : second);
-    const int32_t sample = secondMagnitude > firstMagnitude ? second : first;
-    monoPcm[monoSamples++] = static_cast<int16_t>(sample);
-    const uint32_t magnitude = max<uint32_t>(firstMagnitude, secondMagnitude);
-    peak = max<uint16_t>(peak, static_cast<uint16_t>(min<uint32_t>(magnitude, UINT16_MAX)));
-    const int64_t signedSample = sample;
-    sumSquares += static_cast<uint64_t>(signedSample * signedSample);
+    const int32_t first = voiceCaptureStereoPcm[i];
+    const int32_t second =
+        (!rxMono && i + 1 < sampleCount)
+            ? voiceCaptureStereoPcm[i + 1]
+            : first;
+    voiceCaptureFirstMicPcm[monoSamples] = static_cast<int16_t>(first);
+    voiceCaptureSecondMicPcm[monoSamples] = static_cast<int16_t>(second);
+    ++monoSamples;
+    const uint32_t firstMagnitude =
+        static_cast<uint32_t>(first < 0 ? -first : first);
+    const uint32_t secondMagnitude =
+        static_cast<uint32_t>(second < 0 ? -second : second);
+    rawFirstPeak = max<uint16_t>(
+        rawFirstPeak,
+        static_cast<uint16_t>(min<uint32_t>(firstMagnitude, UINT16_MAX)));
+    rawSecondPeak = max<uint16_t>(
+        rawSecondPeak,
+        static_cast<uint16_t>(min<uint32_t>(secondMagnitude, UINT16_MAX)));
+    rawFirstSumSquares += static_cast<uint64_t>(
+        static_cast<int64_t>(first) * static_cast<int64_t>(first));
+    rawSecondSumSquares += static_cast<uint64_t>(
+        static_cast<int64_t>(second) * static_cast<int64_t>(second));
   }
 
   if (monoSamples == 0) {
@@ -7030,12 +7820,54 @@ void voiceCaptureTick() {
     return;
   }
 
-  const uint32_t meanSquare = monoSamples > 0 ? static_cast<uint32_t>(sumSquares / monoSamples) : 0;
+  const uint16_t rawFirstRms = static_cast<uint16_t>(
+      min<uint32_t>(
+          static_cast<uint32_t>(sqrtf(
+              static_cast<float>(rawFirstSumSquares / monoSamples))),
+          UINT16_MAX));
+  const uint16_t rawSecondRms = static_cast<uint16_t>(
+      min<uint32_t>(
+          static_cast<uint32_t>(sqrtf(
+              static_cast<float>(rawSecondSumSquares / monoSamples))),
+          UINT16_MAX));
+  const uint8_t selectedMic = selectVoiceCaptureMic(
+      rawFirstRms,
+      rawSecondRms,
+      rawFirstPeak,
+      rawSecondPeak);
+  int16_t *selectedMicPcm =
+      selectedMic == 0
+          ? voiceCaptureFirstMicPcm
+          : voiceCaptureSecondMicPcm;
+
+  bool dspSpeechDetected = false;
+  const bool dspApplied = processVoiceCaptureDsp(
+      selectedMicPcm,
+      monoSamples,
+      voiceCaptureProcessedPcm,
+      dspSpeechDetected);
+  voiceCapture.captureGainQ8 = kVoiceCaptureUnityGainQ8;
+  uint64_t sumSquares = 0;
+  uint16_t peak = 0;
+  for (size_t i = 0; i < monoSamples; ++i) {
+    const int16_t output = voiceCaptureProcessedPcm[i];
+    const uint32_t magnitude = static_cast<uint32_t>(
+        output < 0 ? -static_cast<int32_t>(output) : output);
+    peak = max<uint16_t>(
+        peak, static_cast<uint16_t>(min<uint32_t>(magnitude, UINT16_MAX)));
+    const int64_t signedSample = output;
+    sumSquares += static_cast<uint64_t>(signedSample * signedSample);
+  }
+  const uint32_t meanSquare =
+      monoSamples > 0 ? static_cast<uint32_t>(sumSquares / monoSamples) : 0;
   const uint16_t rms = static_cast<uint16_t>(min<uint32_t>(sqrtf(static_cast<float>(meanSquare)), UINT16_MAX));
   voiceCapture.rms = rms;
   voiceCapture.peak = peak;
   voiceCapture.vadActive = voiceCapture.pttActive && !voiceCapture.muted &&
-                           (rms >= kVoiceVadRmsThreshold || peak >= kVoiceVadPeakThreshold);
+                           (dspApplied
+                                ? dspSpeechDetected
+                                : (rms >= kVoiceVadRmsThreshold ||
+                                   peak >= kVoiceVadPeakThreshold));
 
   if (kBlePhoneGatewayEnabled && bleVoiceGateway.ready && voiceAudioUplinkCharacteristic &&
       provisioning.appConnected && now - voiceCapture.lastFrameMs >= kVoiceFrameTickMs) {
@@ -7044,11 +7876,38 @@ void voiceCaptureTick() {
     uint8_t packet[DragonRadarVoice::kPacketHeaderBytes + kVoiceFrameSamples / 2];
     uint8_t flags = voiceCapture.vadActive ? DragonRadarVoice::kFlagVad : 0;
     const size_t packetBytes = DragonRadarVoice::encodePacket(
-        monoPcm, monoSamples, voiceCapture.sequence, flags, packet, sizeof(packet));
+        voiceCaptureProcessedPcm,
+        monoSamples,
+        voiceCapture.sequence,
+        flags,
+        packet,
+        sizeof(packet));
     if (packetBytes > 0 && packetBytes <= kFirmwareStatusNotifySafeBytes) {
       voiceAudioUplinkCharacteristic->setValue(packet, packetBytes);
       voiceAudioUplinkCharacteristic->notify();
       bleVoiceGateway.lastUplinkMs = now;
+      if (kSerialDiagnostics && voiceCapture.sequence % 25U == 0U) {
+        Serial.print("DIAG voice_tx seq=");
+        Serial.print(voiceCapture.sequence);
+        Serial.print(" rms=");
+        Serial.print(voiceCapture.rms);
+        Serial.print(" peak=");
+        Serial.print(voiceCapture.peak);
+        Serial.print(" rawL=");
+        Serial.print(rawFirstPeak);
+        Serial.print(" rawR=");
+        Serial.print(rawSecondPeak);
+        Serial.print(" mic=");
+        Serial.print(selectedMic + 1);
+        Serial.print(" dsp=");
+        Serial.print(dspApplied ? 1 : 0);
+        Serial.print(" vad=");
+        Serial.print(voiceCapture.vadActive ? 1 : 0);
+        Serial.print(" bytes=");
+        Serial.print(packetBytes);
+        Serial.print(" drops=");
+        Serial.println(bleVoiceGateway.uplinkDrops);
+      }
     } else {
       ++bleVoiceGateway.uplinkDrops;
     }
@@ -7056,7 +7915,10 @@ void voiceCaptureTick() {
              now - voiceCapture.lastFrameMs >= kVoiceFrameTickMs) {
     voiceCapture.lastFrameMs = now;
     ++voiceCapture.sequence;
-    sendRelayVoiceFrame(monoPcm, monoSamples, voiceCapture.pttActive);
+    sendRelayVoiceFrame(
+        voiceCaptureProcessedPcm,
+        monoSamples,
+        voiceCapture.pttActive);
     if (kSerialDiagnostics) {
       Serial.print("DIAG voice seq=");
       Serial.print(voiceCapture.sequence);
@@ -7068,6 +7930,14 @@ void voiceCaptureTick() {
       Serial.print(voiceCapture.rms);
       Serial.print(" peak=");
       Serial.print(voiceCapture.peak);
+      Serial.print(" rawL=");
+      Serial.print(rawFirstPeak);
+      Serial.print(" rawR=");
+      Serial.print(rawSecondPeak);
+      Serial.print(" mic=");
+      Serial.print(selectedMic + 1);
+      Serial.print(" dsp=");
+      Serial.print(dspApplied ? 1 : 0);
       Serial.print(" audio=");
       Serial.println(voiceCapture.pttActive ? "pcm16" : "status");
     }
@@ -8384,9 +9254,50 @@ void printSerialCommandHelp() {
     return;
   }
 
-  Serial.println("DIAG commands: ? help, h hardware, d display_test, z zoom, c align_north, b brightness, a audio, f frame_rate, t frame_turbo, p ping");
+  Serial.println("DIAG commands: ? help, h hardware, d display_test, z zoom, c align_north, b brightness, a audio, f frame_rate, t frame_turbo, p ping, r voice_playback, v voice_ptt");
   Serial.println("DIAG line: relay <ws_url> <http_api_url> <room_token> <device_token>");
   Serial.println("DIAG line: ui <main|menu|info|confirm|pending|sleep|standby|wake|status|select ITEM|activate>");
+}
+
+void playVoicePlaybackDiagnostic() {
+  if (voiceCapture.pttPending || voiceCapture.pttActive) {
+    endPushToTalk();
+  }
+  constexpr uint16_t kProofFrames = 25;
+  constexpr float kProofFrequencyHz = 800.0f;
+  constexpr int16_t kProofInputLevel = 2000;
+  uint32_t sequence = voiceCapture.receivedSequence;
+  for (uint16_t frame = 0; frame < kProofFrames; ++frame) {
+    int16_t pcm[kVoiceFrameSamples];
+    for (size_t i = 0; i < kVoiceFrameSamples; ++i) {
+      const size_t absoluteSample =
+          static_cast<size_t>(frame) * kVoiceFrameSamples + i;
+      const float phase =
+          6.28318530717958647692f * kProofFrequencyHz * absoluteSample /
+          kAudioSampleRate;
+      pcm[i] = static_cast<int16_t>(sinf(phase) * kProofInputLevel);
+    }
+    uint8_t packet[DragonRadarVoice::kPacketHeaderBytes + kVoiceFrameSamples / 2];
+    const size_t packetBytes = DragonRadarVoice::encodePacket(
+        pcm, kVoiceFrameSamples, ++sequence, DragonRadarVoice::kFlagVad,
+        packet, sizeof(packet));
+    processBleVoiceAudioFrame(packet, packetBytes);
+    delay(kVoiceFrameDurationMs);
+  }
+  // The diagnostic enters through the same decoder as a real remote stream,
+  // which marks the remote speaker active. Pair it with the production
+  // remote-end path so the render loop is never left paused after the proof.
+  processBleVoiceControlEvent(BleVoiceEventKind::RemoteEnd);
+  remoteRoomSpeakerActive = false;
+  remoteRoomSpeakerUntilMs = 0;
+  Serial.print("DIAG voice_playback frames=");
+  Serial.print(kProofFrames);
+  Serial.print(" gainQ8=");
+  Serial.print(bleVoiceGateway.playbackGainQ8);
+  Serial.print(" bytesWritten=");
+  Serial.print(bleVoiceGateway.lastPlaybackBytesWritten);
+  Serial.print(" drops=");
+  Serial.println(bleVoiceGateway.downlinkDrops);
 }
 
 void printSerialCommandResult(char command, const char *action) {
@@ -8451,8 +9362,24 @@ void handleSerialCommand(char rawCommand) {
       printFrameRateCommandResult(command, "frame_turbo");
       break;
     case 'p':
-      startTone(1568.0f, 120, 4200, true);
+      // Diagnostic-only speaker proof. The regular UI tone path is
+      // intentionally silent, so use the existing alert path here without
+      // re-enabling touch or navigation sounds.
+      startAlertTone(1568.0f, 500, 11000, true);
       printSerialCommandResult(command, "ping");
+      break;
+    case 'r':
+      playVoicePlaybackDiagnostic();
+      printSerialCommandResult(command, "voice_playback");
+      break;
+    case 'v':
+      if (voiceCapture.pttPending || voiceCapture.pttActive) {
+        endPushToTalk();
+        printSerialCommandResult(command, "voice_ptt_stop");
+      } else {
+        beginPushToTalk();
+        printSerialCommandResult(command, "voice_ptt_start");
+      }
       break;
     default:
       printSerialCommandResult(command, "unknown");
@@ -8839,7 +9766,8 @@ void serialDiagnosticsTick() {
   Serial.print(" power=");
   Serial.print(powerStateText());
   Serial.print(" ptt=");
-  Serial.print(voiceCapture.pttActive ? "active" : "idle");
+  Serial.print(voiceCapture.pttPending ? "pending" :
+               (voiceCapture.pttActive ? "active" : "idle"));
   Serial.print(" muted=");
   Serial.print(voiceCapture.muted ? "yes" : "no");
   Serial.print(" voiceTx=");
@@ -9370,7 +10298,9 @@ void setup() {
 
   runBootAnimation();
   setupAudio();
+  setupVoiceCaptureDsp();
 
+  setupBleVoiceEventQueue();
   setupBle();
   otaManager.setBootHealth(displayOnline, provisioning.serviceOnline);
   printHardwareSummary();
@@ -9386,6 +10316,7 @@ void loop() {
   pollPowerButton();
   pollButtons();
   pollTouch();
+  bleVoiceGatewayTick();
   systemUiTick();
   activeSleepTick();
   provisioningTick();
@@ -9401,7 +10332,11 @@ void loop() {
   audioPowerTick();
 
   const uint32_t now = millis();
-  if ((radarUiDisplayActive() || otaManager.shouldShowOverlay()) &&
+  const bool voiceIoActive =
+      voiceCapture.pttPending || voiceCapture.pttActive ||
+      bleVoiceGateway.remoteTalkActive || voiceCapture.playbackActive;
+  if (!voiceIoActive &&
+      (radarUiDisplayActive() || otaManager.shouldShowOverlay()) &&
       now - lastFrameMs >= currentFrameMs()) {
     const float dt = (now - lastFrameMs) / 1000.0f;
     lastFrameMs = now;

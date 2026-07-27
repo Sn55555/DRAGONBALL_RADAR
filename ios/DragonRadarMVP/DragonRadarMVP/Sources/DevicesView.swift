@@ -391,11 +391,119 @@ struct DeviceStatusDetailView: View {
                 MangaPanel("固件") {
                     FirmwareSummaryRow()
                 }
+                DeviceOwnershipPanel(device: device)
             }
             .padding(18)
         }
         .background(MangaBackground())
         .navigationTitle("雷达详情")
+    }
+}
+
+private struct DeviceOwnershipPanel: View {
+    @Environment(AppState.self) private var appState
+    @Environment(BLEDeviceBridge.self) private var bleBridge
+    @Environment(RadarRuntime.self) private var radarRuntime
+    @Environment(\.dismiss) private var dismiss
+    @State private var releasePhase: AppOperationPhase = .idle
+    @State private var showsReleaseConfirmation = false
+    var device: RadarDevice
+
+    var body: some View {
+        MangaPanel("设备所有权") {
+            Text("释放后，这台雷达会退出当前账号并清除本机的所有者、Wi‑Fi 和房间配置。账号与房间本身不会被删除。")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(MangaTheme.subtle)
+
+            InfoRow(label: "当前状态", value: releaseReadinessText)
+            OperationStatusView(phase: releasePhase)
+
+            Button(role: .destructive) {
+                showsReleaseConfirmation = true
+            } label: {
+                Label("释放设备", systemImage: "rectangle.portrait.and.arrow.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(InkButtonStyle(filled: false))
+            .disabled(releasePhase.isLoading || !releaseReady)
+            .accessibilityIdentifier("devices.ownership.release")
+
+            if !bleBridge.hasCharacteristic(.ownerControl) {
+                Text("当前雷达固件不支持安全释放。请先完成固件更新；如无法更新，可在雷达本机通过 RST 恢复。")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(MangaTheme.subtle)
+            }
+        }
+        .confirmationDialog(
+            "释放这台雷达？",
+            isPresented: $showsReleaseConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("释放并清除雷达", role: .destructive) {
+                Task { await releaseDevice() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("释放完成后，其他账号可以重新绑定。该操作不会删除你的账号或房间。")
+        }
+    }
+
+    private var releaseReady: Bool {
+        appState.isSignedIn
+            && bleBridge.isBLEConnected
+            && bleBridge.ownerSessionAuthorized
+            && bleBridge.deviceStatus?.paired == 1
+            && bleBridge.hasCharacteristic(.ownerControl)
+    }
+
+    private var releaseReadinessText: String {
+        if !appState.isSignedIn { return "需要先登录" }
+        if !bleBridge.isBLEConnected { return "请先连接这台雷达" }
+        if !bleBridge.hasCharacteristic(.ownerControl) { return "需要更新雷达固件" }
+        if !bleBridge.ownerSessionAuthorized { return "正在确认所有者身份" }
+        if bleBridge.deviceStatus?.paired != 1 { return "雷达当前未绑定" }
+        return "可安全释放"
+    }
+
+    @MainActor
+    private func releaseDevice() async {
+        guard releaseReady else {
+            releasePhase = .failed(releaseReadinessText)
+            return
+        }
+
+        releasePhase = .loading
+        let prepareStartedAt = Date()
+        guard
+            bleBridge.prepareOwnerRelease(),
+            await bleBridge.confirmOwnerReleasePrepared(startedAt: prepareStartedAt)
+        else {
+            releasePhase = .failed(bleBridge.lastWriteEvent)
+            return
+        }
+
+        let cloudResult = await appState.releaseDeviceAndWait(deviceID: device.deviceID)
+        guard cloudResult.succeeded else {
+            bleBridge.cancelOwnerRelease()
+            releasePhase = .failed(cloudResult.message)
+            return
+        }
+
+        let commitStartedAt = Date()
+        guard
+            bleBridge.commitOwnerRelease(),
+            await bleBridge.confirmOwnerReleaseCommitted(startedAt: commitStartedAt)
+        else {
+            releasePhase = .failed("云端身份已撤销，但雷达没有完成清除。请保持连接后重试；若仍失败，请在雷达本机执行 RST。")
+            return
+        }
+
+        appState.completeReleasedDeviceLocally(deviceID: device.deviceID)
+        bleBridge.forgetReleasedDevice()
+        radarRuntime.disconnectRelay()
+        releasePhase = .success("设备已释放，可由其他账号重新绑定")
+        try? await Task.sleep(for: .milliseconds(700))
+        dismiss()
     }
 }
 
@@ -1344,32 +1452,31 @@ struct WifiConfigSheet: View {
         }
 
         writePhase = .loading
+        guard await prepareWifiConfigWrite() else {
+            return
+        }
+        guard await bleBridge.beginExclusiveControlWrite() else {
+            writePhase = .failed("雷达蓝牙通道繁忙，无法安全写入 OTA 网络")
+            return
+        }
+        defer {
+            bleBridge.endExclusiveControlWrite()
+        }
         let writeStartedAt = Date()
-        guard bleBridge.writeWifiConfig(ssid: cleanSSID, password: password) else {
+        guard await bleBridge.writeWifiConfig(ssid: cleanSSID, password: password) else {
             writePhase = .failed(userFacingWriteFailure(defaultMessage: "Wi-Fi 写入失败"))
+            return
+        }
+
+        guard await waitForWifiConfigWriteConfirmation(since: writeStartedAt) else {
             return
         }
         appState.applyWifiConfig(ssid: cleanSSID)
 
         if let onConfigurationWritten {
-            for _ in 0..<20 {
-                try? await Task.sleep(for: .milliseconds(100))
-                guard bleBridge.isBLEConnected else {
-                    writePhase = .failed("雷达连接已断开，请靠近后重试")
-                    return
-                }
-                if bleBridge.lastWriteEvent == "雷达写入已确认" {
-                    writePhase = .success("网络已保存，正在继续更新")
-                    onConfigurationWritten()
-                    dismiss()
-                    return
-                }
-                if bleBridge.lastWriteEvent.contains("失败") {
-                    writePhase = .failed(userFacingWriteFailure(defaultMessage: "Wi-Fi 写入失败"))
-                    return
-                }
-            }
-            writePhase = .failed("雷达未确认网络配置，请保持靠近后重试")
+            writePhase = .success("网络已保存，正在继续更新")
+            onConfigurationWritten()
+            dismiss()
             return
         }
 
@@ -1398,6 +1505,122 @@ struct WifiConfigSheet: View {
             roomCode: roomCode
         )
         await waitForESPNetworkConfirmation(since: writeStartedAt)
+    }
+
+    @MainActor
+    private func prepareWifiConfigWrite() async -> Bool {
+        var refreshedCharacteristics = false
+        let readinessDeadline = Date().addingTimeInterval(3)
+
+        while Date() < readinessDeadline {
+            switch bleBridge.wifiConfigWriteReadiness {
+            case .ready:
+                return true
+            case .disconnected:
+                writePhase = .failed("雷达连接已断开，请靠近后重试")
+                return false
+            case .channelUnavailable:
+                if !refreshedCharacteristics {
+                    refreshedCharacteristics = true
+                    bleBridge.refreshCharacteristics()
+                }
+            case .statusUnavailable:
+                bleBridge.readDeviceStatus()
+            case .ownerAuthorizationRequired:
+                return await recoverOwnerSessionForWifiWrite()
+            }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+
+        if bleBridge.wifiConfigWriteReadiness == .channelUnavailable {
+            writePhase = .loading
+            guard await bleBridge.repairWifiConfigChannel() else {
+                writePhase = .failed("无法恢复雷达网络配置通道，请确认雷达开机并靠近手机")
+                return false
+            }
+            return await prepareWifiConfigWrite()
+        }
+
+        switch bleBridge.wifiConfigWriteReadiness {
+        case .ownerAuthorizationRequired:
+            return await recoverOwnerSessionForWifiWrite()
+        case .channelUnavailable:
+            writePhase = .failed("雷达网络配置通道尚未准备好，请保持靠近后重试")
+        case .statusUnavailable:
+            writePhase = .failed("尚未读取到雷达状态，请保持连接后重试")
+        case .disconnected:
+            writePhase = .failed("雷达连接已断开，请靠近后重试")
+        case .ready:
+            return true
+        }
+        return false
+    }
+
+    @MainActor
+    private func recoverOwnerSessionForWifiWrite() async -> Bool {
+        writePhase = .loading
+        do {
+            let devices = try await appState.devicesRepository.listDevices()
+            guard !devices.isEmpty else {
+                writePhase = .failed("当前账号没有已绑定的雷达凭证")
+                return false
+            }
+
+            let activeDeviceID = appState.devicesStore.activeDevice?.deviceID
+            let orderedDevices = devices.sorted { lhs, rhs in
+                lhs.deviceID == activeDeviceID && rhs.deviceID != activeDeviceID
+            }
+            guard
+                let matchedToken = await bleBridge.recoverOwnerSession(
+                    deviceTokens: orderedDevices.map(\.deviceToken)
+                ),
+                let matchedDevice = orderedDevices.first(where: { $0.deviceToken == matchedToken })
+            else {
+                writePhase = .failed("当前账号与这台雷达不匹配，无法写入网络")
+                return false
+            }
+
+            appState.devicesStore.applyServerDevice(matchedDevice)
+            guard bleBridge.wifiConfigWriteReadiness == .ready else {
+                writePhase = .failed("雷达授权尚未完成，请保持连接后重试")
+                return false
+            }
+            return true
+        } catch {
+            writePhase = .failed("无法读取雷达凭证，请检查 iPhone 网络后重试")
+            return false
+        }
+    }
+
+    @MainActor
+    private func waitForWifiConfigWriteConfirmation(since writeStartedAt: Date) async -> Bool {
+        for _ in 0..<30 {
+            guard bleBridge.isBLEConnected else {
+                writePhase = .failed("雷达连接已断开，请靠近后重试")
+                return false
+            }
+            if let rejection = BLEWifiConfigTransactionGate.rejected(
+                startedAt: writeStartedAt,
+                gattErrorAt: bleBridge.lastWifiConfigWriteErrorAt,
+                gattError: bleBridge.wifiConfigWriteError,
+                status: bleBridge.deviceStatus,
+                statusAt: bleBridge.lastDeviceStatusAt
+            ) {
+                writePhase = .failed(rejection)
+                return false
+            }
+            if BLEWifiConfigTransactionGate.confirmed(
+                startedAt: writeStartedAt,
+                gattConfirmedAt: bleBridge.lastWifiConfigWriteConfirmedAt,
+                status: bleBridge.deviceStatus,
+                statusAt: bleBridge.lastDeviceStatusAt
+            ) {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        writePhase = .failed("雷达未确认网络配置，请保持靠近后重试")
+        return false
     }
 
     @MainActor
@@ -1449,7 +1672,12 @@ struct WifiConfigSheet: View {
         if !bleBridge.isBLEConnected {
             return "雷达未连接，不能写入"
         }
-        if bleBridge.lastWriteEvent.contains("不可用") {
+        if bleBridge.lastWriteEvent.contains("所有者会话") {
+            return "正在确认雷达所有者身份，请保持连接后重试"
+        }
+        if bleBridge.lastWriteEvent.contains("不可用")
+            || bleBridge.lastWriteEvent.contains("未准备好")
+        {
             return "雷达连接未准备好，不能写入"
         }
         if bleBridge.lastWriteEvent.contains("失败") {

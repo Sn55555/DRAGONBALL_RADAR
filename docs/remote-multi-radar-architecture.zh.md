@@ -149,8 +149,12 @@ CapsuleRadar-<shortId>
 BLE Service：
 
 ```text
-service_uuid = 7d540100-f82d-4b2f-91c6-4f0f88aa5a11
+binding_service_uuid = 7d540100-f82d-4b2f-91c6-4f0f88aa5a11
+owner_service_uuid   = 7d540400-f82d-4b2f-91c6-4f0f88aa5a11
 ```
+
+所有者服务使用独立版本 UUID，避免已经缓存旧 GATT 服务表的 iPhone
+无法发现后来增加的释放通道。
 
 Characteristics：
 
@@ -162,6 +166,7 @@ Characteristics：
 | `local_location` | App -> ESP write | 本机 GPS 摘要 |
 | `device_status` | ESP -> App notify | 电量、Wi-Fi、云连接、音频状态 |
 | `server_config` | App -> ESP write | Relay URL、room token、device token |
+| `owner_control` | App -> ESP write | 所有者授权后的两阶段设备释放 |
 
 首版 iOS/ESP 固件使用以下特征 UUID 合同：
 
@@ -173,6 +178,16 @@ Characteristics：
 | `local_location` | `7d540104-f82d-4b2f-91c6-4f0f88aa5a11` |
 | `device_status` | `7d540105-f82d-4b2f-91c6-4f0f88aa5a11` |
 | `server_config` | `7d540106-f82d-4b2f-91c6-4f0f88aa5a11` |
+| `owner_control` | `7d540401-f82d-4b2f-91c6-4f0f88aa5a11` |
+
+安全释放顺序：
+
+1. App 通过已认证的所有者 BLE 会话发送 `prepare_release`。
+2. ESP 回报新的 `release_prepared` 状态，准备状态 60 秒后自动失效。
+3. App 调用 `DELETE /v1/devices/{device_id}`，服务端撤销旧 device token。
+4. 服务端成功后，App 发送 `commit_release`；ESP 回报
+   `release_committed`，清除持久化所有者、Wi-Fi、房间配置和 BLE 绑定后重启。
+5. 服务端失败时，App 发送 `cancel_release`，ESP 保留当前绑定。
 
 ### 本机定位包
 
@@ -507,7 +522,7 @@ voice_member_states
 - 语音帧只在房间成员之间转发
 - 服务端验证 `room_id + device_id + token`
 - 邀请码一次性或短期有效
-- 设备解绑后立即吊销 device token
+- 设备释放先验证 BLE 所有者会话，再吊销 device token，最后由 ESP 清除本机绑定
 
 ## MVP 开发顺序
 

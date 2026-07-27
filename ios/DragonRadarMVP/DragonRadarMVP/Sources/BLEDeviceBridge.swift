@@ -17,6 +17,7 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
     case voiceAudioUplink = "voice_audio_uplink"
     case voiceAudioDownlink = "voice_audio_downlink"
     case roomStateSnapshot = "room_state_snapshot"
+    case ownerControl = "owner_control"
 
     var id: String { rawValue }
 
@@ -46,6 +47,8 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
             CBUUID(string: "7d54010b-f82d-4b2f-91c6-4f0f88aa5a11")
         case .roomStateSnapshot:
             CBUUID(string: "7d540301-f82d-4b2f-91c6-4f0f88aa5a11")
+        case .ownerControl:
+            CBUUID(string: "7d540401-f82d-4b2f-91c6-4f0f88aa5a11")
         }
     }
 
@@ -61,6 +64,10 @@ enum RadarBLECharacteristic: String, CaseIterable, Identifiable {
         .deviceStatus,
         .serverConfig
     ]
+
+    static var requiredPhysicalAcceptanceRoles: [Self] {
+        allCases.filter { $0 != .ownerControl }
+    }
 }
 
 enum RadarRoomStateBLEPacketEncoder {
@@ -340,6 +347,116 @@ struct RadarBLEDeviceStatus: Decodable, Hashable {
     }
 }
 
+struct RadarRoomStateBLEProjectionSignature: Hashable {
+    struct Member: Hashable {
+        var memberID: String
+        var peerID: String
+        var name: String
+        var latitudeE7: Int
+        var longitudeE7: Int
+        var horizontalAccuracyCM: Int
+        var speedCMS: Int
+        var courseDeg100: Int
+        var unixTime: Int
+        var speaking: Bool
+        var locationStale: Bool
+    }
+
+    var members: [Member]
+
+    var hasSpeakingMember: Bool {
+        members.contains(where: \.speaking)
+    }
+
+    var isEmpty: Bool {
+        members.isEmpty
+    }
+
+    init(snapshot: RelayRoomStateSnapshot, localAppPeerID: String) {
+        members = snapshot.members.compactMap { member -> Member? in
+            guard
+                member.role == "app",
+                member.online,
+                member.appOnline != false,
+                member.peerID != localAppPeerID,
+                member.locationPaused != true,
+                let location = member.location,
+                let latitudeE7 = location.latE7,
+                let longitudeE7 = location.lonE7
+            else { return nil }
+
+            let speaking = member.voiceStatus?.ptt == true
+                || member.voiceStatus?.vad == true
+                || member.voiceStatus?.speaker == true
+                || snapshot.voiceFloor?.speakerGroupID == member.memberID
+                || snapshot.voiceFloor?.speakerPeerID == member.peerID
+            return Member(
+                memberID: member.memberID,
+                peerID: member.peerID,
+                name: member.name ?? member.memberID,
+                latitudeE7: latitudeE7,
+                longitudeE7: longitudeE7,
+                horizontalAccuracyCM: location.horizontalAccuracyCM ?? 0,
+                speedCMS: location.speedCMS ?? 0,
+                courseDeg100: location.courseDeg100 ?? 0,
+                unixTime: location.unixTime ?? 0,
+                speaking: speaking,
+                locationStale: member.locationStale == true
+            )
+        }
+        .prefix(RadarRoomStateBLEPacketEncoder.maximumRemoteMembers)
+        .map { $0 }
+    }
+}
+
+enum RadarRoomStateBLEProjectionPolicy {
+    static let idleKeepaliveInterval: TimeInterval = 10
+    static let speakingKeepaliveInterval: TimeInterval = 0.75
+
+    static func shouldSchedule(
+        signature: RadarRoomStateBLEProjectionSignature,
+        referenceSignature: RadarRoomStateBLEProjectionSignature?,
+        referenceDate: Date?,
+        now: Date
+    ) -> Bool {
+        guard signature == referenceSignature, let referenceDate else {
+            return true
+        }
+        let interval = signature.hasSpeakingMember
+            ? speakingKeepaliveInterval
+            : idleKeepaliveInterval
+        return now.timeIntervalSince(referenceDate) >= interval
+    }
+
+    static func shouldScheduleProjection(
+        signature: RadarRoomStateBLEProjectionSignature,
+        referenceSignature: RadarRoomStateBLEProjectionSignature?,
+        referenceWasClear: Bool,
+        referenceDate: Date?,
+        now: Date
+    ) -> Bool {
+        if referenceWasClear, signature.isEmpty {
+            guard let referenceDate else { return true }
+            return now.timeIntervalSince(referenceDate) >= idleKeepaliveInterval
+        }
+        guard !referenceWasClear else { return true }
+        return shouldSchedule(
+            signature: signature,
+            referenceSignature: referenceSignature,
+            referenceDate: referenceDate,
+            now: now
+        )
+    }
+
+    static func shouldScheduleClear(
+        referenceSignature: RadarRoomStateBLEProjectionSignature?,
+        referenceWasClear: Bool
+    ) -> Bool {
+        guard !referenceWasClear else { return false }
+        return referenceSignature?.isEmpty != true
+    }
+}
+
 enum BLEPairingTransactionGate {
     static func pairingResponseAccepted(
         status: RadarBLEDeviceStatus?,
@@ -386,6 +503,152 @@ enum BLEPairingTransactionGate {
         return status.server == 1
             && status.ownerAuth == 1
             && ownerSessionAuthorized
+    }
+}
+
+enum BLEWifiConfigTransactionGate {
+    static func confirmed(
+        startedAt: Date,
+        gattConfirmedAt: Date?,
+        status: RadarBLEDeviceStatus?,
+        statusAt: Date?
+    ) -> Bool {
+        if let gattConfirmedAt, gattConfirmedAt >= startedAt {
+            return true
+        }
+        guard
+            let status,
+            let statusAt,
+            statusAt >= startedAt
+        else { return false }
+        return status.last == "wifi_config"
+    }
+
+    static func rejected(
+        startedAt: Date,
+        gattErrorAt: Date?,
+        gattError: String?,
+        status: RadarBLEDeviceStatus?,
+        statusAt: Date?
+    ) -> String? {
+        if
+            let gattErrorAt,
+            gattErrorAt >= startedAt,
+            let gattError,
+            !gattError.isEmpty
+        {
+            return gattError
+        }
+        guard
+            let status,
+            let statusAt,
+            statusAt >= startedAt
+        else { return nil }
+        if status.last == "owner_auth_required" {
+            return "雷达所有者会话尚未确认，不能写入 OTA 网络"
+        }
+        if status.last.hasPrefix("wifi_config invalid:") {
+            return "OTA 网络配置格式无效"
+        }
+        return nil
+    }
+}
+
+enum BLEWifiConfigWriteReadiness: Equatable {
+    case disconnected
+    case channelUnavailable
+    case statusUnavailable
+    case ownerAuthorizationRequired
+    case ready
+
+    static func resolve(
+        isConnected: Bool,
+        hasWifiConfigCharacteristic: Bool,
+        status: RadarBLEDeviceStatus?,
+        ownerSessionAuthorized: Bool
+    ) -> Self {
+        guard isConnected else { return .disconnected }
+        guard hasWifiConfigCharacteristic else { return .channelUnavailable }
+        guard let status else { return .statusUnavailable }
+        if
+            status.paired == 1,
+            status.ownerAuthRequired == 1,
+            !ownerSessionAuthorized
+        {
+            return .ownerAuthorizationRequired
+        }
+        return .ready
+    }
+}
+
+enum BLEFirmwareOTACapability: Equatable {
+    case unknown
+    case supported
+    case unsupported
+
+    static func resolve(
+        otaCapable: Int?,
+        hasControlCharacteristic: Bool,
+        hasStatusCharacteristic: Bool
+    ) -> Self {
+        if otaCapable == 0 {
+            return .unsupported
+        }
+        if otaCapable == 1 || (hasControlCharacteristic && hasStatusCharacteristic) {
+            return .supported
+        }
+        return .unknown
+    }
+}
+
+enum BLEOwnerReleaseTransactionGate {
+    static func prepared(
+        status: RadarBLEDeviceStatus?,
+        statusAt: Date?,
+        startedAt: Date,
+        ownerSessionAuthorized: Bool
+    ) -> Bool {
+        guard
+            let status,
+            let statusAt,
+            statusAt >= startedAt
+        else { return false }
+        return status.last == "release_prepared"
+            && status.paired == 1
+            && status.ownerAuth == 1
+            && ownerSessionAuthorized
+    }
+
+    static func committed(
+        status: RadarBLEDeviceStatus?,
+        statusAt: Date?,
+        startedAt: Date
+    ) -> Bool {
+        guard
+            let status,
+            let statusAt,
+            statusAt >= startedAt
+        else { return false }
+        return status.last == "release_committed"
+    }
+
+    static func rejected(
+        status: RadarBLEDeviceStatus?,
+        statusAt: Date?,
+        startedAt: Date
+    ) -> Bool {
+        guard
+            let status,
+            let statusAt,
+            statusAt >= startedAt
+        else { return false }
+        return [
+            "release_not_bound",
+            "release_blocked_ota",
+            "release_not_prepared",
+            "release_command_invalid",
+            "release_command_unknown"
+        ].contains(status.last)
     }
 }
 
@@ -473,16 +736,32 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     @ObservationIgnored private var voiceGatewayAnnounced = false
     @ObservationIgnored private var voiceControlHandler: ((Data) -> Void)?
     @ObservationIgnored private var voiceUplinkHandler: ((Data) -> Void)?
-    @ObservationIgnored private var latestRoomStateProjection: (snapshot: RelayRoomStateSnapshot, localAppPeerID: String)?
+    @ObservationIgnored private var voiceReadyHandler: (() -> Void)?
+    @ObservationIgnored private var latestRoomStateProjection: (
+        snapshot: RelayRoomStateSnapshot,
+        localAppPeerID: String,
+        signature: RadarRoomStateBLEProjectionSignature
+    )?
     @ObservationIgnored private var roomStateClearPending = false
     @ObservationIgnored private var roomStateWriteQueue: [Data] = []
     @ObservationIgnored private var roomStateWriteInFlight = false
+    @ObservationIgnored private var roomStatePacketStartedAt: Date?
+    @ObservationIgnored private var roomStatePacketOpcode: UInt8 = 0
     @ObservationIgnored private var roomStateNeedsReplay = false
     @ObservationIgnored private var roomStateSequence: UInt16 = 0
+    @ObservationIgnored private var roomStateCurrentSignature: RadarRoomStateBLEProjectionSignature?
+    @ObservationIgnored private var roomStateCurrentWasClear = false
+    @ObservationIgnored private var roomStateCurrentStartedAt: Date?
+    @ObservationIgnored private var roomStateCommittedSignature: RadarRoomStateBLEProjectionSignature?
+    @ObservationIgnored private var roomStateCommittedWasClear = false
+    @ObservationIgnored private var roomStateCommittedAt: Date?
+    @ObservationIgnored private var roomStateProjectionSuspended = false
+    @ObservationIgnored private var roomStateResumeTask: Task<Void, Never>?
 
     let radarServiceUUID = CBUUID(string: "7d540100-f82d-4b2f-91c6-4f0f88aa5a11")
     let voiceServiceUUID = CBUUID(string: "7d540200-f82d-4b2f-91c6-4f0f88aa5a11")
     let roomStateServiceUUID = CBUUID(string: "7d540300-f82d-4b2f-91c6-4f0f88aa5a11")
+    let ownerServiceUUID = CBUUID(string: "7d540400-f82d-4b2f-91c6-4f0f88aa5a11")
 
     var candidates: [BLEDeviceCandidate] = []
     var isScanning = false
@@ -501,6 +780,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     var firmwareStatus: RadarBLEFirmwareStatus?
     var lastFirmwareStatusAt: Date?
     var firmwareControlWriteError: String?
+    var lastWifiConfigWriteConfirmedAt: Date?
+    var lastWifiConfigWriteErrorAt: Date?
+    var wifiConfigWriteError: String?
     var firmwareReconnectText = "未启用"
     var ownerSessionAuthorized = false
     var lastWriteEvent = "尚未写入雷达" {
@@ -549,6 +831,10 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         bleTransportConnected
     }
 
+    var isProvisioningChannelReady: Bool {
+        RadarBLECharacteristic.requiredProvisioningRoles.allSatisfy(hasCharacteristic)
+    }
+
     var hasSavedGateway: Bool {
         defaults.string(forKey: Self.gatewayPeripheralKey) != nil
     }
@@ -565,7 +851,8 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             break
         }
         if bleSecurityRepairRequired { return "需要更新系统配对" }
-        if isBLEConnected { return "已连接" }
+        if isBLEConnected, isProvisioningChannelReady { return "已连接" }
+        if isBLEConnected { return "正在连接" }
         if isScanning || selectedPeripheralID != nil || (hasSavedGateway && !scanTimedOut) {
             return "正在连接"
         }
@@ -576,8 +863,11 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         if bleSecurityRepairRequired {
             return bleSecurityRepairText
         }
-        if isBLEConnected {
+        if isBLEConnected, isProvisioningChannelReady {
             return "\(connectedPeripheralName) · 以后打开 App 会自动连接"
+        }
+        if isBLEConnected {
+            return "\(connectedPeripheralName) · 正在恢复雷达控制通道"
         }
         if centralState == .poweredOff {
             return "开启手机蓝牙后，App 会自动连接已保存的雷达"
@@ -595,17 +885,49 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
     }
 
     private var radarServiceUUIDs: [CBUUID] {
-        [radarServiceUUID, voiceServiceUUID, roomStateServiceUUID]
+        [radarServiceUUID, voiceServiceUUID, roomStateServiceUUID, ownerServiceUUID]
     }
 
     private func discoverRadarServices(on peripheral: CBPeripheral) {
+        if let cachedServices = peripheral.services {
+            for service in cachedServices where radarServiceUUIDs.contains(service.uuid) {
+                if let cachedCharacteristics = service.characteristics, !cachedCharacteristics.isEmpty {
+                    registerRadarCharacteristics(
+                        cachedCharacteristics,
+                        service: service,
+                        peripheral: peripheral,
+                        source: "cache"
+                    )
+                }
+                peripheral.discoverCharacteristics(nil, for: service)
+            }
+        }
         peripheral.discoverServices(radarServiceUUIDs)
     }
 
+    var firmwareOTACapability: BLEFirmwareOTACapability {
+        BLEFirmwareOTACapability.resolve(
+            otaCapable: deviceStatus?.otaCapable,
+            hasControlCharacteristic: hasCharacteristic(.firmwareControl),
+            hasStatusCharacteristic: hasCharacteristic(.firmwareStatus)
+        )
+    }
+
     var supportsFirmwareOTA: Bool {
-        guard hasCharacteristic(.firmwareControl), hasCharacteristic(.firmwareStatus) else { return false }
-        if deviceStatus?.otaCapable == 0 { return false }
-        return true
+        firmwareOTACapability == .supported
+    }
+
+    var isFirmwareOTAChannelReady: Bool {
+        hasCharacteristic(.firmwareControl) && hasCharacteristic(.firmwareStatus)
+    }
+
+    var wifiConfigWriteReadiness: BLEWifiConfigWriteReadiness {
+        BLEWifiConfigWriteReadiness.resolve(
+            isConnected: isBLEConnected,
+            hasWifiConfigCharacteristic: hasCharacteristic(.wifiConfig),
+            status: deviceStatus,
+            ownerSessionAuthorized: ownerSessionAuthorized
+        )
     }
 
     var isVoiceGatewayReady: Bool {
@@ -618,10 +940,12 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
     func configureVoiceGateway(
         onControl: @escaping (Data) -> Void,
-        onUplinkFrame: @escaping (Data) -> Void
+        onUplinkFrame: @escaping (Data) -> Void,
+        onReady: @escaping () -> Void
     ) {
         voiceControlHandler = onControl
         voiceUplinkHandler = onUplinkFrame
+        voiceReadyHandler = onReady
         activateVoiceGatewayIfReady()
     }
 
@@ -746,6 +1070,93 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         return false
     }
 
+    func prepareOwnerRelease() -> Bool {
+        guard ownerSessionAuthorized, deviceStatus?.paired == 1 else {
+            lastWriteEvent = "雷达所有者会话尚未确认，不能释放设备"
+            return false
+        }
+        guard hasCharacteristic(.ownerControl) else {
+            lastWriteEvent = "当前雷达固件不支持安全释放，请先更新固件"
+            return false
+        }
+        return writeJSON(
+            ["version": "1", "command": "prepare_release"],
+            role: .ownerControl
+        )
+    }
+
+    func cancelOwnerRelease() {
+        guard hasCharacteristic(.ownerControl), ownerSessionAuthorized else { return }
+        _ = writeJSON(
+            ["version": "1", "command": "cancel_release"],
+            role: .ownerControl
+        )
+    }
+
+    func commitOwnerRelease() -> Bool {
+        guard ownerSessionAuthorized, hasCharacteristic(.ownerControl) else {
+            lastWriteEvent = "雷达释放确认通道不可用"
+            return false
+        }
+        return writeJSON(
+            ["version": "1", "command": "commit_release"],
+            role: .ownerControl
+        )
+    }
+
+    func confirmOwnerReleasePrepared(
+        startedAt: Date,
+        timeoutSeconds: TimeInterval = 6
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if BLEOwnerReleaseTransactionGate.prepared(
+                status: deviceStatus,
+                statusAt: lastDeviceStatusAt,
+                startedAt: startedAt,
+                ownerSessionAuthorized: ownerSessionAuthorized
+            ) {
+                return true
+            }
+            if BLEOwnerReleaseTransactionGate.rejected(
+                status: deviceStatus,
+                statusAt: lastDeviceStatusAt,
+                startedAt: startedAt
+            ) {
+                return false
+            }
+            readDeviceStatus()
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+        return false
+    }
+
+    func confirmOwnerReleaseCommitted(
+        startedAt: Date,
+        timeoutSeconds: TimeInterval = 4
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if BLEOwnerReleaseTransactionGate.committed(
+                status: deviceStatus,
+                statusAt: lastDeviceStatusAt,
+                startedAt: startedAt
+            ) {
+                return true
+            }
+            if BLEOwnerReleaseTransactionGate.rejected(
+                status: deviceStatus,
+                statusAt: lastDeviceStatusAt,
+                startedAt: startedAt
+            ) {
+                return false
+            }
+            readDeviceStatus()
+            try? await Task.sleep(for: .milliseconds(120))
+        }
+        return false
+    }
+
     private func authorizeOwnerSessionIfPossible() {
         guard deviceStatus?.paired == 1, deviceStatus?.ownerAuthRequired == 1 else { return }
         guard !ownerSessionAuthorized, ownerAuthAttemptChallenge != pairingChallengeText else { return }
@@ -783,11 +1194,82 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         lastEvent = "重新检测雷达连接"
         if let services = peripheral.services, !services.isEmpty {
             for service in services where radarServiceUUIDs.contains(service.uuid) {
+                if let cachedCharacteristics = service.characteristics, !cachedCharacteristics.isEmpty {
+                    registerRadarCharacteristics(
+                        cachedCharacteristics,
+                        service: service,
+                        peripheral: peripheral,
+                        source: "refresh-cache"
+                    )
+                }
                 peripheral.discoverCharacteristics(nil, for: service)
             }
+            peripheral.discoverServices(radarServiceUUIDs)
         } else {
             discoverRadarServices(on: peripheral)
         }
+    }
+
+    func repairWifiConfigChannel(timeoutSeconds: TimeInterval = 12) async -> Bool {
+        guard isBLEConnected else {
+            print("DragonRadar BLE wifi_channel_repair result=skipped reason=disconnected")
+            return false
+        }
+        print(
+            "DragonRadar BLE wifi_channel_repair "
+                + "phase=refresh cached_roles=\(availableCharacteristicNames.count)"
+        )
+        refreshCharacteristics()
+
+        let cacheDeadline = Date().addingTimeInterval(2)
+        while Date() < cacheDeadline {
+            if hasCharacteristic(.wifiConfig) {
+                print("DragonRadar BLE wifi_channel_repair result=ready source=cache")
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+
+        guard
+            let central,
+            let selectedPeripheralID,
+            let peripheral = peripherals[selectedPeripheralID]
+        else { return false }
+
+        lastEvent = "正在重建雷达控制通道"
+        print(
+            "DragonRadar BLE wifi_channel_repair "
+                + "phase=reconnect peripheral=\(peripheral.identifier.uuidString)"
+        )
+        manualDisconnectRequested = false
+        central.cancelPeripheralConnection(peripheral)
+
+        let reconnectDeadline = Date().addingTimeInterval(timeoutSeconds)
+        var reconnectIssued = false
+        while Date() < reconnectDeadline {
+            if isBLEConnected, hasCharacteristic(.wifiConfig) {
+                print("DragonRadar BLE wifi_channel_repair result=ready source=reconnect")
+                return true
+            }
+            if peripheral.state == .disconnected, !reconnectIssued {
+                reconnectIssued = true
+                self.selectedPeripheralID = peripheral.identifier
+                connectedPeripheralName = peripheral.name ?? connectedPeripheralName
+                central.connect(
+                    peripheral,
+                    options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true]
+                )
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        let ready = isBLEConnected && hasCharacteristic(.wifiConfig)
+        print(
+            "DragonRadar BLE wifi_channel_repair "
+                + "result=\(ready ? "ready" : "failed") "
+                + "transport=\(isBLEConnected ? 1 : 0) "
+                + "wifi_role=\(hasCharacteristic(.wifiConfig) ? 1 : 0)"
+        )
+        return ready
     }
 
     func readDeviceStatus() {
@@ -1349,7 +1831,18 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         characteristics.removeAll()
         roomStateWriteQueue.removeAll()
         roomStateWriteInFlight = false
+        roomStatePacketStartedAt = nil
+        roomStatePacketOpcode = 0
         roomStateNeedsReplay = latestRoomStateProjection != nil || roomStateClearPending
+        roomStateCurrentSignature = nil
+        roomStateCurrentWasClear = false
+        roomStateCurrentStartedAt = nil
+        roomStateCommittedSignature = nil
+        roomStateCommittedWasClear = false
+        roomStateCommittedAt = nil
+        roomStateProjectionSuspended = false
+        roomStateResumeTask?.cancel()
+        roomStateResumeTask = nil
     }
 
     func connect(_ candidate: BLEDeviceCandidate) {
@@ -1484,6 +1977,47 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             return
         }
         central?.cancelPeripheralConnection(peripheral)
+    }
+
+    func forgetReleasedDevice() {
+        manualDisconnectRequested = true
+        gatewayReconnectTask?.cancel()
+        stopFirmwareReconnectTracking(clearTarget: true, suppressed: true)
+        central?.stopScan()
+        isScanning = false
+
+        if
+            let selectedPeripheralID,
+            let peripheral = peripherals[selectedPeripheralID],
+            peripheral.state == .connected || peripheral.state == .connecting
+        {
+            central?.cancelPeripheralConnection(peripheral)
+        }
+
+        defaults.removeObject(forKey: Self.gatewayPeripheralKey)
+        defaults.removeObject(forKey: Self.persistedPairedKey)
+        defaults.removeObject(forKey: Self.persistedServerConfiguredKey)
+        defaults.removeObject(forKey: Self.persistedDeviceNameKey)
+        selectedPeripheralID = nil
+        bleTransportConnected = false
+        connectedPeripheralName = "未连接"
+        candidates.removeAll()
+        characteristics.removeAll()
+        discoveredCharacteristics.removeAll()
+        availableCharacteristicNames.removeAll()
+        deviceStatus = nil
+        deviceStatusText = "未读取"
+        lastDeviceStatusAt = nil
+        pairingChallengeText = "未读取"
+        ownerDeviceToken = ""
+        ownerSessionAuthorized = false
+        ownerAuthAttemptChallenge = nil
+        persistedPaired = false
+        persistedServerConfigured = false
+        persistedDeviceName = "未注册"
+        voiceGatewayAnnounced = false
+        voiceGatewayText = "等待雷达语音通道"
+        lastEvent = "雷达已释放，可由其他账号重新绑定"
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -1830,6 +2364,20 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         }
 
         let serviceCharacteristics = service.characteristics ?? []
+        registerRadarCharacteristics(
+            serviceCharacteristics,
+            service: service,
+            peripheral: peripheral,
+            source: "discovery"
+        )
+    }
+
+    private func registerRadarCharacteristics(
+        _ serviceCharacteristics: [CBCharacteristic],
+        service: CBService,
+        peripheral: CBPeripheral,
+        source: String
+    ) {
         discoveredCharacteristics = Array(
             Set(discoveredCharacteristics + serviceCharacteristics.map(\.uuid.uuidString))
         ).sorted()
@@ -1853,6 +2401,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
         print(
             "DragonRadar BLE discovery "
+                + "source=\(source) "
                 + "service=\(service.uuid.uuidString) "
                 + "roles=\(availableCharacteristicNames.count)/\(RadarBLECharacteristic.allCases.count) "
                 + "owner=\(ownerSessionAuthorized ? 1 : 0) "
@@ -1985,19 +2534,37 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         return written
     }
 
-    func writeWifiConfig(ssid: String, password: String) -> Bool {
+    func writeWifiConfig(ssid: String, password: String) async -> Bool {
+        if
+            deviceStatus?.paired == 1,
+            deviceStatus?.ownerAuthRequired == 1,
+            !ownerSessionAuthorized
+        {
+            authorizeOwnerSessionIfPossible()
+            lastWriteEvent = "雷达所有者会话尚未确认，不能写入 OTA 网络"
+            return false
+        }
+        lastWifiConfigWriteConfirmedAt = nil
+        lastWifiConfigWriteErrorAt = nil
+        wifiConfigWriteError = nil
         let payload = [
             "version": "1",
             "ssid": ssid,
             "password": password
         ]
-        let written = writeJSON(payload, role: .wifiConfig)
-        if written {
-            deviceStatus = nil
-            deviceStatusText = "等待雷达上报"
-            lastDeviceStatusAt = nil
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            lastWriteEvent = "OTA 网络配置生成失败"
+            return false
         }
-        return written
+        print(
+            "DragonRadar BLE wifi_config "
+                + "phase=write_start "
+                + "channel=\(hasCharacteristic(.wifiConfig) ? 1 : 0) "
+                + "owner=\(ownerSessionAuthorized ? 1 : 0) "
+                + "ssid_bytes=\(ssid.utf8.count) "
+                + "password_bytes=\(password.utf8.count)"
+        )
+        return await writeWifiConfigData(data)
     }
 
     func writeServerConfig(
@@ -2058,7 +2625,14 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
     @discardableResult
     func writeRoomStateSnapshot(_ snapshot: RelayRoomStateSnapshot, localAppPeerID: String) -> Bool {
-        latestRoomStateProjection = (snapshot, localAppPeerID)
+        latestRoomStateProjection = (
+            snapshot,
+            localAppPeerID,
+            RadarRoomStateBLEProjectionSignature(
+                snapshot: snapshot,
+                localAppPeerID: localAppPeerID
+            )
+        )
         roomStateClearPending = false
         return scheduleLatestRoomStateProjection()
     }
@@ -2079,6 +2653,14 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             roomStateNeedsReplay = true
             return false
         }
+        guard latestRoomStateProjectionNeedsWrite() else {
+            roomStateNeedsReplay = false
+            return true
+        }
+        if roomStateProjectionSuspended {
+            roomStateNeedsReplay = true
+            return true
+        }
         if roomStateWriteInFlight || !roomStateWriteQueue.isEmpty {
             roomStateNeedsReplay = true
             return true
@@ -2091,17 +2673,52 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
                 localAppPeerID: projection.localAppPeerID,
                 sequence: roomStateSequence
             )
+            roomStateCurrentSignature = projection.signature
+            roomStateCurrentWasClear = false
         } else if roomStateClearPending {
             roomStateWriteQueue = RadarRoomStateBLEPacketEncoder.emptyPackets(
                 serverTime: Int(Date().timeIntervalSince1970),
                 sequence: roomStateSequence
             )
+            roomStateCurrentSignature = nil
+            roomStateCurrentWasClear = true
         } else {
             return false
         }
+        roomStateCurrentStartedAt = Date()
         roomStateNeedsReplay = false
         flushRoomStateWriteQueue()
         return true
+    }
+
+    private func latestRoomStateProjectionNeedsWrite(now: Date = Date()) -> Bool {
+        let transactionActive = roomStateWriteInFlight || !roomStateWriteQueue.isEmpty
+        let referenceSignature = transactionActive
+            ? roomStateCurrentSignature
+            : roomStateCommittedSignature
+        let referenceWasClear = transactionActive
+            ? roomStateCurrentWasClear
+            : roomStateCommittedWasClear
+        let referenceDate = transactionActive
+            ? roomStateCurrentStartedAt
+            : roomStateCommittedAt
+
+        if let projection = latestRoomStateProjection {
+            return RadarRoomStateBLEProjectionPolicy.shouldScheduleProjection(
+                signature: projection.signature,
+                referenceSignature: referenceSignature,
+                referenceWasClear: referenceWasClear,
+                referenceDate: referenceDate,
+                now: now
+            )
+        }
+        if roomStateClearPending {
+            return RadarRoomStateBLEProjectionPolicy.shouldScheduleClear(
+                referenceSignature: referenceSignature,
+                referenceWasClear: referenceWasClear
+            )
+        }
+        return false
     }
 
     private func flushRoomStateWriteQueue() {
@@ -2126,14 +2743,35 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             return
         }
         roomStateWriteInFlight = true
+        let opcode = packet.count > 1 ? packet[1] : 0
+        roomStatePacketStartedAt = Date()
+        roomStatePacketOpcode = opcode
+        print(
+            "DragonRadar BLE room_state write_start "
+                + "sequence=\(roomStateSequence) opcode=\(opcode) "
+                + "remaining=\(roomStateWriteQueue.count)"
+        )
         peripheral.writeValue(packet, for: characteristic, type: .withResponse)
     }
 
     private func handleRoomStateWriteResult(error: String?) {
+        let latencyMS = roomStatePacketStartedAt.map {
+            max(0, Int(Date().timeIntervalSince($0) * 1_000))
+        } ?? -1
+        print(
+            "DragonRadar BLE room_state write_result "
+                + "sequence=\(roomStateSequence) opcode=\(roomStatePacketOpcode) "
+                + "latency_ms=\(latencyMS) result=\(error == nil ? "ok" : "failed")"
+        )
         roomStateWriteInFlight = false
+        roomStatePacketStartedAt = nil
+        roomStatePacketOpcode = 0
         if let error {
             roomStateWriteQueue.removeAll()
             roomStateNeedsReplay = true
+            roomStateCurrentSignature = nil
+            roomStateCurrentWasClear = false
+            roomStateCurrentStartedAt = nil
             print("DragonRadar BLE room_state write_failed error=\(error)")
             return
         }
@@ -2141,10 +2779,107 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             flushRoomStateWriteQueue()
             return
         }
+        roomStateCommittedSignature = roomStateCurrentSignature
+        roomStateCommittedWasClear = roomStateCurrentWasClear
+        roomStateCommittedAt = Date()
+        roomStateCurrentSignature = nil
+        roomStateCurrentWasClear = false
+        roomStateCurrentStartedAt = nil
         print("DragonRadar BLE room_state projected device=\(connectedPeripheralName)")
-        if roomStateNeedsReplay {
+        if roomStateNeedsReplay, !roomStateProjectionSuspended {
             _ = scheduleLatestRoomStateProjection()
         }
+    }
+
+    func beginExclusiveControlWrite(timeoutSeconds: TimeInterval = 3) async -> Bool {
+        roomStateResumeTask?.cancel()
+        roomStateResumeTask = nil
+        roomStateProjectionSuspended = true
+        roomStateNeedsReplay = latestRoomStateProjection != nil || roomStateClearPending
+        print(
+            "DragonRadar BLE control_barrier "
+                + "phase=drain room_inflight=\(roomStateWriteInFlight ? 1 : 0) "
+                + "room_queued=\(roomStateWriteQueue.count)"
+        )
+
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while
+            (roomStateWriteInFlight || !roomStateWriteQueue.isEmpty),
+            Date() < deadline
+        {
+            try? await Task.sleep(for: .milliseconds(40))
+        }
+        guard isBLEConnected else {
+            roomStateProjectionSuspended = false
+            print(
+                "DragonRadar BLE control_barrier "
+                    + "result=failed reason=disconnected"
+            )
+            return false
+        }
+        guard !roomStateWriteInFlight, roomStateWriteQueue.isEmpty else {
+            roomStateProjectionSuspended = false
+            print(
+                "DragonRadar BLE control_barrier "
+                    + "result=failed reason=room_transaction_timeout "
+                    + "room_inflight=\(roomStateWriteInFlight ? 1 : 0) "
+                    + "room_queued=\(roomStateWriteQueue.count)"
+            )
+            return false
+        }
+        print("DragonRadar BLE control_barrier result=ready")
+        return true
+    }
+
+    func endExclusiveControlWrite(resumeDelaySeconds: TimeInterval = 0.5) {
+        roomStateResumeTask?.cancel()
+        roomStateResumeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(resumeDelaySeconds))
+            guard !Task.isCancelled, let self else { return }
+            self.roomStateProjectionSuspended = false
+            self.roomStateResumeTask = nil
+            print("DragonRadar BLE control_barrier phase=resume")
+            if self.roomStateNeedsReplay {
+                _ = self.scheduleLatestRoomStateProjection()
+            }
+        }
+    }
+
+    private func writeWifiConfigData(_ data: Data, timeoutSeconds: TimeInterval = 3) async -> Bool {
+        guard
+            let selectedPeripheralID,
+            let peripheral = peripherals[selectedPeripheralID],
+            let characteristic = characteristics[.wifiConfig]
+        else {
+            lastWriteEvent = "雷达网络配置通道未准备好"
+            return false
+        }
+
+        if characteristic.properties.contains(.writeWithoutResponse) {
+            let maximumLength = peripheral.maximumWriteValueLength(for: .withoutResponse)
+            guard data.count <= maximumLength else {
+                lastWriteEvent = "OTA 网络配置过长（\(data.count)/\(maximumLength) 字节）"
+                return false
+            }
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while !peripheral.canSendWriteWithoutResponse, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(40))
+            }
+            guard peripheral.canSendWriteWithoutResponse else {
+                lastWriteEvent = "雷达蓝牙写入队列繁忙，请重试"
+                return false
+            }
+            peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+            lastWriteEvent = "OTA 网络配置已发送，等待雷达确认"
+            print(
+                "DragonRadar BLE wifi_config "
+                    + "phase=sent mode=without_response bytes=\(data.count) mtu=\(maximumLength)"
+            )
+            return true
+        }
+
+        print("DragonRadar BLE wifi_config phase=fallback mode=with_response")
+        return writeData(data, role: .wifiConfig)
     }
 
     @discardableResult
@@ -2176,6 +2911,7 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
 
     private func activateVoiceGatewayIfReady() {
         guard isVoiceGatewayReady else { return }
+        let wasAnnounced = voiceGatewayAnnounced
         if !voiceGatewayAnnounced {
             voiceGatewayAnnounced = sendVoiceControl(command: "gateway_ready")
             print(
@@ -2186,6 +2922,9 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
         }
         if voiceGatewayAnnounced {
             voiceGatewayText = "BLE 语音网关已就绪"
+        }
+        if !wasAnnounced, voiceGatewayAnnounced {
+            voiceReadyHandler?()
         }
         flushVoiceDownlinkQueue()
     }
@@ -2319,14 +3058,26 @@ final class BLEDeviceBridge: NSObject, @preconcurrency CBCentralManagerDelegate,
             lastWriteEvent = "写入雷达失败：\(error)"
             if role == .firmwareControl {
                 firmwareControlWriteError = lastWriteEvent
+            } else if role == .wifiConfig {
+                lastWifiConfigWriteErrorAt = Date()
+                wifiConfigWriteError = lastWriteEvent
+                print("DragonRadar BLE wifi_config result=failed error=\(error)")
             }
         } else {
             lastWriteEvent = "雷达写入已确认"
             rememberConfirmedWrite(role)
-            if role == .pairingResponse || role == .wifiConfig || role == .serverConfig {
+            if role == .pairingResponse
+                || role == .wifiConfig
+                || role == .serverConfig
+                || role == .ownerControl
+            {
                 readDeviceStatus()
             } else if role == .firmwareControl {
                 readFirmwareStatus()
+            }
+            if role == .wifiConfig {
+                lastWifiConfigWriteConfirmedAt = Date()
+                print("DragonRadar BLE wifi_config result=confirmed")
             }
         }
     }

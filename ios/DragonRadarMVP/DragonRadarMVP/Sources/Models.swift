@@ -228,6 +228,7 @@ struct ServerDevice: Decodable, Hashable {
     var name: String
     var deviceToken: String
     var pairingResponse: String
+    var registrationCreated: Bool?
 
     enum CodingKeys: String, CodingKey {
         case deviceID = "device_id"
@@ -235,6 +236,7 @@ struct ServerDevice: Decodable, Hashable {
         case name
         case deviceToken = "device_token"
         case pairingResponse = "pairing_response"
+        case registrationCreated = "registration_created"
     }
 }
 
@@ -2440,12 +2442,52 @@ final class AppState {
     }
 
     func cancelRegisteredDevice(_ device: ServerDevice) async {
+        guard device.registrationCreated == true else {
+            lastRoomAPIEvent = "雷达未接受绑定，已保留原设备凭证"
+            bump()
+            return
+        }
         do {
             try await devicesRepository.revokeDevice(deviceID: device.deviceID)
             lastRoomAPIEvent = "雷达未接受绑定，临时凭证已撤销"
         } catch {
             lastRoomAPIEvent = "雷达未接受绑定，临时凭证撤销待重试"
         }
+        bump()
+    }
+
+    func releaseDeviceAndWait(deviceID: String) async -> AppOperationResult {
+        guard isSignedIn else {
+            return AppOperationResult(succeeded: false, message: AppError.notSignedIn.localizedDescription)
+        }
+        let cleanDeviceID = deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanDeviceID.isEmpty else {
+            return AppOperationResult(succeeded: false, message: "设备身份缺失，无法释放")
+        }
+
+        do {
+            try await devicesRepository.revokeDevice(deviceID: cleanDeviceID)
+        } catch RoomRepositoryError.server(let code, _) where code == "invalid_device" {
+            // A retry after the server committed the release is safe. Finish
+            // removing the stale local credential instead of trapping the user.
+        } catch {
+            return AppOperationResult(
+                succeeded: false,
+                message: "释放失败 · \(AppError.userFacingMessage(for: error))"
+            )
+        }
+
+        lastRoomAPIEvent = "雷达云端身份已撤销，等待本机清除确认"
+        bump()
+        return AppOperationResult(succeeded: true, message: "云端身份已撤销")
+    }
+
+    func completeReleasedDeviceLocally(deviceID: String) {
+        let cleanDeviceID = deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if devicesStore.activeDevice?.deviceID == cleanDeviceID {
+            devicesStore.clearDevices()
+        }
+        lastRoomAPIEvent = "雷达已从当前账号释放"
         bump()
     }
     #endif

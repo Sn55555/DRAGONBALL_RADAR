@@ -362,6 +362,7 @@ final class RadarRuntime {
     @ObservationIgnored private var voiceWakeHandler: ((String, String) -> Void)?
     @ObservationIgnored private var voiceFrameHandler: ((Data) -> Void)?
     @ObservationIgnored private var voiceGrantedHandler: ((String) -> Void)?
+    @ObservationIgnored private var voiceBusyHandler: ((String) -> Void)?
     @ObservationIgnored private var voiceEndHandler: (() -> Void)?
     @ObservationIgnored private var activeVoiceRequestID = ""
     @ObservationIgnored private var pendingVoiceReadyRequestID = ""
@@ -435,11 +436,13 @@ final class RadarRuntime {
         onWake: @escaping (String, String) -> Void,
         onFrame: @escaping (Data) -> Void,
         onGranted: @escaping (String) -> Void,
+        onBusy: @escaping (String) -> Void,
         onEnd: @escaping () -> Void
     ) {
         voiceWakeHandler = onWake
         voiceFrameHandler = onFrame
         voiceGrantedHandler = onGranted
+        voiceBusyHandler = onBusy
         voiceEndHandler = onEnd
     }
 
@@ -488,20 +491,24 @@ final class RadarRuntime {
 
     func releaseVoiceFloor(requestID: String? = nil) async {
         let effectiveID = requestID ?? activeVoiceRequestID
-        do {
-            try await sendRelayJSON([
-                "type": "gateway_voice_release",
-                "request_id": effectiveID
-            ])
-        } catch {
-            noteVoiceEvent("语音释放失败：\(error.localizedDescription)")
+        if !effectiveID.isEmpty {
+            do {
+                try await sendRelayJSON([
+                    "type": "gateway_voice_release",
+                    "request_id": effectiveID
+                ])
+            } catch {
+                noteVoiceEvent("语音释放失败：\(error.localizedDescription)")
+            }
         }
-        activeVoiceRequestID = ""
+        if activeVoiceRequestID == effectiveID {
+            activeVoiceRequestID = ""
+        }
         voicePhase = .idle
     }
 
     func sendVoiceFrame(_ frame: Data) async {
-        guard relayPhase == .ready, !frame.isEmpty else { return }
+        guard relayPhase == .ready, !activeVoiceRequestID.isEmpty, !frame.isEmpty else { return }
         let sequence: UInt32 = frame.count >= 8
             ? frame[4..<8].enumerated().reduce(0) { partial, item in
                 partial | (UInt32(item.element) << UInt32(item.offset * 8))
@@ -1063,11 +1070,16 @@ final class RadarRuntime {
     #if !APP_ONLY
     private func handleVoiceBusy(_ object: [String: Any]) {
         voicePhase = .degraded
+        let requestID = object["request_id"] as? String ?? activeVoiceRequestID
         let speakerGroupID = object["speaker_group_id"] as? String
         let speakerPeerID = object["speaker_peer_id"] as? String
         let speaker = speakerGroupID ?? speakerPeerID ?? "其他成员"
+        if requestID == activeVoiceRequestID {
+            activeVoiceRequestID = ""
+        }
         noteVoiceEvent("抢麦失败，\(speaker) 正在说话")
         noteRelayEvent("当前有人正在说话 · \(speaker)")
+        voiceBusyHandler?(requestID)
     }
     #endif
 

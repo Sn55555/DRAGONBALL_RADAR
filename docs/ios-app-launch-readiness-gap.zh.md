@@ -156,7 +156,7 @@
 - `pairing_response` 已不再是 `mvp-response:<challenge>`；服务端签发 v2 HMAC 响应，ESP 验证当前 challenge、device_id、nonce 和 HMAC 后才确认 paired。
 - `device_token` 已由服务端签发并可撤销。
 - `wifi_config` 明文 JSON 写入 BLE；上线前至少需要明确安全边界和短连接暴露策略。
-- 设备列表已接服务端，仍需真机验证多账号恢复和解绑后的 ESP 行为。
+- 设备列表已接服务端；App、Relay 和 ESP 已实现两阶段安全释放，仍需真机验证多账号恢复及释放后重新绑定。
 - 当前 v2 使用共享 HMAC key，不是每台设备独立公私钥；发布 preflight 已防止默认开发 key 和服务端/固件 key 不一致，泄露后的轮换流程仍需运营文档和真机演练。
 
 实施步骤：
@@ -168,7 +168,11 @@
 5. App 写入 `server_config`，内容使用服务端签发的 `device_token`。已完成。
 6. 服务端保存用户和设备绑定关系。已完成。
 7. App 设备列表改为 `GET /v1/devices`。已完成。
-8. 增加解绑接口，解绑后服务端撤销 device token。已完成。
+8. 增加释放设备闭环：App 先通过所有者 BLE 会话执行
+   `prepare_release`，再由服务端撤销 device token，最后发送
+   `commit_release`；ESP 确认后清除所有者、Wi-Fi、房间配置和 BLE 绑定并重启。
+   服务端失败时发送 `cancel_release`，不改变 ESP 的物理绑定。代码、固件构建和
+   iOS 状态机单测已完成，待两台真机执行释放后重新绑定验收。
 9. BLE 配网写入前要求设备处于未绑定或当前用户已绑定状态。
 10. 发布构建时设置生产密钥：Relay 使用 `DRAGON_RADAR_PAIRING_HMAC_KEY`，固件构建使用 `PAIRING_HMAC_KEY=... RADAR_RELEASE=1 tools/build_radar.sh field`。已完成 preflight。
 11. 使用 `tools/prepare_release_pairing_key.sh check` 验证当前环境；使用 `tools/prepare_release_pairing_key.sh write-env output/release-current/secrets` 生成 `relay.env`、`firmware.env` 和不含 secret 的 fingerprint manifest。已完成并纳入 `tools/verify_project.sh quick/full`。
@@ -178,6 +182,8 @@
 - 未登录用户不能绑定设备。
 - 已绑定到其他用户的设备不能被直接覆盖绑定。
 - 解绑后 ESP 使用旧 token 连接 Relay 会被拒绝。
+- 非当前所有者或未完成 BLE 所有者授权时，ESP 拒绝释放命令。
+- 云端撤销失败时 ESP 保持原绑定；云端成功且 ESP 确认提交后，App 才清理本地凭证。
 - App 重装后能从服务端恢复已绑定设备。
 - ESP 收到伪造或与当前 challenge 不匹配的 `pairing_response` 不会置为 paired。代码已实现并通过固件构建，待真机 BLE 负向验收。
 - 发布构建不能使用默认开发配对 key；服务端和固件 key 不一致会在 preflight 阶段失败。已由 `tools/prepare_release_pairing_key.sh self-test` 验证。
@@ -514,7 +520,7 @@
 2. BLE `pairing_response` 改为服务端签名。
 3. App 设备列表真实化。
 4. 切房后 ESP 自动同步，并有确认状态。
-5. 解绑和 token 撤销完成。
+5. 释放设备和 token 撤销闭环已完成代码与自动化验证，待实体 ESP 重新绑定验收。
 
 完成标志：
 

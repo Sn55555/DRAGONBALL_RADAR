@@ -61,7 +61,7 @@ struct FirmwareUpdateView: View {
                 StatusChip(
                     text: bleBridge.bleSecurityRepairRequired
                         ? "需要重新配对"
-                        : (bleBridge.supportsFirmwareOTA ? "支持无线更新" : "需要初始化"),
+                        : otaCapabilityChipText,
                     filled: bleBridge.supportsFirmwareOTA && !bleBridge.bleSecurityRepairRequired
                 )
             }
@@ -110,7 +110,7 @@ struct FirmwareUpdateView: View {
                 .accessibilityIdentifier("devices.firmware.progress")
             }
 
-            if firmwareUpdate.phase == .bootstrapRequired || (!bleBridge.supportsFirmwareOTA && firmwareUpdate.availableRelease != nil) {
+            if firmwareUpdate.phase == .bootstrapRequired || bleBridge.firmwareOTACapability == .unsupported {
                 Text("这台雷达的旧分区/旧协议无法安全接收 OTA。请先通过 USB 刷入支持双分区、107/108 通道和回滚确认的新固件；以后即可在这里无线更新。")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(MangaTheme.subtle)
@@ -221,7 +221,11 @@ struct FirmwareUpdateView: View {
                 detail: bleSecurityGateDetail,
                 passed: !bleBridge.bleSecurityRepairRequired && bleBridge.deviceStatus?.bleSecure == 1
             )
-            FirmwareGateRow(title: "OTA 通道", detail: bleBridge.supportsFirmwareOTA ? "107 控制与 108 状态可用" : "旧固件需 USB 初始化", passed: bleBridge.supportsFirmwareOTA)
+            FirmwareGateRow(
+                title: "OTA 通道",
+                detail: otaChannelGateDetail,
+                passed: bleBridge.supportsFirmwareOTA && bleBridge.isFirmwareOTAChannelReady
+            )
             FirmwareGateRow(title: "绑定与凭证", detail: provisioningGateDetail, passed: bleBridge.deviceStatus?.isOTAProvisioningReady == true)
             FirmwareGateRow(title: "所有者会话", detail: ownerSessionGateDetail, passed: ownerSessionGatePassed)
             FirmwareGateRow(title: "更新源", detail: originGateDetail, passed: bleBridge.deviceStatus?.isOTAOriginConfirmed == true)
@@ -400,6 +404,7 @@ struct FirmwareUpdateView: View {
         bleBridge.isBLEConnected
             && !bleBridge.bleSecurityRepairRequired
             && bleBridge.supportsFirmwareOTA
+            && bleBridge.isFirmwareOTAChannelReady
             && bleBridge.deviceStatus?.isOTAProvisioningReady == true
             && ownerSessionGatePassed
             && bleBridge.deviceStatus?.isOTAOriginConfirmed == true
@@ -407,6 +412,30 @@ struct FirmwareUpdateView: View {
             && batteryGatePassed
             && baselineGatePassed
             && releaseGatePassed
+    }
+
+    private var otaCapabilityChipText: String {
+        switch bleBridge.firmwareOTACapability {
+        case .supported:
+            return bleBridge.isFirmwareOTAChannelReady ? "支持无线更新" : "正在恢复通道"
+        case .unsupported:
+            return "需要初始化"
+        case .unknown:
+            return "正在读取"
+        }
+    }
+
+    private var otaChannelGateDetail: String {
+        switch bleBridge.firmwareOTACapability {
+        case .supported:
+            return bleBridge.isFirmwareOTAChannelReady
+                ? "107 控制与 108 状态可用"
+                : "固件已确认支持 OTA，正在恢复 107/108 通道"
+        case .unsupported:
+            return "雷达明确上报当前固件不支持 OTA"
+        case .unknown:
+            return "正在读取 OTA 能力，尚未判定为旧固件"
+        }
     }
 
     private var phaseTitle: String {

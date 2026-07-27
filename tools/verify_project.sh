@@ -132,6 +132,20 @@ grep -Fq '首次连接成功后，以后会自动连接。' ios/DragonRadarMVP/D
   echo "iOS pairing UI does not explain first-time scan and automatic reconnection." >&2
   exit 1
 }
+for required_owner_release_marker in \
+  'kOwnerBleServiceUuid' \
+  'prepare_release' \
+  'commit_release' \
+  'release_committed'; do
+  grep -Fq "$required_owner_release_marker" firmware/DragonRadar/DragonRadar.ino || {
+    echo "Missing owner-release firmware marker: $required_owner_release_marker" >&2
+    exit 1
+  }
+done
+grep -Fq 'devices.ownership.release' ios/DragonRadarMVP/DragonRadarMVP/Sources/DevicesView.swift || {
+  echo "iOS owner-release action is missing." >&2
+  exit 1
+}
 echo "ble-transport-security-contract-ok"
 
 log_step "Checking heading alignment math"

@@ -258,13 +258,6 @@ private final class AppRuntimeCoordinator {
             )
             return
         }
-        guard radarRuntime.relayPhase == .ready else {
-            print(
-                "DragonRadar location publish deferred "
-                    + "relay=\(radarRuntime.relayPhase.rawValue)"
-            )
-            return
-        }
         let now = Date()
         guard force || now.timeIntervalSince(lastPublishedLocationAt) >= Self.locationPublishInterval else { return }
 
@@ -621,6 +614,9 @@ struct AppRuntimeHost<Content: View>: View {
             },
             onUplinkFrame: { frame in
                 Task { await radarRuntime.sendVoiceFrame(frame) }
+            },
+            onReady: {
+                resendPendingRemoteVoiceWake()
             }
         )
         radarRuntime.configureVoiceGateway(
@@ -631,8 +627,22 @@ struct AppRuntimeHost<Content: View>: View {
                 bleBridge.sendVoiceDownlinkFrame(frame)
             },
             onGranted: { requestID in
-                activeLocalVoiceRequestID = requestID
+                guard activeLocalVoiceRequestID == requestID else {
+                    Task { await radarRuntime.releaseVoiceFloor(requestID: requestID) }
+                    return
+                }
+                guard bleBridge.sendVoiceControl(command: "ptt_granted", requestID: requestID) else {
+                    activeLocalVoiceRequestID = ""
+                    Task { await radarRuntime.releaseVoiceFloor(requestID: requestID) }
+                    return
+                }
                 pushToTalkGateway.beginSystemTransmission()
+            },
+            onBusy: { requestID in
+                guard activeLocalVoiceRequestID == requestID else { return }
+                activeLocalVoiceRequestID = ""
+                pushToTalkGateway.endSystemTransmission()
+                _ = bleBridge.sendVoiceControl(command: "ptt_cancel", requestID: requestID)
             },
             onEnd: {
                 pendingRemoteVoiceRequestID = ""
@@ -658,11 +668,7 @@ struct AppRuntimeHost<Content: View>: View {
         guard pendingRemoteVoiceRequestID != requestID else { return }
         pendingRemoteVoiceRequestID = requestID
         pushToTalkGateway.setRemoteSpeaker(speaker)
-        let sentToRadar = bleBridge.sendVoiceControl(command: "remote_begin", requestID: requestID)
-        print("DragonRadar voice wake BLE remote_begin request=\(requestID) sent=\(sentToRadar ? 1 : 0)")
-        if !sentToRadar {
-            radarRuntime.noteVoiceEvent("收到远端语音，但 BLE 雷达尚未就绪")
-        }
+        resendPendingRemoteVoiceWake()
         if radarRuntime.relayPhase != .ready {
             let roomCode = appState.inviteCode.trimmingCharacters(in: .whitespacesAndNewlines)
             let accessToken = appState.accessToken
@@ -675,6 +681,16 @@ struct AppRuntimeHost<Content: View>: View {
                     appAccessToken: accessToken
                 )
             }
+        }
+    }
+
+    private func resendPendingRemoteVoiceWake() {
+        guard !pendingRemoteVoiceRequestID.isEmpty else { return }
+        let requestID = pendingRemoteVoiceRequestID
+        let sentToRadar = bleBridge.sendVoiceControl(command: "remote_begin", requestID: requestID)
+        print("DragonRadar voice wake BLE remote_begin request=\(requestID) sent=\(sentToRadar ? 1 : 0)")
+        if !sentToRadar {
+            radarRuntime.noteVoiceEvent("收到远端语音，但 BLE 雷达尚未就绪")
         }
     }
 
@@ -692,7 +708,12 @@ struct AppRuntimeHost<Content: View>: View {
             let deviceToken = appState.activeDeviceToken
             let accessToken = appState.accessToken
             Task {
+                guard activeLocalVoiceRequestID == requestID else { return }
                 await radarRuntime.requestVoiceFloor(requestID: requestID)
+                guard activeLocalVoiceRequestID == requestID else {
+                    await radarRuntime.releaseVoiceFloor(requestID: requestID)
+                    return
+                }
                 guard
                     radarRuntime.relayPhase != .ready,
                     !roomCode.isEmpty,
@@ -900,6 +921,18 @@ private final class AppRuntimeCoordinator {
             return
         }
         let now = Date()
+        if force || now.timeIntervalSince(lastWroteLocationToESPAt) >= Self.locationPublishInterval {
+            if bleBridge.writeLocalLocation(snapshot) {
+                lastWroteLocationToESPAt = now
+            }
+        }
+        guard radarRuntime.relayPhase == .ready else {
+            print(
+                "DragonRadar location publish deferred "
+                    + "relay=\(radarRuntime.relayPhase.rawValue)"
+            )
+            return
+        }
         guard force || now.timeIntervalSince(lastPublishedLocationAt) >= Self.locationPublishInterval else { return }
 
         lastPublishedLocationAt = now
