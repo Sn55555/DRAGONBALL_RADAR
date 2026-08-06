@@ -35,6 +35,7 @@ extern "C" {
 #include "HeadingAlignment.h"
 #include "HeadingStability.h"
 #include "OtaManager.h"
+#include "TouchHold.h"
 #include "VoiceAdpcm.h"
 #include "bulma_boot_badge.h"
 #include "boot_audio_pcm.h"
@@ -170,6 +171,9 @@ constexpr uint32_t kSystemMenuControlFeedbackMs = 220;
 constexpr uint32_t kSystemMenuPageTransitionMs = 180;
 constexpr uint32_t kPowerConfirmHoldMs = 1500;
 constexpr uint32_t kFactoryResetConfirmHoldMs = 4000;
+// CST9217 reports a stationary contact roughly once per second. Periodic
+// recovery polls between those reports must not be interpreted as a release.
+constexpr uint32_t kTouchPointGapToleranceMs = 1250;
 constexpr int16_t kSystemMenuSwipeThresholdPx = 52;
 constexpr int16_t kSystemMenuEdgeTapWidthPx = 104;
 constexpr int16_t kSystemMenuActionCenterY = 342;
@@ -885,6 +889,7 @@ uint32_t systemMenuPageTransitionStartedMs = 0;
 uint32_t systemMenuPageTransitionUntilMs = 0;
 uint32_t lastUserInputMs = 0;
 uint32_t powerConfirmPressedAtMs = 0;
+uint32_t touchLastPositivePointMs = 0;
 uint32_t displaySelfTestUntilMs = 0;
 uint32_t lastDiagMs = 0;
 int16_t radarChordHalfCache[kRadarChordCacheSize] = {0};
@@ -1779,6 +1784,7 @@ void resetUiInputState() {
   headingCalibrationGestureCancelled = false;
   headingCalibrationHoldWaitFeedback = HeadingAlignmentFeedback::None;
   powerConfirmPressedAtMs = 0;
+  touchLastPositivePointMs = 0;
   edgeGestureConsumed = false;
 }
 
@@ -4400,16 +4406,37 @@ void pollTouch() {
     return;
   }
   lastPoll = now;
+  noInterrupts();
+  const bool touchEventPending = touchIrq;
   touchIrq = false;
+  interrupts();
 
   int16_t x[5] = {0};
   int16_t y[5] = {0};
-  const uint8_t count = touch.getPoint(x, y, touch.getSupportTouchPoint());
+  uint8_t count = touch.getPoint(x, y, touch.getSupportTouchPoint());
   for (uint8_t index = 0; index < count; ++index) {
     x[index] = DragonRadarDisplayOrientation::logicalTouchCoordinate(
         x[index], kScreenW, screenDirection);
     y[index] = DragonRadarDisplayOrientation::logicalTouchCoordinate(
         y[index], kScreenH, screenDirection);
+  }
+
+  if (count > 0) {
+    touchLastPositivePointMs = now;
+  } else if (DragonRadarTouchHold::shouldCarryConfirmationHold(
+                 radarUiMode == RadarUiMode::PowerConfirm ||
+                     radarUiMode == RadarUiMode::FactoryResetConfirm,
+                 touchWasPressed,
+                 touchEventPending,
+                 count,
+                 touchLastPositivePointMs,
+                 now,
+                 kTouchPointGapToleranceMs)) {
+    // Use the last logical coordinate only for an empty recovery poll. A real
+    // controller interrupt with zero points remains an immediate release.
+    count = 1;
+    x[0] = touchLastX;
+    y[0] = touchLastY;
   }
 
   if (ignoreTouchUntilRelease) {

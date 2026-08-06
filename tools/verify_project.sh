@@ -196,6 +196,22 @@ log_step "Checking display orientation and touch mapping"
   "$ORIENTATION_TEST_ROOT/test_display_orientation"
 )
 
+log_step "Checking confirmation-screen touch hold continuity"
+(
+  TOUCH_HOLD_TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dragon-radar-touch-hold-test.XXXXXX")"
+  trap 'rm -rf "$TOUCH_HOLD_TEST_ROOT"' EXIT
+  "${CXX:-c++}" \
+    -std=c++17 \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -pedantic \
+    -Ifirmware/DragonRadar \
+    tools/test_touch_hold.cpp \
+    -o "$TOUCH_HOLD_TEST_ROOT/test_touch_hold"
+  "$TOUCH_HOLD_TEST_ROOT/test_touch_hold"
+)
+
 log_step "Checking Relay limit primitives"
 python3 tools/smoke_relay_limits.py
 
